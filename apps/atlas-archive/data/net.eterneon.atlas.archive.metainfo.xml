@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>net.eterneon.atlas.archive</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Atlas Archive</name>
+  <summary>Open, extract and create archives</summary>
+  <description>
+    <p>Atlas Archive is the archive manager of AtlasOS. Double-click an archive to browse it like a folder, preview what is inside and drag files out, or extract it all with one click. It reads and writes ZIP (with AES-256 encryption), 7z and tar archives, and opens RAR, ISO, cab, cpio, deb and rpm files.</p>
+    <p>Every archive is opened in a sandbox that can only write into the folder you extract to, and nothing an archive holds can land outside it. Archives built to fill your disk are caught before they do.</p>
+  </description>
+  <launchable type="desktop-id">net.eterneon.atlas.archive.desktop</launchable>
+  <url type="homepage">https://github.com/EternalCoder454/AtlasOS</url>
+  <url type="vcs-browser">https://github.com/EternalCoder454/atlasos-archive</url>
+  <url type="bugtracker">https://github.com/EternalCoder454/atlasos-archive/issues</url>
+  <developer id="net.eterneon">
+    <name>Eterneon</name>
+  </developer>
+  <categories>
+    <category>Utility</category>
+    <category>Archiving</category>
+  </categories>
+  <provides>
+    <binary>atlas-archive</binary>
+    <binary>atlas-archive-cli</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-10-05"/>
+  </releases>
+</component>

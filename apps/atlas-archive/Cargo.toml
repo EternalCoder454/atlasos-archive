@@ -1,0 +1,26 @@
+[package]
+name = "atlas-archive"
+description = "Atlas Archive: the archive manager of AtlasOS (Kirigami UI over CXX-Qt)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+# CMake (Corrosion) links the static library into the C++ executable.
+# `rlib` is there so `cargo test` and `cargo clippy` work as usual.
+[lib]
+name = "atlas_archive"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+atlas-framework-ui.workspace = true
+atlas-archive-core = { path = "../../crates/atlas-archive-core" }
+cxx = "1"
+cxx-qt = "0.10"
+cxx-qt-lib = "0.10"
+log.workspace = true
+
+[build-dependencies]
+cxx-qt-build = "0.10"

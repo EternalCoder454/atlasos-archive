@@ -1,0 +1,12 @@
+[package]
+name = "atlas-archive-worker"
+description = "Atlas Archive's sandboxed worker: the only process that parses archive bytes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+atlas-archive-core = { path = "../../crates/atlas-archive-core" }
+atlas-archive-engine = { path = "../../crates/atlas-archive-engine" }

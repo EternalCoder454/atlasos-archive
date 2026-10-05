@@ -1,0 +1,11 @@
+[package]
+name = "atlas-archive-cli"
+description = "Atlas Archive on the command line: list, extract, test, create, info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+atlas-archive-core = { path = "../../crates/atlas-archive-core" }
