@@ -3,6 +3,7 @@
 //! treats it as untrusted (docs/DESIGN.md, "Extraction rules" and "Names").
 
 pub mod audit;
+pub mod client;
 pub mod limits;
 pub mod link;
 pub mod name;
