@@ -1,8 +1,8 @@
 //! Runs the real worker binary over its pipes, sandbox and all.
 
 use std::fs::File;
-use std::io::Write;
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -65,7 +65,9 @@ fn run(archive: Option<&Path>, staging: Option<&Path>, requests: &[Request]) -> 
         .env("LANG", "C.UTF-8")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // Never the test's own stderr: that can be a terminal, which the
+        // worker refuses.
+        .stderr(Stdio::piped());
     // SAFETY: `place` only makes async-signal-safe calls.
     unsafe {
         cmd.pre_exec(move || match (a, s) {
@@ -76,6 +78,13 @@ fn run(archive: Option<&Path>, staging: Option<&Path>, requests: &[Request]) -> 
         });
     }
     let mut child = cmd.spawn().unwrap();
+    // Drained, so a worker that logs a lot never blocks on it.
+    let mut log = child.stderr.take().unwrap();
+    let log = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = log.read_to_string(&mut text);
+        text
+    });
     let mut input = child.stdin.take().unwrap();
     for r in requests {
         proto::write_frame(&mut input, &r.encode()).unwrap();
@@ -93,6 +102,10 @@ fn run(archive: Option<&Path>, staging: Option<&Path>, requests: &[Request]) -> 
     }
     drop(input);
     let status = child.wait().unwrap();
+    let log = log.join().unwrap();
+    if !log.is_empty() {
+        eprintln!("worker log: {log}");
+    }
     (replies, status.code().unwrap_or(-1))
 }
 
@@ -227,7 +240,9 @@ fn leaked_descriptors_are_closed() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atlas-archive-worker"));
     let archive = File::open(&a).unwrap();
     let ar = archive.as_raw_fd();
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     // SAFETY: async-signal-safe calls only.
     unsafe {
         cmd.pre_exec(move || place(&[(ar, 3), (l, 7)]));
@@ -254,4 +269,41 @@ fn leaked_descriptors_are_closed() {
     assert!(out.status.success());
     drop(leak);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_terminal_is_refused() {
+    // A pty as the worker's stderr: it says so on the reply pipe and exits
+    // with 2 before reading a request.
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: valid out-pointers; null name, termios and window size.
+    let r = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: two new descriptors, owned from here.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_atlas-archive-worker"))
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let frame = proto::read_frame(&mut output).unwrap().expect("a reply");
+    let reply = Reply::decode(&frame).unwrap();
+    assert!(
+        matches!(&reply, Reply::Failed { reason } if reason.contains("terminal")),
+        "{reply:?}"
+    );
+    drop(child.stdin.take());
+    assert_eq!(child.wait().unwrap().code(), Some(2));
+    drop(master);
 }

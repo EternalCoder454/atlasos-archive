@@ -178,6 +178,20 @@ mod tests {
             return;
         };
         let staging = std::fs::File::open(dir.join("staging")).unwrap();
+        // A terminal to inject input into, opened before the sandbox closes
+        // /dev/pts.
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: valid out-pointers; null name, termios and window size.
+        let pty = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(pty, 0, "openpty");
         enter(Some(staging.as_fd())).unwrap();
         // Inside staging: allowed.
         std::fs::write(dir.join("staging/ok"), b"ok").unwrap();
@@ -244,6 +258,60 @@ mod tests {
             "run a program"
         );
         assert_eq!(std::thread::spawn(|| 7).join().unwrap(), 7, "threads");
+        // Same-user processes and terminals stay out of reach.
+        // SAFETY: plain calls; null or valid pointers of the right size.
+        unsafe {
+            assert!(
+                eperm(libc::shmget(libc::IPC_PRIVATE, 4096, 0o600).into()),
+                "shmget"
+            );
+            assert!(
+                eperm(libc::msgget(libc::IPC_PRIVATE, 0o600).into()),
+                "msgget"
+            );
+            assert!(
+                eperm(libc::semget(libc::IPC_PRIVATE, 1, 0o600).into()),
+                "semget"
+            );
+            let mut old = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            assert!(
+                eperm(
+                    libc::prlimit(
+                        libc::getppid(),
+                        libc::RLIMIT_NOFILE,
+                        std::ptr::null(),
+                        old.as_mut_ptr()
+                    )
+                    .into()
+                ),
+                "prlimit64 on the parent"
+            );
+            // Its own limits (what glibc's setrlimit does) still work.
+            assert_eq!(
+                libc::prlimit(0, libc::RLIMIT_NOFILE, std::ptr::null(), old.as_mut_ptr()),
+                0,
+                "prlimit64 on itself"
+            );
+            assert!(
+                eperm(libc::setpriority(libc::PRIO_PROCESS, 0, 0).into()),
+                "setpriority"
+            );
+            let c = b'x';
+            assert!(
+                eperm(libc::ioctl(slave, libc::TIOCSTI, &c as *const u8).into()),
+                "TIOCSTI"
+            );
+            assert!(
+                eperm(libc::ioctl(slave, 0x5000_940E_u32 as _, std::ptr::null::<u8>()).into()),
+                "btrfs subvolume create"
+            );
+            assert_eq!(libc::ioctl(slave, libc::TCGETS, std::ptr::null::<u8>()), -1);
+            assert_ne!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM),
+                "other terminal calls aren't denied by the filter"
+            );
+        }
         let ok =
             std::ffi::CString::new(dir.join("staging/ok").into_os_string().into_encoded_bytes())
                 .unwrap();

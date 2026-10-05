@@ -43,6 +43,11 @@ fn take(fd: RawFd) -> Option<OwnedFd> {
     }
 }
 
+fn is_tty(fd: RawFd) -> bool {
+    // SAFETY: isatty only inspects the descriptor.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
 fn kind_of(fd: &OwnedFd) -> Option<libc::mode_t> {
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat fills `st` on success.
@@ -70,6 +75,19 @@ fn main() -> ExitCode {
         input: File::from(requests),
         output: File::from(replies),
     };
+    // A terminal on any standard descriptor could be fed input (TIOCSTI and
+    // its kin) after the worker is gone: the client never gives one. fd 2 is
+    // the log, so say so on the reply pipe, unless that is one itself.
+    if [0, 1, 2].into_iter().any(is_tty) {
+        let reason = "The worker was started with a terminal as one of its standard streams.";
+        eprintln!("atlas-archive-worker: {reason}");
+        if !is_tty(REPLIES) {
+            let _ = conn.send(&Reply::Failed {
+                reason: reason.into(),
+            });
+        }
+        return ExitCode::from(2);
+    }
     let archive = take(ARCHIVE);
     // Only a folder: a rule for anything else would give Landlock rights
     // it can't apply.

@@ -221,26 +221,30 @@ fn non_ascii(p: Option<&Piece>) -> bool {
     matches!(p, Some(&Piece::Char(c)) if !c.is_ascii())
 }
 
-/// The length of a well-formed tag flag starting at `i` (U+1F3F4, 2 to 7
-/// tag letters, U+E007F: the flags of England, Scotland, Wales), or 0.
+/// The subdivision flags that exist (England, Scotland, Wales): the only
+/// tag sequences kept, so no other text can hide in tag characters.
+const SUBDIVISION_FLAGS: [&str; 3] = ["gbeng", "gbsct", "gbwls"];
+
+/// The length of a well-formed tag flag starting at `i` (U+1F3F4, the tag
+/// letters of one of `SUBDIVISION_FLAGS`, U+E007F), or 0.
 fn tag_flag(pieces: &[Piece], i: usize) -> usize {
     if pieces.get(i) != Some(&Piece::Char('\u{1F3F4}')) {
         return 0;
     }
-    let tags = pieces[i + 1..]
+    let tags: String = pieces[i + 1..]
         .iter()
-        // Subdivision codes are lowercase letters and digits: nothing else
-        // can hide in a flag.
-        .take_while(|p| {
-            matches!(
-                p,
-                Piece::Char('\u{E0030}'..='\u{E0039}' | '\u{E0061}'..='\u{E007A}')
-            )
+        .map_while(|p| match p {
+            // A tag letter or digit is its ASCII character plus 0xE0000.
+            Piece::Char(c @ ('\u{E0030}'..='\u{E0039}' | '\u{E0061}'..='\u{E007A}')) => {
+                char::from_u32(*c as u32 - 0xE0000)
+            }
+            _ => None,
         })
-        .count();
-    let ends = pieces.get(i + 1 + tags) == Some(&Piece::Char('\u{E007F}'));
-    if (2..=7).contains(&tags) && ends {
-        tags + 2
+        .take(8)
+        .collect();
+    let ends = pieces.get(i + 1 + tags.len()) == Some(&Piece::Char('\u{E007F}'));
+    if ends && SUBDIVISION_FLAGS.contains(&tags.as_str()) {
+        tags.len() + 2
     } else {
         0
     }
@@ -495,6 +499,13 @@ mod tests {
         let hidden = format!("🏴{}.png", "\u{E0068}".repeat(40));
         assert!(show(&hidden).1);
         assert!(show(&hidden).0.contains("<U+E0068>"));
+        let wales = "🏴\u{E0067}\u{E0062}\u{E0077}\u{E006C}\u{E0073}\u{E007F}";
+        assert_eq!(show(wales), (wales.into(), false));
+        let scotland = "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}";
+        assert_eq!(show(scotland), (scotland.into(), false));
+        // Well-formed tags that spell no real subdivision hide text too.
+        let word = "🏴\u{E0068}\u{E0069}\u{E0064}\u{E0065}\u{E007F}";
+        assert!(show(word).1 && show(word).0.contains("<U+E0068>"), "hide");
         assert!(show("🏴\u{E0067}\u{E0062}.png").1, "no cancel tag");
         assert!(show("x\u{E0067}\u{E0062}\u{E007F}").1, "no flag");
         assert!(

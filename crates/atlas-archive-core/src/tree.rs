@@ -444,6 +444,27 @@ impl Tree {
         self.lone_top = self.find_lone_top();
     }
 
+    /// Points the hard link `node` at `to`, a node the caller knows is its
+    /// target, as `finish` would have if the link's path had named it (the
+    /// staging audit, whose raw names can clash with another name's disk
+    /// form). The same rules apply: a file stored earlier. Folder sizes are
+    /// left as `finish` made them.
+    pub(crate) fn set_hardlink(&mut self, node: u32, to: u32) {
+        let ok = self.nodes[node as usize].kind == Kind::Hardlink
+            && self.nodes[to as usize].kind == Kind::File
+            && self.nodes[to as usize]
+                .entry
+                .is_some_and(|t| self.nodes[node as usize].entry.is_some_and(|n| t < n));
+        let n = &mut self.nodes[node as usize];
+        if ok {
+            n.hardlink = Some(to);
+            n.refused = None;
+        } else {
+            n.hardlink = None;
+            n.refused = Some(Refused::HardlinkTarget);
+        }
+    }
+
     fn find_lone_top(&self) -> Option<u32> {
         let [top] = self.nodes[ROOT as usize].children[..] else {
             return None;

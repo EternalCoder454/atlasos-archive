@@ -103,9 +103,15 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    starting processes (`fork`, `vfork`, `clone` without `CLONE_THREAD`,
    `clone3`, `execve`, `execveat`; threads still work), namespaces,
    `ptrace` and `process_vm_*`, extended attributes and ACLs (`*setxattr*`),
-   io_uring, BPF, perf, keyrings, `userfaultfd`, mounts, modules and the
-   other administrative calls; a call from another architecture's table
-   kills it. So nothing a compromised parser starts can outlive the worker
+   io_uring and the older `io_*` calls, BPF, perf, keyrings, `userfaultfd`,
+   mounts, modules and the other administrative calls, System V and POSIX
+   message queues, shared memory and semaphores, `kcmp`, `setpriority`, and
+   the terminal and btrfs `ioctl` commands that reach outside the worker
+   (`TIOCSTI`, `TIOCLINUX`, `TIOCCONS`, `TIOCSCTTY`, `TIOCSETD`, subvolume
+   and snapshot creation); `prlimit64` and the `sched_set*` calls work only
+   on the worker itself (pid 0). A call from another architecture's table
+   kills it. The worker refuses to start with a terminal on descriptor 0, 1
+   or 2: the client gives it pipes. So nothing a compromised parser starts can outlive the worker
    and keep writing to staging while the client audits it. Limits:
    `RLIMIT_AS` 4 GiB (the largest 7z dictionary is 1.5 GiB),
    `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256. On a kernel without Landlock the
@@ -226,9 +232,12 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   is a launcher or a launcher-named link resolves to it (resolved by the
   kernel below staging, after the renames). Modes and attributes are fixed
   through an `O_PATH` handle checked (device, inode, type) to be what the
-  walk found. The tree it returns is built again from what is left, so it
-  holds only items on disk under their names. Removals are reported as
-  skipped entries.
+  walk found. The tree it returns is built again from what is left, and
+  each item's name in it must be its name on disk, or the audit fails. Two
+  folders whose names have the same disk form are never merged: the audit
+  fails. Paths of 4096 bytes or more fail it too. Removals are reported as
+  skipped entries: the first 1000 by name (each shown in at most 1024
+  bytes), the rest as a count.
 - **After a libarchive extraction** the client runs the audit itself, once
   the worker has exited: it kills (`SIGKILL`) and reaps (`waitpid`) the
   worker before the first look at staging, so nothing can change between
@@ -293,8 +302,9 @@ libarchive's `hdrcharset` with the same guess.
   (a literal `\` as `\\`, so an escape can't be faked), bidi controls
   (U+202A–202E, U+2066–2069, U+200E/F, U+061C) and invisible characters
   (zero-width spaces, word joiners, Hangul fillers, variation selectors and
-  tags out of place, U+FEFF, U+2800 and the like) as `<U+202E>`, whitespace
-  other than a single space as `<U+3000>`, undecodable bytes as `\xNN`. The
+  tags out of place, U+FEFF, U+2800 and the like) as `<U+202E>` (after a
+  flag, only the England, Scotland and Wales tag sequences are in place),
+  whitespace other than a single space as `<U+3000>`, undecodable bytes as `\xNN`. The
   row is marked "Unusual name" for any of these, and for leading, trailing
   or doubled spaces. Joiners in emoji and scripts that need them are kept.
   All text from an archive is set with `textFormat: Text.PlainText`.

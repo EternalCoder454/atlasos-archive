@@ -28,8 +28,19 @@ use crate::path::{self, MAX_DEPTH, MAX_PATH_BYTES};
 use crate::proto::{Entry, Format, Kind};
 use crate::tree::{MAX_NODES, ROOT, Tree};
 
-/// The most path bytes the walk keeps, all items' paths together.
+/// The most path bytes the walk looks at, all items' paths together: a bound
+/// on its work. Nothing holds them all at once: a path is built for one
+/// entry at a time, as the tree takes it, and dropped.
 const MAX_PATH_TOTAL: usize = 256 << 20;
+/// The longest path the kernel resolves is `PATH_MAX` - 1 bytes (the NUL
+/// counts); a longer one is refused by the walk, as nesting too deep.
+const MAX_PATH_LEN: usize = 4095;
+/// How many removals `Audit::removed` lists; the rest are only counted.
+pub const MAX_REMOVED_LISTED: usize = 1000;
+/// The longest path shown in a report, in bytes.
+const MAX_SHOWN: usize = 1024;
+/// Tries for a temporary name that is taken.
+const TEMP_TRIES: u32 = 8;
 /// The one extended attribute left alone: the system's own label.
 const KEPT_XATTR: &[u8] = b"security.selinux";
 
@@ -46,7 +57,10 @@ pub struct Audit {
     /// What is in staging now: every node is on disk under its name, none is
     /// refused. `lone_top` decides the move out.
     pub tree: Tree,
+    /// The first `MAX_REMOVED_LISTED` removals.
     pub removed: Vec<Removed>,
+    /// Removals past those listed in `removed`, counted only.
+    pub removed_more: usize,
     /// Items renamed to their disk form.
     pub renamed: u32,
 }
@@ -95,6 +109,10 @@ fn check(r: libc::c_int) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn failed_check() -> io::Error {
+    io::Error::other("The extracted files couldn't be checked.")
 }
 
 fn changed() -> io::Error {
@@ -324,7 +342,7 @@ fn walk(staging: BorrowedFd<'_>) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
         let fd = open_dir(staging, &dir_path)?;
         for (name, st, link) in read_dir(fd.as_fd(), MAX_NODES - found.len())? {
             let len = dir_path.len() + usize::from(!dir_path.is_empty()) + name.len();
-            if depth >= MAX_DEPTH || len > MAX_PATH_BYTES {
+            if depth >= MAX_DEPTH || len > MAX_PATH_LEN {
                 return Err(io::Error::other(
                     "The extracted folder nests deeper than Atlas Archive can check.",
                 ));
@@ -395,8 +413,39 @@ fn is_disk_form(name: &[u8]) -> bool {
     })
 }
 
+/// A path as shown in a report: safe to display, and short.
 fn shown(path: &[u8]) -> String {
-    name::display_text(&String::from_utf8_lossy(path))
+    let mut s = name::display_text(&String::from_utf8_lossy(path));
+    if s.len() > MAX_SHOWN {
+        let mut end = MAX_SHOWN;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push('\u{2026}');
+    }
+    s
+}
+
+/// A random 64-bit number for this audit's temporary names, so no name in
+/// staging can be made to match one.
+fn nonce() -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    loop {
+        // SAFETY: a buffer of the given length.
+        let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n == buf.len() as isize {
+            return Ok(u64::from_le_bytes(buf));
+        }
+        let e = io::Error::last_os_error();
+        if n >= 0 || e.kind() != io::ErrorKind::Interrupted {
+            return Err(if n >= 0 {
+                io::Error::other("short getrandom")
+            } else {
+                e
+            });
+        }
+    }
 }
 
 fn file_mode(st: &libc::stat, umask: u32, launcher: bool) -> u32 {
@@ -417,38 +466,50 @@ fn folder_format() -> Format {
     }
 }
 
-/// The items `order` lists as entries, in that order (an entry's index is
-/// its place), with the paths of `names`.
-fn entries(
+/// Entry `p` of the listing `order` (an entry's index is its place), with
+/// the paths of `names`.
+fn entry_at(
     found: &[Found],
     names: &[Vec<u8>],
     order: &[usize],
     hardlink_to: &HashMap<usize, usize>,
-) -> Vec<Entry> {
-    order
-        .iter()
-        .enumerate()
-        .map(|(p, &i)| {
-            let f = &found[i];
-            let path = path_of(found, names, i);
-            let (kind, link) = match hardlink_to.get(&i) {
-                Some(&to) => (Kind::Hardlink, Some(path_of(found, names, to))),
-                None => (f.kind, f.link.clone()),
-            };
-            Entry {
-                index: p as u32,
-                utf8: std::str::from_utf8(&path).is_ok(),
-                path,
-                kind,
-                size: (f.kind == Kind::File).then_some(f.st.st_size as u64),
-                packed: None,
-                mtime: Some(f.st.st_mtime),
-                mode: f.st.st_mode & 0o7777,
-                encrypted: false,
-                link,
-            }
-        })
-        .collect()
+    p: usize,
+) -> Entry {
+    let i = order[p];
+    let f = &found[i];
+    let path = path_of(found, names, i);
+    let (kind, link) = match hardlink_to.get(&i) {
+        Some(&to) => (Kind::Hardlink, Some(path_of(found, names, to))),
+        None => (f.kind, f.link.clone()),
+    };
+    Entry {
+        index: p as u32,
+        utf8: std::str::from_utf8(&path).is_ok(),
+        path,
+        kind,
+        size: (f.kind == Kind::File).then_some(f.st.st_size as u64),
+        packed: None,
+        mtime: Some(f.st.st_mtime),
+        mode: f.st.st_mode & 0o7777,
+        encrypted: false,
+        link,
+    }
+}
+
+/// The tree of the items `order` lists, one entry built at a time (with its
+/// full path) and dropped once placed, so the paths never exist together.
+fn build_tree(
+    found: &[Found],
+    names: &[Vec<u8>],
+    order: &[usize],
+    hardlink_to: &HashMap<usize, usize>,
+) -> Tree {
+    let mut tree = Tree::new(folder_format(), NameEncoding::Utf8);
+    for p in 0..order.len() {
+        tree.add(&entry_at(found, names, order, hardlink_to, p));
+    }
+    tree.finish();
+    tree
 }
 
 /// Audits `staging` (see the module comment). An error leaves staging half
@@ -462,6 +523,7 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
 
     let (found, mut names) = walk(staging)?;
     let mut removed = Vec::new();
+    let mut removed_more = 0usize;
     let mut drop_it = vec![None::<String>; found.len()];
 
     // Hard links: every name of a file must be in staging, or a fix below
@@ -517,15 +579,20 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
             }
         }
     }
-    let tree = Tree::build(
-        folder_format(),
-        &entries(&found, &names, &order, &hardlink_to),
-        Some(NameEncoding::Utf8),
-    );
+    let mut tree = build_tree(&found, &names, &order, &hardlink_to);
     let mut node_of = vec![None::<u32>; found.len()];
     for (id, n) in tree.nodes.iter().enumerate().skip(1) {
         if let Some(e) = n.entry {
             node_of[order[e as usize]] = Some(id as u32);
+        }
+    }
+    // A link's target path is built from raw names, which can clash with
+    // another name's disk form (and so name another node, or none). The
+    // target is known: the first name of the file. Point the link at its
+    // node, so no legitimate name is refused and unlinked for it.
+    for (&i, &first) in &hardlink_to {
+        if let (Some(n), Some(t)) = (node_of[i], node_of[first]) {
+            tree.set_hardlink(n, t);
         }
     }
     let skip_reason: HashMap<u32, &str> = tree
@@ -559,6 +626,15 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
     // folder: folders always parse and are never refused, and unlinkat
     // without AT_REMOVEDIR fails on one, failing the audit.
     let mut gone: Vec<usize> = (0..found.len()).filter(|&i| drop_it[i].is_some()).collect();
+    // Two folders whose names have the same disk form are one folder in the
+    // tree, and the other has no place in it. Merging them is no job for an
+    // audit that can't see what they hold: the extraction fails, in words.
+    if let Some(&i) = gone.iter().find(|&&i| found[i].kind == Kind::Dir) {
+        return Err(io::Error::other(format!(
+            "Two folders in the extracted files ({}) would end up with the same name, and Atlas Archive won't merge them.",
+            shown(&path_of(&found, &names, i))
+        )));
+    }
     gone.sort_by_key(|&i| found[i].parent);
     let mut folders = Folders::new();
     for i in gone {
@@ -566,10 +642,14 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         let c = cstring(&names[i])?;
         // SAFETY: a valid descriptor and C string.
         check(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) })?;
-        removed.push(Removed {
-            path: shown(&path_of(&found, &names, i)),
-            reason: drop_it[i].clone().expect("dropped"),
-        });
+        if removed.len() < MAX_REMOVED_LISTED {
+            removed.push(Removed {
+                path: shown(&path_of(&found, &names, i)),
+                reason: drop_it[i].clone().expect("dropped"),
+            });
+        } else {
+            removed_more += 1;
+        }
     }
 
     // Renames, folder by folder, deepest first (a folder's path holds until
@@ -584,6 +664,9 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         .collect();
     moves.sort_by_key(|&i| (Reverse(found[i].depth), found[i].parent));
     let mut renamed = 0;
+    // Temporary names: a random number for this audit, so a name already in
+    // staging can't be one.
+    let nonce = nonce()?;
     let mut spare = 0u64;
     for group in moves.chunk_by(|&a, &b| found[a].parent == found[b].parent) {
         let dir = open_dir(
@@ -607,13 +690,17 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         let mut temps = Vec::with_capacity(group.len());
         for &i in group {
             let old = cstring(&names[i])?;
+            let mut tries = 0;
             let temp = loop {
                 // Not a disk form, so never a name the audit keeps.
-                let t = CString::new(format!("\u{1}atlas-audit-{spare}")).expect("no NUL");
+                let t =
+                    CString::new(format!("\u{1}atlas-audit-{nonce:016x}-{spare}")).expect("no NUL");
                 spare += 1;
+                tries += 1;
                 match rename(&old, &t) {
                     Ok(()) => break t,
-                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) && spare < 1 << 20 => {}
+                    // Only a guess at the random number gets here.
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) && tries < TEMP_TRIES => {}
                     Err(e) => return Err(e),
                 }
             };
@@ -629,6 +716,10 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
             renamed += 1;
         }
     }
+
+    // The first tree is done with; the last one is built from the names now
+    // on disk.
+    drop(tree);
 
     // Launchers, by what is on disk now: every name of a file shares its
     // inode, and a launcher-named link reaches what the kernel would open
@@ -649,11 +740,22 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
                     libc::O_PATH,
                     libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV,
                 );
-                if let Ok(fd) = target {
-                    let st = fstat(fd.as_fd())?;
-                    if st.st_mode & libc::S_IFMT == libc::S_IFREG {
-                        launchers.insert((st.st_dev, st.st_ino));
+                match target {
+                    Ok(fd) => {
+                        let st = fstat(fd.as_fd())?;
+                        if st.st_mode & libc::S_IFMT == libc::S_IFREG {
+                            launchers.insert((st.st_dev, st.st_ino));
+                        }
                     }
+                    // Reaches nothing in staging: not a launcher's target.
+                    Err(e)
+                        if matches!(
+                            e.raw_os_error(),
+                            Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR | libc::EXDEV)
+                        ) => {}
+                    // Anything else means the walk can't tell: fail, never
+                    // leave a launcher that might run.
+                    Err(e) => return Err(e),
                 }
             }
             _ => {}
@@ -699,22 +801,28 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         .into_iter()
         .filter(|&(i, to)| drop_it[i].is_none() && drop_it[to].is_none())
         .collect();
-    let tree = Tree::build(
-        folder_format(),
-        &entries(&found, &names, &kept, &hardlink_to),
-        Some(NameEncoding::Utf8),
-    );
+    let tree = build_tree(&found, &names, &kept, &hardlink_to);
     let placed = tree.nodes.iter().filter(|n| n.entry.is_some()).count();
     if placed != kept.len()
         || !tree.skipped.is_empty()
         || tree.skipped_more > 0
         || tree.nodes.iter().any(|n| n.refused.is_some())
     {
-        return Err(io::Error::other("The extracted files couldn't be checked."));
+        return Err(failed_check());
+    }
+    // Every node is on disk under the name it has: a kept item the tree
+    // placed under another name (a clash it numbered again) isn't.
+    for n in &tree.nodes[1..] {
+        if let Some(e) = n.entry
+            && n.name.disk.as_bytes() != names[kept[e as usize]]
+        {
+            return Err(failed_check());
+        }
     }
     Ok(Audit {
         tree,
         removed,
+        removed_more,
         renamed,
     })
 }
@@ -995,6 +1103,91 @@ mod tests {
         assert_eq!(a.top_level(), ["only"]);
         assert_eq!(a.tree.lone_top, a.tree.find(["only"]));
         assert!(a.tree.nodes.iter().all(|n| n.refused.is_none()));
+    }
+
+    #[test]
+    fn the_removed_list_is_capped() {
+        let s = Scratch::new("many");
+        let st = s.staging();
+        for k in 0..MAX_REMOVED_LISTED + 5 {
+            symlink("/etc/passwd", st.join(format!("l{k}"))).unwrap();
+        }
+        let a = audit_path(&st, 0o022).unwrap();
+        assert_eq!(a.removed.len(), MAX_REMOVED_LISTED);
+        assert_eq!(a.removed_more, 5);
+        assert!(a.top_level().is_empty());
+    }
+
+    #[test]
+    fn shown_paths_are_short() {
+        let long = "d/".repeat(3000);
+        let s = shown(long.as_bytes());
+        assert!(s.len() <= MAX_SHOWN + '\u{2026}'.len_utf8());
+        assert!(s.ends_with('\u{2026}'));
+        assert_eq!(shown(b"a/b"), "a/b");
+        // Cut on a character boundary.
+        let wide = "\u{e9}".repeat(2000);
+        assert!(shown(wide.as_bytes()).ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn two_folders_with_one_disk_form_fail_in_words() {
+        let s = Scratch::new("dirs");
+        let st = s.staging();
+        std::fs::create_dir(st.join("x\u{202E}")).unwrap();
+        std::fs::write(st.join("x\u{202E}/a"), b"1").unwrap();
+        std::fs::create_dir(st.join("x\u{202D}")).unwrap();
+        std::fs::write(st.join("x\u{202D}/b"), b"2").unwrap();
+        let e = audit_path(&st, 0o022).err().expect("fails");
+        assert!(e.to_string().contains("same name"), "{e}");
+    }
+
+    #[test]
+    fn a_clashing_target_name_keeps_every_link() {
+        let s = Scratch::new("target");
+        let st = s.staging();
+        // Both names of one file are misnamed, and another file already has
+        // the disk form of the first.
+        std::fs::write(st.join("x\u{1}"), b"f").unwrap();
+        std::fs::hard_link(st.join("x\u{1}"), st.join("x\u{2}")).unwrap();
+        std::fs::write(st.join("x_"), b"other").unwrap();
+        let a = audit_path(&st, 0o022).unwrap();
+        assert!(a.removed.is_empty(), "{:?}", a.removed);
+        assert_eq!(std::fs::read(st.join("x_")).unwrap(), b"other");
+        let top = a.top_level();
+        assert_eq!(top.len(), 3, "{top:?}");
+        let linked = top
+            .iter()
+            .filter(|n| std::fs::metadata(st.join(n)).unwrap().nlink() == 2)
+            .count();
+        assert_eq!(linked, 2);
+    }
+
+    #[test]
+    fn temporary_names_survive_decoys() {
+        let s = Scratch::new("decoys");
+        let st = s.staging();
+        for k in 0..40 {
+            std::fs::write(st.join(format!("\u{1}atlas-audit-{k}")), b"d").unwrap();
+            std::fs::write(st.join(format!("\u{1}atlas-audit-{k:016x}-0")), b"d").unwrap();
+        }
+        let a = audit_path(&st, 0o022).unwrap();
+        assert!(a.removed.is_empty(), "{:?}", a.removed);
+        assert_eq!(a.top_level().len(), 80);
+    }
+
+    #[test]
+    fn launcher_links_that_reach_nothing_are_not_an_error() {
+        let s = Scratch::new("dangling");
+        let st = s.staging();
+        std::fs::write(st.join("t"), b"t").unwrap();
+        symlink("t", st.join("ok.desktop")).unwrap();
+        symlink("nowhere", st.join("gone.desktop")).unwrap();
+        symlink("loop.desktop", st.join("loop.desktop")).unwrap();
+        symlink("t/x", st.join("notdir.desktop")).unwrap();
+        let a = audit_path(&st, 0o022).unwrap();
+        assert!(st.join("ok.desktop").exists());
+        assert!(a.removed.len() <= 3, "{:?}", a.removed);
     }
 
     #[test]
