@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 pub use extract::{default_name, numbered_name};
 pub use spawn::Cancel;
-pub use staging::{Cleaned, clean_stale, default_state_dir};
+pub use staging::{Cleaned, clean_stale, clean_stale_within, default_state_dir};
 pub use trash::Trash;
 
 use crate::audit::{self, Removed};

@@ -1292,9 +1292,7 @@ mod tests {
         }
         let mut left = MAX_LINK_TOTAL;
         let fd = std::fs::File::open(&st).unwrap();
-        let e = read_dir(fd.as_fd(), MAX_NODES, &mut left)
-            .err()
-            .expect("fails");
+        let e = read_dir(fd.as_fd(), MAX_NODES, &mut left).expect_err("fails");
         assert_eq!(e.to_string(), too_many().to_string());
     }
 

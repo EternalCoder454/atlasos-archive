@@ -198,6 +198,40 @@ pub fn getuid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+pub fn getegid() -> u32 {
+    // SAFETY: getegid has no failure.
+    unsafe { libc::getegid() }
+}
+
+/// Opens `name` in `dir` as an `O_PATH` descriptor without following a link:
+/// good for `fstat` and `fchmod_path`, nothing else.
+pub fn open_path_nofollow(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<OwnedFd> {
+    let c = cstr(name)?;
+    retry(|| {
+        // SAFETY: a valid descriptor and C string; a new descriptor we own.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(owned(fd))
+        }
+    })
+}
+
+/// `fchmod` for an `O_PATH` descriptor (which `fchmod` refuses), through
+/// `/proc/self/fd/N`: it names the opened file itself, not a path to resolve.
+pub fn fchmod_path(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
+    let c = cstr(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
+    // SAFETY: a valid C string.
+    check(unsafe { libc::chmod(c.as_ptr(), mode) })
+}
+
 /// `fchmod` where the file system may not keep modes (FAT, some network
 /// mounts: EPERM, ENOTSUP, EINVAL): that is not an error there.
 pub fn fchmod_soft(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {

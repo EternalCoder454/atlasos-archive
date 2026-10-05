@@ -198,8 +198,10 @@ fn move_item(
     ))
 }
 
-/// Renames staging itself to `name` (numbered when taken) and opens it up
-/// for its owner's umask: it was made 0700 so nobody else saw it half done.
+/// Renames staging itself to `name` (numbered when taken) and then opens it up
+/// for its owner's umask, by descriptor: it was made 0700 so nobody else saw
+/// it half done, and stays exactly 0700 until it is in place (so a crash
+/// leaves a folder the next start's record proof still accepts).
 /// The destination's setgid bit is kept. The folder is checked by identity
 /// (device, inode, type) under its old name before the rename and under the
 /// new one after; on a mismatch nothing is placed and staging is emptied by
@@ -207,9 +209,14 @@ fn move_item(
 /// destination can still swap a name between the check and the rename.
 fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String, Error> {
     let ours = sys::fstat(staging.fd()).map_err(|e| move_failed(&e))?;
+    if !super::staging::is_our_dir(&ours) {
+        return Err(fail(
+            "The extracted files couldn't be moved into place safely, so nothing was kept.",
+            "the staging descriptor isn't a folder of ours".to_string(),
+        ));
+    }
     let dest = sys::fstat(staging.dest()).map_err(|e| move_failed(&e))?;
     let mode = ((0o777 & !umask) | 0o700) | (dest.st_mode & libc::S_ISGID);
-    sys::fchmod_soft(staging.fd(), mode).map_err(|e| move_failed(&e))?;
     for n in 1..=MAX_TRIES {
         let cand = if n == 1 {
             name.to_string()
@@ -218,7 +225,7 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
         };
         match staging.name_is_ours() {
             Ok(true) => {}
-            Ok(false) => return Err(swapped(staging, "before the move")),
+            Ok(false) => return Err(swapped(staging, "before the move", None)),
             Err(e) => return Err(move_failed(&e)),
         }
         match sys::rename_noreplace(
@@ -230,9 +237,15 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
             Ok(()) => {
                 match sys::lstatat(staging.dest(), cand.as_bytes()) {
                     Ok(now) if sys::same_file(&now, &ours) => {}
-                    _ => return Err(swapped(staging, "after the move")),
+                    _ => return Err(swapped(staging, "after the move", Some(&cand))),
                 }
                 staging.forget();
+                // In place: now it takes the user's mode, by descriptor. A
+                // file system that keeps no modes is fine; any other failure
+                // leaves the folder placed but private, which is only strict.
+                if let Err(e) = sys::fchmod_soft(staging.fd(), mode) {
+                    log::warn!("The extracted folder couldn't be given its mode: {e}");
+                }
                 return Ok(cand);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -246,14 +259,21 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
 
 /// The staging folder's name led somewhere else: refuse, and empty what is
 /// ours by descriptor (the folder itself then goes when `staging` drops).
-fn swapped(staging: &Staging, when: &str) -> Error {
+/// `placed` is the name the move gave it when the swap showed up after the
+/// move: something else is at that name then, and it is left alone.
+fn swapped(staging: &Staging, when: &str, placed: Option<&str>) -> Error {
     if let Err(e) = staging.clear() {
         log::warn!("The staging folder couldn't be emptied: {e}");
     }
-    fail(
-        "The extracted files couldn't be moved into place safely, so nothing was kept.",
-        format!("the staging folder was replaced {when}"),
-    )
+    let shown = match placed {
+        None => "The extracted files couldn't be moved into place safely, so nothing was kept."
+            .to_string(),
+        Some(p) => format!(
+            "The extracted files couldn't be moved into place safely and were removed. Something else is now at “{}” in the folder; it was not touched.",
+            name::display_text(p)
+        ),
+    };
+    fail(shown, format!("the staging folder was replaced {when}"))
 }
 
 /// Extract here met an item of the same name: ask, then do as told.

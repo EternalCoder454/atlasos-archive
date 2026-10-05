@@ -8,6 +8,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawF
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::sys::{self, bfd, cstr};
@@ -32,6 +33,12 @@ const STALE_TMP: Duration = Duration::from_secs(60);
 /// How long dropping a `Staging` may spend deleting. Past it the folder and
 /// its record stay for the next start's `clean_stale`.
 const REMOVE_BUDGET: Duration = Duration::from_secs(300);
+/// The time one `clean_stale` spends deleting, over all records. A record
+/// whose delete doesn't finish stays for the next start.
+const CLEAN_BUDGET: Duration = Duration::from_secs(20);
+/// How long a record whose destination is missing or different is kept (by
+/// the record's own age) before it is dropped.
+const WAIT_LIMIT: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// A staging folder's name for `archive`: `.<name>.atlas-partial-<hex>`, the
 /// archive's name in disk form and shortened so the whole fits `NAME_MAX`.
@@ -251,12 +258,24 @@ fn create_new(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<OwnedFd
 // ---- the staging folder ----
 
 /// Whether others can change the folder `st` describes and could therefore
-/// swap names in it under us: write for others without the sticky bit.
-/// (Group write is left alone: on most systems a user's group is theirs.)
+/// swap names in it under us: write for others without the sticky bit, or
+/// write for a group that isn't our own (group write on the user's own
+/// private group stays allowed).
 /// Residual risk, documented in DESIGN.md: a process of the same user, or
 /// anyone who can write the destination, can still race the name-based moves.
 pub fn dest_is_shared(st: &libc::stat) -> bool {
-    st.st_mode & libc::S_IWOTH != 0 && st.st_mode & libc::S_ISVTX == 0
+    shared_for(st, sys::getegid())
+}
+
+fn shared_for(st: &libc::stat, egid: u32) -> bool {
+    st.st_mode & libc::S_ISVTX == 0
+        && (st.st_mode & libc::S_IWOTH != 0
+            || (st.st_mode & libc::S_IWGRP != 0 && st.st_gid != egid))
+}
+
+/// A folder of ours: what a staging folder we just made must be.
+pub fn is_our_dir(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFDIR && st.st_uid == sys::getuid()
 }
 
 /// One job's staging folder. Dropping it removes the folder and the record
@@ -268,6 +287,9 @@ pub struct Staging {
     fd: OwnedFd,
     record: Option<RecordFile>,
     gone: bool,
+    /// A delete ran out of time: the folder and record stay for the next
+    /// start and nothing retries it (`clear` has only `&self`).
+    stuck: AtomicBool,
 }
 
 impl Staging {
@@ -328,8 +350,13 @@ impl Staging {
             }
         };
         let opened = sys::open_subdir(bfd(&dest), name.as_bytes()).and_then(|fd| {
+            // The name must lead to the folder we just made: a folder of ours.
+            if !is_our_dir(&sys::fstat(bfd(&fd))?) {
+                return Err(io::Error::other("the new staging folder isn't ours"));
+            }
             // mkdirat applied the umask; the folder is the user's alone until
-            // it is moved out. (A file system without modes keeps what it has.)
+            // it is moved out. (A file system without modes keeps what it has;
+            // that is tolerated only here, for a folder that is ours.)
             sys::fchmod_soft(bfd(&fd), 0o700)?;
             Ok(fd)
         });
@@ -340,6 +367,7 @@ impl Staging {
                 fd,
                 record,
                 gone: false,
+                stuck: AtomicBool::new(false),
             }),
             Err(e) => {
                 let _ = sys::unlinkat(bfd(&dest), name.as_bytes(), libc::AT_REMOVEDIR);
@@ -378,9 +406,19 @@ impl Staging {
         }
     }
 
-    /// Empties the folder (a new attempt needs it so).
+    /// Empties the folder (a new attempt needs it so), within `REMOVE_BUDGET`.
     pub fn clear(&self) -> io::Result<()> {
-        purge(self.fd.as_fd(), None)
+        self.clear_within(REMOVE_BUDGET)
+    }
+
+    /// Empties the folder within `budget`. Past it the folder is left for the
+    /// next start's cleanup and never deleted again by this job.
+    pub fn clear_within(&self, budget: Duration) -> io::Result<()> {
+        let r = purge(self.fd.as_fd(), Some(Instant::now() + budget));
+        if matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
+            self.stuck.store(true, Ordering::Relaxed);
+        }
+        r
     }
 
     /// Removes the folder and the record. The content goes by descriptor and
@@ -388,10 +426,11 @@ impl Staging {
     /// followed. Past `REMOVE_BUDGET`, or on an error, the folder and the
     /// record stay for the next start's cleanup.
     pub fn remove(&mut self) -> io::Result<()> {
-        if self.gone {
+        if self.gone || self.stuck.load(Ordering::Relaxed) {
             return Ok(());
         }
-        purge(self.fd.as_fd(), Some(Instant::now() + REMOVE_BUDGET))?;
+        // Out of time: the folder and record stay and `Drop` doesn't try again.
+        self.clear_within(REMOVE_BUDGET)?;
         if self.name_is_ours()? {
             sys::unlinkat(self.dest.as_fd(), self.name.as_bytes(), libc::AT_REMOVEDIR)?;
         } else {
@@ -441,6 +480,15 @@ pub struct Cleaned {
     pub live: u32,
     /// Records whose folder couldn't be removed or proven; they stay for next time.
     pub failed: u32,
+    /// Records kept because their delete ran out of the time budget; the next
+    /// start goes on.
+    pub unfinished: u32,
+    /// Records kept because the destination isn't there (an unmounted drive)
+    /// or isn't the folder the job was given; they are dropped after
+    /// `WAIT_LIMIT`.
+    pub waiting: u32,
+    /// Records of that kind dropped for being older than `WAIT_LIMIT`.
+    pub aged_out: u32,
 }
 
 /// Whether the job that wrote `rec` (the record file last changed at `mtime`)
@@ -485,6 +533,13 @@ fn started_after(start: u64, mtime: SystemTime) -> bool {
 /// it may block for as long as a dead mount or a huge tree takes. Stale
 /// temporary files of the record writer go too.
 pub fn clean_stale(state_dir: &Path) -> io::Result<Cleaned> {
+    clean_stale_within(state_dir, CLEAN_BUDGET)
+}
+
+/// `clean_stale` with its own total time `budget` for deleting, over all
+/// records. Past it the records left are kept and counted `unfinished`.
+pub fn clean_stale_within(state_dir: &Path, budget: Duration) -> io::Result<Cleaned> {
+    let deadline = Instant::now() + budget;
     let mut out = Cleaned::default();
     let dir = match open_jobs_dir(state_dir, false) {
         Ok(d) => d,
@@ -517,7 +572,11 @@ pub fn clean_stale(state_dir: &Path) -> io::Result<Cleaned> {
             out.live += 1;
             continue;
         }
-        match remove_dead(&rec) {
+        if Instant::now() >= deadline {
+            out.unfinished += 1;
+            continue;
+        }
+        match remove_dead(&rec, Some(deadline)) {
             Ok(Dead::Removed) => {
                 let _ = sys::unlinkat(bfd(&dir), &name, 0);
                 out.removed += 1;
@@ -528,6 +587,30 @@ pub fn clean_stale(state_dir: &Path) -> io::Result<Cleaned> {
                     rec.staging.escape_debug()
                 );
                 let _ = sys::unlinkat(bfd(&dir), &name, 0);
+            }
+            Ok(Dead::Waiting(why)) => {
+                let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
+                if age > WAIT_LIMIT {
+                    log::warn!(
+                        "Dropping the job record of {}: {why} for over 30 days.",
+                        rec.staging.escape_debug()
+                    );
+                    let _ = sys::unlinkat(bfd(&dir), &name, 0);
+                    out.aged_out += 1;
+                } else {
+                    log::debug!(
+                        "Keeping the job record of {}: {why}.",
+                        rec.staging.escape_debug()
+                    );
+                    out.waiting += 1;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                log::warn!(
+                    "The leftover staging folder {} wasn't removed in time; it stays for the next start.",
+                    rec.staging.escape_debug()
+                );
+                out.unfinished += 1;
             }
             Err(e) => {
                 log::warn!(
@@ -570,6 +653,9 @@ fn read_record(dir: BorrowedFd<'_>, name: &[u8]) -> Option<(Record, SystemTime)>
 enum Dead {
     Removed,
     NotOurs,
+    /// The destination can't be checked now (gone, or a different folder):
+    /// the folder may still exist, so the record waits.
+    Waiting(&'static str),
 }
 
 /// A staging folder that the job made: a folder of ours, mode exactly 0700
@@ -580,15 +666,18 @@ fn is_proven_staging(st: &libc::stat) -> bool {
         && st.st_mode & 0o7777 == 0o700
 }
 
-fn remove_dead(rec: &Record) -> io::Result<Dead> {
+fn remove_dead(rec: &Record, deadline: Option<Instant>) -> io::Result<Dead> {
     // Without following a link at the end; if the user's own path is a link
     // (a folder reached through one), follow it but then demand the exact
     // device and inode.
     let (dest, followed) = match sys::open_dir_nofollow(&rec.dest) {
         Ok(d) => (d, false),
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => (sys::open_dir(&rec.dest)?, true),
-        // The destination is gone, and the folder with it.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Dead::Removed),
+        // Gone, or on a drive that isn't mounted: the hidden folder may still
+        // be there, so the record waits.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(Dead::Waiting("the destination isn't there"));
+        }
         Err(e) => return Err(e),
     };
     let st = sys::fstat(bfd(&dest))?;
@@ -597,11 +686,16 @@ fn remove_dead(rec: &Record) -> io::Result<Dead> {
     // staging proof below carry it. With the device the same, a different
     // inode means the path leads elsewhere now: keep the record.
     if st.st_ino != rec.ino || (followed && st.st_dev != rec.dev) {
-        return Err(io::Error::other(
+        return Ok(Dead::Waiting(
             "the destination isn't the folder the job was given",
         ));
     }
-    match remove_proven(bfd(&dest), rec.staging.as_bytes(), None, &is_proven_staging)? {
+    match remove_proven(
+        bfd(&dest),
+        rec.staging.as_bytes(),
+        deadline,
+        &is_proven_staging,
+    )? {
         true => Ok(Dead::Removed),
         false => Ok(Dead::NotOurs),
     }
@@ -679,22 +773,18 @@ fn remove_leaf(dir: BorrowedFd<'_>, name: &[u8]) -> Leaf {
 }
 
 /// Opens the folder `name` below `dir` for emptying: owned by us but locked is
-/// unlocked, and it is made searchable and writable for its owner.
+/// unlocked, and it is made searchable and writable for its owner. The unlock
+/// goes by a descriptor that was checked (a folder, ours), never by name.
 fn open_for_delete(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<OwnedFd> {
     let fd = match sys::open_subdir(dir, name) {
         Err(e) if e.raw_os_error() == Some(libc::EACCES) => {
-            if let Ok(c) = cstr(name) {
-                // SAFETY: valid descriptor and C string; with
-                // AT_SYMLINK_NOFOLLOW the call fails on a link.
-                unsafe {
-                    libc::fchmodat(
-                        dir.as_raw_fd(),
-                        c.as_ptr(),
-                        0o700,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                };
+            let held = sys::open_path_nofollow(dir, name)?;
+            let st = sys::fstat(bfd(&held))?;
+            if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != sys::getuid() {
+                return Err(e);
             }
+            sys::fchmod_path(bfd(&held), 0o700)?;
+            drop(held);
             sys::open_subdir(dir, name)?
         }
         r => r?,
@@ -720,17 +810,52 @@ fn move_to_top(dir: BorrowedFd<'_>, name: &[u8], root: BorrowedFd<'_>) -> io::Re
     Err(last)
 }
 
+/// Non-empty child folders a frame keeps to descend into before it reads its
+/// folder again. Bounds the memory of the walk and, with `BATCH` and
+/// `DELETE_DEPTH`, its descriptors.
+const PENDING: usize = 256;
+
+/// A folder being emptied: `fd` is `None` for the root, whose descriptor the
+/// caller holds.
+struct Frame {
+    name: Vec<u8>,
+    fd: Option<OwnedFd>,
+    /// Names that were non-empty folders at the last read, to descend into.
+    pending: Vec<Vec<u8>>,
+    /// A read's names are being worked off (its pending list not yet done).
+    round_open: bool,
+    /// Something in this round went away.
+    progressed: bool,
+    first: Option<io::Error>,
+}
+
+impl Frame {
+    fn new(name: Vec<u8>, fd: Option<OwnedFd>) -> Frame {
+        Frame {
+            name,
+            fd,
+            pending: Vec::new(),
+            round_open: false,
+            progressed: false,
+            first: None,
+        }
+    }
+}
+
 /// Removes everything in the folder `root`, keeping `root` itself. Iterative
 /// and without depth limit: it holds at most `DELETE_DEPTH` + 2 descriptors,
 /// reads names `BATCH` at a time (so a folder of millions never sits in
 /// memory), and moves a subtree that gets deeper than `DELETE_DEPTH` up to
-/// `root` to be walked from there. Never follows a link; every open resolves
-/// below the folder it starts from (`sys::RESOLVE`).
+/// `root` to be walked from there. A folder keeps up to `PENDING` non-empty
+/// children from one read and descends into them in turn, so a folder of
+/// many folders is read once per `PENDING` of them, not once per child. Never
+/// follows a link; every open resolves below the folder it starts from
+/// (`sys::RESOLVE`).
 fn purge(root: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<()> {
     // Search and write for the owner, or nothing below can go.
     let _ = sys::fchmod(root, 0o700);
-    // The folders being emptied below `root`, deepest last, with their names.
-    let mut stack: Vec<(Vec<u8>, OwnedFd)> = Vec::new();
+    // The folders being emptied, the root first, the deepest last.
+    let mut stack: Vec<Frame> = vec![Frame::new(Vec::new(), None)];
     loop {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(io::Error::new(
@@ -740,52 +865,73 @@ fn purge(root: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<()> {
         }
         let cur_raw: RawFd = stack
             .last()
-            .map_or(root.as_raw_fd(), |(_, fd)| fd.as_raw_fd());
+            .and_then(|f| f.fd.as_ref())
+            .map_or(root.as_raw_fd(), |fd| fd.as_raw_fd());
         // SAFETY: `cur_raw` is `root` or a descriptor in `stack`; pushing to
         // the stack moves the OwnedFd, not the descriptor, and a pop below
         // happens only after the last use of `cur`.
         let cur = unsafe { BorrowedFd::borrow_raw(cur_raw) };
-        let names = read_names(cur, BATCH)?;
-        if names.is_empty() {
-            let Some((name, fd)) = stack.pop() else {
-                return Ok(());
-            };
-            drop(fd);
-            let parent = stack.last().map_or(root, |(_, fd)| fd.as_fd());
-            ignore_missing(sys::unlinkat(parent, &name, libc::AT_REMOVEDIR))?;
+        let deep = stack.len() > DELETE_DEPTH;
+        let top = stack.last_mut().expect("the root frame is never popped");
+        if let Some(n) = top.pending.pop() {
+            match open_for_delete(cur, &n) {
+                Ok(fd) => stack.push(Frame::new(n, Some(fd))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => top.progressed = true,
+                Err(e) => {
+                    top.first.get_or_insert(e);
+                }
+            }
             continue;
         }
-        let mut progressed = false;
-        let mut first: Option<io::Error> = None;
-        for n in &names {
-            match remove_leaf(cur, n) {
-                Leaf::Gone => progressed = true,
-                Leaf::Err(e) => {
-                    first.get_or_insert(e);
-                }
-                Leaf::NotEmpty if stack.len() >= DELETE_DEPTH => match move_to_top(cur, n, root) {
-                    Ok(()) => progressed = true,
-                    Err(e) => {
-                        first.get_or_insert(e);
-                    }
-                },
-                Leaf::NotEmpty => match open_for_delete(cur, n) {
-                    Ok(fd) => {
-                        stack.push((n.clone(), fd));
-                        // The rest of this batch is read again later.
-                        progressed = true;
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => progressed = true,
-                    Err(e) => {
-                        first.get_or_insert(e);
-                    }
-                },
+        if top.round_open {
+            top.round_open = false;
+            if !top.progressed {
+                // Nothing in this round could go: reading again would loop.
+                return Err(top
+                    .first
+                    .take()
+                    .unwrap_or_else(|| io::Error::other("a folder couldn't be emptied")));
             }
         }
-        if !progressed {
-            // Nothing in this pass could go: reading again would loop.
-            return Err(first.unwrap_or_else(|| io::Error::other("a folder couldn't be emptied")));
+        let names = read_names(cur, BATCH)?;
+        if names.is_empty() {
+            if stack.len() == 1 {
+                return Ok(());
+            }
+            let done = stack.pop().expect("checked above");
+            drop(done.fd);
+            let parent = stack.last_mut().expect("the root frame is left");
+            let pfd = match &parent.fd {
+                Some(fd) => fd.as_fd(),
+                None => root,
+            };
+            ignore_missing(sys::unlinkat(pfd, &done.name, libc::AT_REMOVEDIR))?;
+            parent.progressed = true;
+            continue;
+        }
+        top.round_open = true;
+        top.progressed = false;
+        top.first = None;
+        for n in names {
+            match remove_leaf(cur, &n) {
+                Leaf::Gone => top.progressed = true,
+                Leaf::Err(e) => {
+                    top.first.get_or_insert(e);
+                }
+                Leaf::NotEmpty if deep => match move_to_top(cur, &n, root) {
+                    Ok(()) => top.progressed = true,
+                    Err(e) => {
+                        top.first.get_or_insert(e);
+                    }
+                },
+                Leaf::NotEmpty => {
+                    top.pending.push(n);
+                    // The rest of the batch is read again later.
+                    if top.pending.len() >= PENDING {
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -912,12 +1058,25 @@ mod tests {
         p
     }
 
-    fn open_fds() -> usize {
-        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    /// The descriptor counts below need the file tests one at a time.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Descriptors this process holds on `base` or below it (other tests
+    /// may hold others of their own at the same time).
+    fn open_fds(base: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter(|p| p.starts_with(base))
+            .count()
     }
 
     #[test]
     fn a_chain_of_two_thousand_folders_is_removed_without_a_trace() {
+        let _g = serial();
         let base = scratch("deep");
         let top = sys::open_dir(&base).unwrap();
         sys::mkdirat(bfd(&top), b"s", 0o700).unwrap();
@@ -929,9 +1088,9 @@ mod tests {
             cur = sys::open_subdir(bfd(&cur), b"d").unwrap();
         }
         drop(cur);
-        let before = open_fds();
+        let before = open_fds(&base);
         assert!(remove_proven(bfd(&top), b"s", None, &|_| true).unwrap());
-        assert_eq!(open_fds(), before, "no descriptor is left open");
+        assert_eq!(open_fds(&base), before, "no descriptor is left open");
         assert_eq!(
             sys::lstatat(bfd(&top), b"s").unwrap_err().kind(),
             io::ErrorKind::NotFound
@@ -946,6 +1105,7 @@ mod tests {
 
     #[test]
     fn a_folder_of_two_hundred_thousand_files_is_removed() {
+        let _g = serial();
         let base = scratch("flat");
         let top = sys::open_dir(&base).unwrap();
         sys::mkdirat(bfd(&top), b"s", 0o700).unwrap();
@@ -961,6 +1121,7 @@ mod tests {
 
     #[test]
     fn a_proof_that_fails_removes_nothing_and_a_deadline_stops_the_delete() {
+        let _g = serial();
         let base = scratch("proof");
         let top = sys::open_dir(&base).unwrap();
         sys::mkdirat(bfd(&top), b"s", 0o700).unwrap();
@@ -972,6 +1133,198 @@ mod tests {
         let e = remove_proven(bfd(&top), b"s", Some(past), &|_| true).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert!(sys::lstatat(bfd(&s), b"f").is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn fake_stat(mode: u32, gid: u32) -> libc::stat {
+        // SAFETY: an all-zero `stat` is a valid value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_mode = libc::S_IFDIR | mode;
+        st.st_gid = gid;
+        st
+    }
+
+    #[test]
+    fn shared_destinations_are_told_by_other_write_or_a_foreign_group() {
+        let me = 1000;
+        assert!(!shared_for(&fake_stat(0o755, 7), me));
+        assert!(shared_for(&fake_stat(0o757, me), me));
+        assert!(!shared_for(&fake_stat(0o1777, me), me), "sticky");
+        // Group write on our own group is allowed; on another group it isn't.
+        assert!(!shared_for(&fake_stat(0o775, me), me));
+        assert!(shared_for(&fake_stat(0o775, 7), me));
+        assert!(!shared_for(&fake_stat(0o1775, 7), me), "sticky");
+        assert!(!shared_for(&fake_stat(0o755, 7), me), "group read only");
+    }
+
+    #[test]
+    fn a_folder_of_twenty_thousand_folders_is_removed_quickly() {
+        let _g = serial();
+        let base = scratch("wide");
+        let top = sys::open_dir(&base).unwrap();
+        sys::mkdirat(bfd(&top), b"s", 0o700).unwrap();
+        let s = sys::open_subdir(bfd(&top), b"s").unwrap();
+        for i in 0..20_000u32 {
+            let n = i.to_string();
+            sys::mkdirat(bfd(&s), n.as_bytes(), 0o700).unwrap();
+            let d = sys::open_subdir(bfd(&s), n.as_bytes()).unwrap();
+            drop(create_new(bfd(&d), b"f", 0o600).unwrap());
+        }
+        drop(s);
+        let t = Instant::now();
+        assert!(remove_proven(bfd(&top), b"s", None, &|_| true).unwrap());
+        assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_locked_folder_of_ours_is_unlocked_by_descriptor_and_removed() {
+        let _g = serial();
+        let base = scratch("locked");
+        let top = sys::open_dir(&base).unwrap();
+        sys::mkdirat(bfd(&top), b"s", 0o700).unwrap();
+        let s = sys::open_subdir(bfd(&top), b"s").unwrap();
+        sys::mkdirat(bfd(&s), b"l", 0o700).unwrap();
+        let l = sys::open_subdir(bfd(&s), b"l").unwrap();
+        drop(create_new(bfd(&l), b"f", 0o600).unwrap());
+        sys::fchmod(bfd(&l), 0).unwrap();
+        drop((l, s));
+        assert!(remove_proven(bfd(&top), b"s", None, &|_| true).unwrap());
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A record of a dead job in `state`, for the staging `name` in `dest`
+    /// (which is told to be device `dev`, inode `ino`).
+    fn dead_record(state: &Path, dest: &Path, dev: u64, ino: u64, name: &str) -> PathBuf {
+        let dir = open_jobs_dir(state, true).unwrap();
+        let file = format!("dead-{name}.job");
+        let rec = Record {
+            pid: 0x7fff_fff0,
+            start: 1,
+            boot: None,
+            dest: dest.to_path_buf(),
+            dev,
+            ino,
+            staging: name.to_string(),
+        };
+        RecordFile {
+            dir,
+            file: file.clone(),
+        }
+        .write(rec.encode().as_bytes())
+        .unwrap();
+        jobs_dir(state).join(file)
+    }
+
+    fn back_date(path: &Path, days: u64) {
+        let then = SystemTime::now() - Duration::from_secs(days * 24 * 3600);
+        let secs = then
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ts = libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: 0,
+        };
+        let c = cstr(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid C string and two valid timespecs.
+        let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [ts, ts].as_ptr(), 0) };
+        assert_eq!(r, 0, "{}", io::Error::last_os_error());
+    }
+
+    fn stat_of(p: &Path) -> libc::stat {
+        sys::fstat(bfd(&sys::open_dir(p).unwrap())).unwrap()
+    }
+
+    const STAGE: &str = ".x.zip.atlas-partial-0123456789abcdef";
+
+    #[test]
+    fn a_tiny_budget_leaves_a_big_leftover_and_its_record() {
+        let _g = serial();
+        let base = scratch("budget");
+        let dest = base.join("dest");
+        let state = base.join("state");
+        std::fs::create_dir_all(dest.join(STAGE)).unwrap();
+        std::fs::set_permissions(
+            dest.join(STAGE),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let sd = sys::open_dir(&dest.join(STAGE)).unwrap();
+        for i in 0..5000u32 {
+            drop(create_new(bfd(&sd), i.to_string().as_bytes(), 0o600).unwrap());
+        }
+        drop(sd);
+        let st = stat_of(&dest);
+        let rec = dead_record(&state, &dest, st.st_dev, st.st_ino, STAGE);
+        let c = clean_stale_within(&state, Duration::ZERO).unwrap();
+        assert_eq!((c.removed, c.unfinished, c.failed), (0, 1, 0), "{c:?}");
+        assert!(rec.exists(), "the record stays");
+        assert!(dest.join(STAGE).join("0").exists(), "the folder stays");
+        // With time, the next start finishes it.
+        let c = clean_stale_within(&state, Duration::from_secs(60)).unwrap();
+        assert_eq!((c.removed, c.unfinished), (1, 0), "{c:?}");
+        assert!(!rec.exists() && !dest.join(STAGE).exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn records_of_a_missing_or_different_destination_wait_thirty_days() {
+        let _g = serial();
+        let base = scratch("wait");
+        let dest = base.join("dest");
+        let state = base.join("state");
+        std::fs::create_dir_all(&dest).unwrap();
+        let st = stat_of(&dest);
+        let gone = dead_record(&state, &base.join("unmounted"), 1, 1, STAGE);
+        let other = dead_record(
+            &state,
+            &dest,
+            st.st_dev,
+            st.st_ino + 1,
+            ".y.zip.atlas-partial-0123456789abcdef",
+        );
+        let c = clean_stale(&state).unwrap();
+        assert_eq!(
+            (c.waiting, c.failed, c.aged_out, c.removed),
+            (2, 0, 0, 0),
+            "{c:?}"
+        );
+        assert!(gone.exists() && other.exists());
+        // Still waiting after 29 days, dropped after 31.
+        back_date(&gone, 29);
+        back_date(&other, 29);
+        let c = clean_stale(&state).unwrap();
+        assert_eq!((c.waiting, c.aged_out), (2, 0), "{c:?}");
+        back_date(&gone, 31);
+        back_date(&other, 31);
+        let c = clean_stale(&state).unwrap();
+        assert_eq!((c.waiting, c.aged_out, c.failed), (0, 2, 0), "{c:?}");
+        assert!(!gone.exists() && !other.exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_timed_out_remove_is_not_tried_again_by_drop() {
+        let _g = serial();
+        let base = scratch("stuck");
+        let dest = sys::open_dir(&base).unwrap();
+        let state = base.join("state");
+        let mut st = Staging::create(dest, &base, b"a.zip", Some(&state)).unwrap();
+        let name = st.name().to_string();
+        let sfd = sys::openat2(st.fd(), b".", libc::O_RDONLY | libc::O_DIRECTORY).unwrap();
+        drop(create_new(bfd(&sfd), b"f", 0o600).unwrap());
+        let e = st.clear_within(Duration::ZERO).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(st.remove().is_ok(), "a stuck folder isn't retried");
+        drop(st);
+        assert!(
+            base.join(&name).join("f").exists(),
+            "left for the next start"
+        );
+        assert_eq!(std::fs::read_dir(jobs_dir(&state)).unwrap().count(), 1);
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

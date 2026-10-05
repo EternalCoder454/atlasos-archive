@@ -230,7 +230,9 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   says where both are. Before and after the move out, the name in the
   destination is checked (device, inode, type) to be staging's descriptor.
   A destination folder others can write to is refused unless it is sticky
-  ("Choose a folder of your own"). What remains is a race with the user's
+  ("Choose a folder of your own"); so is one a group other than the
+  user's own can write to. Staging stays exactly 0700 until it is in place,
+  and gets its final mode by descriptor after the move. What remains is a race with the user's
   own processes, which have the user's rights anyway. On file systems
   without `RENAME_NOREPLACE` (FAT, exFAT, some FUSE, NFS and SMB mounts) the
   move falls back to a check then `renameat`, and modes that can't be set
@@ -238,7 +240,9 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
 - A cancel deletes staging (by descriptor, never following links,
   iteratively with a bounded number of descriptors: subtrees deeper than a
   bound are renamed up to the top and deleted from there; names are read in
-  batches; the whole delete is bounded in time). A crash leaves only the
+  batches, with up to 256 non-empty subfolders pending per level so a wide
+  tree is read once; every delete is bounded in time, and one that runs out
+  is left for the next start, never retried at once). A crash leaves only the
   hidden staging folder: each job records its staging path, the boot id and
   the destination folder's device and inode in
   `~/.local/state/atlas-archive/jobs/` (0700, records ours and not group or
@@ -247,8 +251,11 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   itself: the target's name must match `.<name>.atlas-partial-<16 hex>`,
   and only a folder of ours with mode 0700 is deleted. When the device
   number differs (btrfs changes it across boots) but the folder's inode and
-  that proof hold, it is deleted; otherwise the record is kept. This runs
-  off the UI thread, since a dead mount can block it. The user's files
+  that proof hold, it is deleted. A record whose destination is missing
+  (an unplugged drive) or holds another folder now waits, and is dropped
+  after 30 days. The whole cleanup has a 20 s budget per start; a delete
+  that doesn't finish keeps its record for the next one. This runs off the
+  UI thread, since a dead mount can block it. The user's files
   never mix with half a tree.
 - Before writing, the free space below the destination is checked against
   the declared total; a full disk mid-way stops with "There isn't enough

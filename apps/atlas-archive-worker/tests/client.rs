@@ -1173,7 +1173,13 @@ fn a_new_boot_or_device_number_still_cleans_up_what_is_proven() {
     // Nothing matches: kept too.
     record_full(&s, "4.job", dead_pid(), 5, None, (dev + 7, ino + 1), n4);
     let c = clean_stale(&s.state).unwrap();
-    assert_eq!((c.removed, c.live, c.failed), (2, 0, 2), "{c:?}");
+    // A different folder at the path isn't a failure: the record waits (and
+    // is dropped after 30 days).
+    assert_eq!(
+        (c.removed, c.live, c.failed, c.waiting),
+        (2, 0, 0, 2),
+        "{c:?}"
+    );
     assert_eq!(s.ls(), [n3, n4]);
     assert_eq!(
         s.jobs(),
