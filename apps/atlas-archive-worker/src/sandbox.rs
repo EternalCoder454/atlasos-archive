@@ -277,7 +277,9 @@ mod tests {
             assert!(
                 eperm(
                     libc::prlimit(
-                        libc::getppid(),
+                        // 0 when the parent is outside our PID namespace,
+                        // which would ask about ourselves.
+                        libc::getppid().max(1),
                         libc::RLIMIT_NOFILE,
                         std::ptr::null(),
                         old.as_mut_ptr()

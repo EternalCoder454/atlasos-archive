@@ -158,6 +158,10 @@ fn denied() -> Vec<i64> {
         libc::SYS_mq_getsetattr,
         // Priorities: the caller's own are the system's to keep.
         libc::SYS_setpriority,
+        libc::SYS_ioprio_set,
+        // Moving another process's pages between NUMA nodes.
+        libc::SYS_migrate_pages,
+        libc::SYS_move_pages,
     ];
     #[cfg(target_arch = "x86_64")]
     calls.extend([libc::SYS_fork, libc::SYS_vfork, libc::SYS_modify_ldt]);
@@ -165,7 +169,10 @@ fn denied() -> Vec<i64> {
 }
 
 /// Calls that act on a process by its first argument, and so only on the
-/// caller's own (pid 0). glibc's `setrlimit` is `prlimit64(0, ...)`.
+/// caller's own (pid 0). glibc's `setrlimit` is `prlimit64(0, ...)`. glibc
+/// names a new thread by its tid when a pthread attribute sets affinity or
+/// scheduling, so such a `pthread_create` would fail here: nothing in the
+/// worker does that, and the 7z/unrar profile gets its own filter.
 fn own_process_only() -> [i64; 5] {
     [
         libc::SYS_prlimit64,

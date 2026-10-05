@@ -32,6 +32,11 @@ use crate::tree::{MAX_NODES, ROOT, Tree};
 /// on its work. Nothing holds them all at once: a path is built for one
 /// entry at a time, as the tree takes it, and dropped.
 const MAX_PATH_TOTAL: usize = 256 << 20;
+/// The most symlink target bytes the walk keeps, all links together: each
+/// is held (and copied once into the tree) until the audit ends, so this
+/// bounds the client's memory against a staging folder of a million long
+/// links.
+const MAX_LINK_TOTAL: usize = 64 << 20;
 /// The longest path the kernel resolves is `PATH_MAX` - 1 bytes (the NUL
 /// counts); a longer one is refused by the walk, as nesting too deep.
 const MAX_PATH_LEN: usize = 4095;
@@ -333,6 +338,7 @@ fn walk(staging: BorrowedFd<'_>) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
     let mut found: Vec<Found> = Vec::new();
     let mut names: Vec<Vec<u8>> = Vec::new();
     let mut path_total = 0usize;
+    let mut link_total = 0usize;
     let mut queue: VecDeque<Option<usize>> = VecDeque::from([None]);
     while let Some(dir) = queue.pop_front() {
         let (dir_path, depth) = match dir {
@@ -348,7 +354,8 @@ fn walk(staging: BorrowedFd<'_>) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
                 ));
             }
             path_total += len;
-            if path_total > MAX_PATH_TOTAL {
+            link_total += link.as_ref().map_or(0, Vec::len);
+            if path_total > MAX_PATH_TOTAL || link_total > MAX_LINK_TOTAL {
                 return Err(too_many());
             }
             let kind = match st.st_mode & libc::S_IFMT {
@@ -515,6 +522,18 @@ fn build_tree(
 /// Audits `staging` (see the module comment). An error leaves staging half
 /// fixed: the caller must then delete it, never move it out.
 pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
+    audit_fd(staging, umask).map_err(|e| {
+        // A rename to a longer disk form (an invalid byte becomes U+FFFD)
+        // can push a name or path past the kernel's limits.
+        if e.raw_os_error() == Some(libc::ENAMETOOLONG) {
+            io::Error::other("A name in the extracted files is too long to check.")
+        } else {
+            e
+        }
+    })
+}
+
+fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
     // Staging itself: the owner's alone while it is checked (the move out
     // gives the folder its final mode), with no ACL.
     // SAFETY: a valid descriptor.
@@ -629,11 +648,18 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
     // Two folders whose names have the same disk form are one folder in the
     // tree, and the other has no place in it. Merging them is no job for an
     // audit that can't see what they hold: the extraction fails, in words.
+    // A folder the tree skipped for its own reasons (depth, length, count)
+    // fails the same way, with that reason.
     if let Some(&i) = gone.iter().find(|&&i| found[i].kind == Kind::Dir) {
-        return Err(io::Error::other(format!(
-            "Two folders in the extracted files ({}) would end up with the same name, and Atlas Archive won't merge them.",
-            shown(&path_of(&found, &names, i))
-        )));
+        let path = shown(&path_of(&found, &names, i));
+        return Err(io::Error::other(
+            match skip_reason.get(&(position[i] as u32)) {
+                Some(r) => format!("A folder in the extracted files ({path}) can't be kept: {r}"),
+                None => format!(
+                    "Two folders in the extracted files ({path}) would end up with the same name, and Atlas Archive won't merge them."
+                ),
+            },
+        ));
     }
     gone.sort_by_key(|&i| found[i].parent);
     let mut folders = Folders::new();
@@ -1199,5 +1225,30 @@ mod tests {
         }
         std::fs::create_dir_all(&p).unwrap();
         assert!(audit_path(&s.staging(), 0o022).is_err());
+    }
+
+    #[test]
+    fn link_targets_have_a_budget() {
+        let s = Scratch::new("link-budget");
+        let st = s.staging();
+        let target = "t".repeat(4000);
+        for i in 0..(MAX_LINK_TOTAL / 4000 + 1) {
+            std::os::unix::fs::symlink(&target, st.join(format!("{i}"))).unwrap();
+        }
+        let e = audit_path(&st, 0o022).err().expect("fails");
+        assert_eq!(e.to_string(), too_many().to_string());
+    }
+
+    #[test]
+    fn a_name_too_long_once_fixed_fails_in_words() {
+        let s = Scratch::new("long");
+        let st = s.staging();
+        // 255 bytes that aren't UTF-8: each becomes U+FFFD (3 bytes) on disk.
+        let name = std::ffi::OsStr::from_bytes(&[0xB0; 255]);
+        std::fs::write(st.join(name), b"1").unwrap();
+        match audit_path(&st, 0o022) {
+            Ok(_) => {}
+            Err(e) => assert!(!e.to_string().contains("os error"), "{e}"),
+        }
     }
 }

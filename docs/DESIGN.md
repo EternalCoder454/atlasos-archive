@@ -105,7 +105,8 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    `ptrace` and `process_vm_*`, extended attributes and ACLs (`*setxattr*`),
    io_uring and the older `io_*` calls, BPF, perf, keyrings, `userfaultfd`,
    mounts, modules and the other administrative calls, System V and POSIX
-   message queues, shared memory and semaphores, `kcmp`, `setpriority`, and
+   message queues, shared memory and semaphores, `kcmp`, `setpriority`,
+   `ioprio_set`, `migrate_pages`, `move_pages`, and
    the terminal and btrfs `ioctl` commands that reach outside the worker
    (`TIOCSTI`, `TIOCLINUX`, `TIOCCONS`, `TIOCSCTTY`, `TIOCSETD`, subvolume
    and snapshot creation); `prlimit64` and the `sched_set*` calls work only
@@ -274,7 +275,8 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   walk found. The tree it returns is built again from what is left, and
   each item's name in it must be its name on disk, or the audit fails. Two
   folders whose names have the same disk form are never merged: the audit
-  fails. Paths of 4096 bytes or more fail it too. Removals are reported as
+  fails. Paths of 4096 bytes or more fail it too, as do more than 64 MiB of
+  symlink targets in all, and a name too long once it is in disk form. Removals are reported as
   skipped entries: the first 1000 by name (each shown in at most 1024
   bytes), the rest as a count.
 - **After a libarchive extraction** the client runs the audit itself, once
