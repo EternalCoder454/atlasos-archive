@@ -83,6 +83,10 @@ fn denied() -> Vec<i64> {
         libc::SYS_process_vm_writev,
         libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
+        // Landlock's signal scope covers it; denied anyway, with
+        // process_mrelease (reaping another process's memory).
+        libc::SYS_pidfd_send_signal,
+        libc::SYS_process_mrelease,
         libc::SYS_process_madvise,
         // Network, of every family.
         libc::SYS_socket,

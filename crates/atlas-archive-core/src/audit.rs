@@ -32,10 +32,11 @@ use crate::tree::{MAX_NODES, ROOT, Tree};
 /// on its work. Nothing holds them all at once: a path is built for one
 /// entry at a time, as the tree takes it, and dropped.
 const MAX_PATH_TOTAL: usize = 256 << 20;
-/// The most symlink target bytes the walk keeps, all links together: each
-/// is held (and copied once into the tree) until the audit ends, so this
-/// bounds the client's memory against a staging folder of a million long
-/// links.
+/// The most link target bytes the audit holds, all links together: symlink
+/// targets as the walk reads them, and the target path of every hard link
+/// (each tree keeps a copy until it is finished, a kept symlink a few
+/// more), so this bounds the client's memory against a staging folder of a
+/// million long links.
 const MAX_LINK_TOTAL: usize = 64 << 20;
 /// The longest path the kernel resolves is `PATH_MAX` - 1 bytes (the NUL
 /// counts); a longer one is refused by the walk, as nesting too deep.
@@ -245,7 +246,9 @@ type Listed = (Vec<u8>, libc::stat, Option<Vec<u8>>);
 
 /// The items in the folder `dir`, with their `lstat` and link targets; at
 /// most `budget` of them.
-fn read_dir(dir: BorrowedFd<'_>, budget: usize) -> io::Result<Vec<Listed>> {
+/// `links_left`: the symlink target bytes still allowed, spent as each
+/// target is read, so one folder of long links can't fill memory first.
+fn read_dir(dir: BorrowedFd<'_>, budget: usize, links_left: &mut usize) -> io::Result<Vec<Listed>> {
     let raw = dir.as_raw_fd();
     // SAFETY: plain fcntl; the copy is ours.
     let copy = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
@@ -305,6 +308,10 @@ fn read_dir(dir: BorrowedFd<'_>, budget: usize) -> io::Result<Vec<Listed>> {
             if n < 0 {
                 break Err(io::Error::last_os_error());
             }
+            let Some(left) = links_left.checked_sub(n as usize) else {
+                break Err(too_many());
+            };
+            *links_left = left;
             Some(buf[..n as usize].to_vec())
         } else {
             None
@@ -332,13 +339,40 @@ fn path_of(found: &[Found], names: &[Vec<u8>], i: usize) -> Vec<u8> {
     path
 }
 
+/// The length of `path_of(found, names, i)`, without building it.
+fn path_len(found: &[Found], names: &[Vec<u8>], i: usize) -> usize {
+    let mut len = names[i].len();
+    let mut at = found[i].parent;
+    while let Some(p) = at {
+        len += names[p].len() + 1;
+        at = found[p].parent;
+    }
+    len
+}
+
+/// Fails when the hard links' target paths, which a tree holds until it is
+/// finished, would pass what is left of the link budget.
+fn hardlinks_fit(
+    found: &[Found],
+    names: &[Vec<u8>],
+    hardlink_to: &HashMap<usize, usize>,
+    links_left: usize,
+) -> io::Result<()> {
+    let mut left = links_left;
+    for &to in hardlink_to.values() {
+        left = left
+            .checked_sub(path_len(found, names, to))
+            .ok_or_else(too_many)?;
+    }
+    Ok(())
+}
+
 /// Every item below staging, breadth first, with their names; one folder
 /// open at a time.
-fn walk(staging: BorrowedFd<'_>) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
+fn walk(staging: BorrowedFd<'_>, links_left: &mut usize) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
     let mut found: Vec<Found> = Vec::new();
     let mut names: Vec<Vec<u8>> = Vec::new();
     let mut path_total = 0usize;
-    let mut link_total = 0usize;
     let mut queue: VecDeque<Option<usize>> = VecDeque::from([None]);
     while let Some(dir) = queue.pop_front() {
         let (dir_path, depth) = match dir {
@@ -346,7 +380,7 @@ fn walk(staging: BorrowedFd<'_>) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
             Some(i) => (path_of(&found, &names, i), found[i].depth + 1),
         };
         let fd = open_dir(staging, &dir_path)?;
-        for (name, st, link) in read_dir(fd.as_fd(), MAX_NODES - found.len())? {
+        for (name, st, link) in read_dir(fd.as_fd(), MAX_NODES - found.len(), links_left)? {
             let len = dir_path.len() + usize::from(!dir_path.is_empty()) + name.len();
             if depth >= MAX_DEPTH || len > MAX_PATH_LEN {
                 return Err(io::Error::other(
@@ -354,8 +388,7 @@ fn walk(staging: BorrowedFd<'_>) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
                 ));
             }
             path_total += len;
-            link_total += link.as_ref().map_or(0, Vec::len);
-            if path_total > MAX_PATH_TOTAL || link_total > MAX_LINK_TOTAL {
+            if path_total > MAX_PATH_TOTAL {
                 return Err(too_many());
             }
             let kind = match st.st_mode & libc::S_IFMT {
@@ -540,7 +573,8 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
     check(unsafe { libc::fchmod(staging.as_raw_fd(), 0o700) })?;
     strip_xattrs(staging)?;
 
-    let (found, mut names) = walk(staging)?;
+    let mut links_left = MAX_LINK_TOTAL;
+    let (found, mut names) = walk(staging, &mut links_left)?;
     let mut removed = Vec::new();
     let mut removed_more = 0usize;
     let mut drop_it = vec![None::<String>; found.len()];
@@ -598,6 +632,7 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
             }
         }
     }
+    hardlinks_fit(&found, &names, &hardlink_to, links_left)?;
     let mut tree = build_tree(&found, &names, &order, &hardlink_to);
     let mut node_of = vec![None::<u32>; found.len()];
     for (id, n) in tree.nodes.iter().enumerate().skip(1) {
@@ -614,6 +649,7 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
             tree.set_hardlink(n, t);
         }
     }
+    let tree_skips_full = tree.skipped_more > 0;
     let skip_reason: HashMap<u32, &str> = tree
         .skipped
         .iter()
@@ -655,6 +691,10 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         return Err(io::Error::other(
             match skip_reason.get(&(position[i] as u32)) {
                 Some(r) => format!("A folder in the extracted files ({path}) can't be kept: {r}"),
+                // Past MAX_SKIPPED the tree keeps no reason: say less.
+                None if tree_skips_full => {
+                    format!("A folder in the extracted files ({path}) can't be kept.")
+                }
                 None => format!(
                     "Two folders in the extracted files ({path}) would end up with the same name, and Atlas Archive won't merge them."
                 ),
@@ -827,6 +867,8 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         .into_iter()
         .filter(|&(i, to)| drop_it[i].is_none() && drop_it[to].is_none())
         .collect();
+    // Names are in disk form now, which can be longer.
+    hardlinks_fit(&found, &names, &hardlink_to, links_left)?;
     let tree = build_tree(&found, &names, &kept, &hardlink_to);
     let placed = tree.nodes.iter().filter(|n| n.entry.is_some()).count();
     if placed != kept.len()
@@ -1240,15 +1282,59 @@ mod tests {
     }
 
     #[test]
-    fn a_name_too_long_once_fixed_fails_in_words() {
+    fn link_targets_are_budgeted_as_they_are_read() {
+        // One folder of long links fails while it is read, not after.
+        let s = Scratch::new("link-one-dir");
+        let st = s.staging();
+        let target = "t".repeat(4000);
+        for i in 0..(MAX_LINK_TOTAL / 4000 + 1) {
+            std::os::unix::fs::symlink(&target, st.join(format!("{i}"))).unwrap();
+        }
+        let mut left = MAX_LINK_TOTAL;
+        let fd = std::fs::File::open(&st).unwrap();
+        let e = read_dir(fd.as_fd(), MAX_NODES, &mut left)
+            .err()
+            .expect("fails");
+        assert_eq!(e.to_string(), too_many().to_string());
+    }
+
+    #[test]
+    fn hard_link_targets_count_against_the_budget() {
+        let s = Scratch::new("hardlink-budget");
+        let st = s.staging();
+        // A file at a long path, and many names for it below that folder
+        // (the walk's first name is the target, so the file comes first).
+        let mut deep = st.clone();
+        for _ in 0..15 {
+            deep.push("d".repeat(250));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("f");
+        std::fs::write(&file, b"1").unwrap();
+        let target_len = file.strip_prefix(&st).unwrap().as_os_str().len();
+        let needed = MAX_LINK_TOTAL / target_len + 1;
+        std::fs::create_dir(deep.join("l")).unwrap();
+        for i in 0..needed {
+            std::fs::hard_link(&file, deep.join("l").join(format!("{i}"))).unwrap();
+        }
+        let e = audit_path(&st, 0o022).err().expect("fails");
+        assert_eq!(e.to_string(), too_many().to_string());
+    }
+
+    #[test]
+    fn a_long_invalid_name_is_fixed_into_one_that_fits() {
+        // 255 bytes that aren't UTF-8: the disk form stays within NAME_MAX,
+        // so the rename can't fail as too long (the audit maps that error
+        // to words anyway, should a disk form ever grow past it).
         let s = Scratch::new("long");
         let st = s.staging();
-        // 255 bytes that aren't UTF-8: each becomes U+FFFD (3 bytes) on disk.
         let name = std::ffi::OsStr::from_bytes(&[0xB0; 255]);
         std::fs::write(st.join(name), b"1").unwrap();
-        match audit_path(&st, 0o022) {
-            Ok(_) => {}
-            Err(e) => assert!(!e.to_string().contains("os error"), "{e}"),
+        let a = audit_path(&st, 0o022).unwrap();
+        assert_eq!(a.renamed, 1);
+        for e in std::fs::read_dir(&st).unwrap() {
+            let n = e.unwrap().file_name();
+            assert!(n.len() <= 255 && n.to_str().is_some(), "{n:?}");
         }
     }
 }
