@@ -967,6 +967,31 @@ fn done_after_a_declined_limit_is_refused() {
 }
 
 #[test]
+fn a_test_job_asks_about_limits_too() {
+    let s = Scratch::new("testlimit");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("l.bin", &limit_reply(Kind::TotalSize));
+    s.frame("done.bin", &Reply::Done { written: vec![] });
+    s.frame(
+        "failed.bin",
+        &Reply::Failed {
+            reason: "stopped".into(),
+        },
+    );
+    // Accepted: the test goes on to its end.
+    let w = s.fake("cat \"$DIR/l.bin\" \"$DIR/done.bin\"; exec sleep 30");
+    let mut rec = Rec {
+        accept_limits: true,
+        ..Rec::default()
+    };
+    w.test(&a, &mut rec, &Cancel::new()).unwrap();
+    // Declined: the worker stops, and the client says why.
+    let w = s.fake("cat \"$DIR/l.bin\" \"$DIR/failed.bin\"; exec sleep 30");
+    let e = w.test(&a, &mut Rec::default(), &Cancel::new()).unwrap_err();
+    assert!(matches!(e, Error::LimitRefused(_)), "{e}");
+}
+
+#[test]
 fn the_worker_gets_only_its_descriptors_a_clean_cwd_and_no_text_tricks() {
     let s = Scratch::new("hygiene");
     let a = s.tar("a.tar.gz", &[("a.txt", "a")]);

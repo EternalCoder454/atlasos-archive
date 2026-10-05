@@ -435,8 +435,14 @@ Job objects disappear 60 s after they finish.
 `list`, `extract`, `test`, `create`, `info`, each with `--json` (one JSON
 object per line, names as given plus a `display` form). Passwords come from
 the terminal or `--password-fd N`, never an argument. Limits are enforced
-unless `--allow-large`. Exit codes: 0 done, 1 failed, 2 bad usage, 3 needs
-a password, 4 a limit refused, 130 cancelled.
+unless `--allow-large`. `extract ARCHIVE [ENTRY…]` takes `--to DIR`,
+`--here`, `--name N` and `--on-clash replace|skip|keep-both` (a folder
+ENTRY brings what is inside it); `list`, `info` and `extract` take
+`--encoding` for names without the UTF-8 flag. Notes on skipped and removed
+entries go to stderr. `test` fails (exit 1) when any item couldn't be read.
+Ctrl-C, SIGTERM and SIGHUP cancel. Exit codes: 0 done, 1 failed, 2 bad
+usage, 3 needs a password (or `--password-fd` gave a wrong one), 4 a limit
+refused, 130 cancelled. `create` exits 2 until the writers land.
 
 The GUI takes `atlas-archive [--extract-here|--extract-to DIR|--extract-all|
 --compress-zip|--compress|--test] FILES…` (the Explorer actions without

@@ -32,6 +32,9 @@ name = "atlas-archive-cli"
 version = "0.1.0"
 dependencies = [
  "atlas-archive-core",
+ "libc",
+ "log",
+ "zeroize",
 ]
 
 [[package]]

@@ -9,3 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 atlas-archive-core = { path = "../../crates/atlas-archive-core" }
+log.workspace = true
+libc.workspace = true
+zeroize.workspace = true

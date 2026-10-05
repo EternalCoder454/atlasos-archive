@@ -768,7 +768,8 @@ fn drive(
                 }
             }
             Reply::NeedPassword { wrong } => return Ok(Final::NeedPassword(wrong)),
-            Reply::Limit(e) if a.op == Op::Extract => {
+            // A test meters bytes like an extraction, so a bomb asks there too.
+            Reply::Limit(e) if a.op != Op::List => {
                 if asked.contains(&e.kind) {
                     return Err(Halt::Bad("the same limit was asked twice"));
                 }
