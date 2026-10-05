@@ -76,7 +76,7 @@ Backends, vetted 2026-10-05:
 - `crates/atlas-archive-engine`: runs only in the worker. libarchive FFI, the
   zip and 7z/unrar drivers, the joined split-volume reader, and the
   extraction writer (`openat2` below the staging folder).
-- `apps/atlas-archive-worker`: the sandboxed process (`/usr/libexec`).
+- `apps/atlas-archive-worker`: the sandboxed process (`/usr/libexec/atlas-archive/atlas-archive-worker`, `client::SYSTEM_WORKER`).
 - `apps/atlas-archive-cli`: `atlas-archive-cli`, no Qt.
 - `apps/atlas-archive`: the GUI. CXX-Qt backend in `src/`, `cpp/main.cpp`
   (Qt start, single instance, the D-Bus adaptor), `qml/`.

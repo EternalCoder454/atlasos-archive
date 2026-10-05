@@ -122,6 +122,21 @@ for bin in %{buildroot}%{_bindir}/atlas-archive %{buildroot}%{_bindir}/atlas-arc
         fi
     done
 done
+# The GUI and the CLI start the worker from this path (client::SYSTEM_WORKER).
+for bin in %{buildroot}%{_bindir}/atlas-archive %{buildroot}%{_bindir}/atlas-archive-cli; do
+    grep -qF "%{_libexecdir}/atlas-archive/atlas-archive-worker" "$bin" ||
+        { echo "$bin doesn't start the installed worker" >&2; exit 1; }
+done
+# No test-only worker override in a shipped build (the dev-worker features).
+for check in "%{buildroot}%{_bindir}/atlas-archive:ATLAS_ARCHIVE_WORKER" \
+    "%{buildroot}%{_bindir}/atlas-archive-cli:ATLAS_ARCHIVE_TEST_FD_WAIT_MS"; do
+    rc=0
+    grep -qF "${check##*:}" "${check%%:*}" || rc=$?
+    if [ "$rc" != 1 ]; then
+        echo "${check%%:*} was built with the dev-worker feature (grep status $rc)" >&2
+        exit 1
+    fi
+done
 desktop-file-validate %{buildroot}%{_datadir}/applications/net.eterneon.atlas.archive.desktop
 appstream-util validate-relax --nonet \
     %{buildroot}%{_datadir}/metainfo/net.eterneon.atlas.archive.metainfo.xml
@@ -133,6 +148,7 @@ appstream-util validate-relax --nonet \
 %dir %{_libexecdir}/atlas-archive
 %{_libexecdir}/atlas-archive/atlas-archive-worker
 %{_datadir}/applications/net.eterneon.atlas.archive.desktop
+%{_datadir}/kio/servicemenus/net.eterneon.atlas.archive.desktop
 %{_datadir}/metainfo/net.eterneon.atlas.archive.metainfo.xml
 %{_datadir}/icons/hicolor/scalable/apps/net.eterneon.atlas.archive.svg
 

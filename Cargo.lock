@@ -25,6 +25,7 @@ dependencies = [
  "cxx-qt-build",
  "cxx-qt-lib",
  "log",
+ "zeroize",
 ]
 
 [[package]]

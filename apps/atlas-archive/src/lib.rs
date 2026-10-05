@@ -4,6 +4,8 @@
 //! in this process: the sandboxed worker does that (docs/DESIGN.md).
 
 mod backend;
+mod job;
+mod view;
 
 atlas_framework_ui::app! {
     name: "Atlas Archive",

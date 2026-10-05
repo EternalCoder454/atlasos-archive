@@ -21,6 +21,12 @@ cxx = "1"
 cxx-qt = "0.10"
 cxx-qt-lib = "0.10"
 log.workspace = true
+zeroize.workspace = true
 
 [build-dependencies]
 cxx-qt-build = "0.10"
+
+[features]
+# `ATLAS_ARCHIVE_WORKER=PATH`: run any executable as the worker, unsandboxed.
+# For smoke tests only; never in a shipped build.
+dev-worker = []

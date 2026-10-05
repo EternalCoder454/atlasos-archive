@@ -9,7 +9,7 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX /usr CACHE PATH "" FORCE)
 endif()
 include(GNUInstallDirs)
-find_package(Qt6 6.11 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Widgets)
+find_package(Qt6 6.11 REQUIRED COMPONENTS Core Gui DBus Qml Quick QuickControls2 Widgets)
 qt_policy(SET QTP0001 NEW)
 qt_policy(SET QTP0004 NEW)
 # atlas-framework-ui's startup code (single instance, window activation)
@@ -19,12 +19,19 @@ find_package(Corrosion REQUIRED)
 
 set(WORKSPACE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
+# -DATLAS_ARCHIVE_FEATURES=dev-worker is for smoke tests only: a worker named
+# by $ATLAS_ARCHIVE_WORKER, unsandboxed. Never in a shipped build.
+set(ATLAS_ARCHIVE_FEATURES "" CACHE STRING "Cargo features of the atlas-archive crate (tests only)")
+
 # Rust library (CXX-Qt QObjects, atlas-framework, atlas-archive-core) and the
 # two Rust programs: the CLI and the sandboxed worker. cxx-qt-build finds Qt
 # via $QMAKE.
 find_program(QMAKE6 NAMES qmake6 qmake REQUIRED)
 corrosion_import_crate(MANIFEST_PATH ${WORKSPACE_DIR}/Cargo.toml
     CRATES atlas-archive atlas-archive-cli atlas-archive-worker LOCKED)
+if(ATLAS_ARCHIVE_FEATURES)
+    corrosion_set_features(atlas_archive FEATURES ${ATLAS_ARCHIVE_FEATURES})
+endif()
 corrosion_set_env_vars(atlas_archive QMAKE=${QMAKE6})
 
 # The framework's C header (atlas/app.h) comes with the crate's sources,
@@ -72,11 +79,14 @@ qt_add_qml_module(atlas-archive-app
     VERSION 1.0
     QML_FILES
         qml/Main.qml
+        qml/ArchiveView.qml
+        qml/JobView.qml
+        qml/Questions.qml
 )
 
 target_link_libraries(atlas-archive-app PRIVATE
     atlas_archive
-    Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Widgets
+    Qt6::Core Qt6::Gui Qt6::DBus Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Widgets
     KF6::DBusAddons KF6::WindowSystem)
 
 install(TARGETS atlas-archive-app RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -85,6 +95,10 @@ install(PROGRAMS $<TARGET_FILE:atlas-archive-cli> DESTINATION ${CMAKE_INSTALL_BI
 install(PROGRAMS $<TARGET_FILE:atlas-archive-worker> DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/atlas-archive)
 install(FILES data/net.eterneon.atlas.archive.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+# Explorer and Dolphin read KDE service menus: the right-click actions.
+install(FILES data/net.eterneon.atlas.archive.servicemenu.desktop
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/kio/servicemenus
+        RENAME net.eterneon.atlas.archive.desktop)
 install(FILES data/net.eterneon.atlas.archive.metainfo.xml
         DESTINATION ${CMAKE_INSTALL_DATADIR}/metainfo)
 install(FILES data/net.eterneon.atlas.archive.svg

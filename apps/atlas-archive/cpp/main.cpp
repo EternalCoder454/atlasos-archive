@@ -9,7 +9,14 @@
 
 #include <QApplication>
 #include <QCommandLineParser>
+#include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusPendingCall>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
+#include <QDesktopServices>
 #include <QDir>
+#include <QFileInfo>
 #include <QQmlApplicationEngine>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -27,6 +34,38 @@ static void activate(QObject *backend, const QStringList &arguments, const QStri
         qWarning("atlas-archive: the backend did not take the launch arguments");
     }
 }
+
+// Shows `path` in the file manager: org.freedesktop.FileManager1.ShowItems,
+// and the folder in the default handler if no file manager answers it. Never
+// waits for the answer.
+static void showInFileManager(const QString &path)
+{
+    const QString uri = QUrl::fromLocalFile(path).toString(QUrl::FullyEncoded);
+    const QString folder = QFileInfo(path).isDir() ? path : QFileInfo(path).absolutePath();
+    QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.FileManager1"),
+                                                          QStringLiteral("/org/freedesktop/FileManager1"),
+                                                          QStringLiteral("org.freedesktop.FileManager1"),
+                                                          QStringLiteral("ShowItems"));
+    message << QStringList{uri} << QString();
+    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(message, 5000));
+    QObject::connect(watcher, &QDBusPendingCallWatcher::finished, watcher, [watcher, folder] {
+        if (watcher->isError()) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
+        }
+        watcher->deleteLater();
+    });
+}
+
+// Receives the backend's showFilesRequested signal.
+class FileManagerBridge : public QObject
+{
+    Q_OBJECT
+public Q_SLOTS:
+    void show(const QString &path)
+    {
+        showInFileManager(path);
+    }
+};
 
 static void raise(QQmlApplicationEngine *engine)
 {
@@ -62,12 +101,8 @@ int main(int argc, char *argv[])
     parser.addHelpOption();
     parser.addVersionOption();
     parser.addOption({QStringLiteral("extract-here"), QStringLiteral("Extract each archive next to it.")});
-    parser.addOption({QStringLiteral("extract-to"), QStringLiteral("Extract each archive into <folder>."), QStringLiteral("folder")});
-    parser.addOption({QStringLiteral("extract-all"), QStringLiteral("Ask once where to extract.")});
-    parser.addOption({QStringLiteral("compress-zip"), QStringLiteral("Compress the files to a ZIP next to them.")});
-    parser.addOption({QStringLiteral("compress"), QStringLiteral("Choose how to compress the files.")});
-    parser.addOption({QStringLiteral("test"), QStringLiteral("Test each archive.")});
-    parser.addPositionalArgument(QStringLiteral("files"), QStringLiteral("Archives to open, or files to compress."), QStringLiteral("[files...]"));
+    parser.addOption({QStringLiteral("extract-to-folder"), QStringLiteral("Extract each archive into a folder named like it, next to it.")});
+    parser.addPositionalArgument(QStringLiteral("files"), QStringLiteral("The archive to open, or the archives to extract."), QStringLiteral("[files...]"));
     // Only --help and --version are acted on here. Every other argument goes
     // to the backend, which alone decides what is valid and says what it
     // refused in the window, so the two never disagree.
@@ -94,6 +129,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // Show Files in the job view.
+    FileManagerBridge files;
+    QObject::connect(backend.get(), SIGNAL(showFilesRequested(QString)), &files, SLOT(show(QString)));
     // A second launch. With nothing but the program name (the launcher
     // icon, the taskbar) the window only comes up, keeping its place.
     QObject::connect(&service, &KDBusService::activateRequested, backend.get(),
@@ -127,3 +165,5 @@ int main(int argc, char *argv[])
     engine.reset();
     return code;
 }
+
+#include "main.moc"

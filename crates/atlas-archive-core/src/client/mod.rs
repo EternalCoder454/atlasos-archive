@@ -44,7 +44,7 @@ use staging::Staging;
 use std::os::unix::ffi::OsStrExt;
 
 /// The installed worker.
-pub const SYSTEM_WORKER: &str = "/usr/libexec/atlas-archive-worker";
+pub const SYSTEM_WORKER: &str = "/usr/libexec/atlas-archive/atlas-archive-worker";
 /// The longest a worker may go without advancing, by default: no progress
 /// (a Progress with more bytes or items, a listing batch) and no answer to a
 /// question. Frames that don't advance don't restart the clock.

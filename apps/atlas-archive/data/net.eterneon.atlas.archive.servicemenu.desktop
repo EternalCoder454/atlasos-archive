@@ -1,27 +1,16 @@
 [Desktop Entry]
-Type=Application
-Name=Atlas Archive
-GenericName=Archive Manager
-Comment=Open, extract and create archives
-Exec=atlas-archive -- %F
-Icon=net.eterneon.atlas.archive
-Terminal=false
-Categories=Qt;KDE;Utility;Archiving;Compression;
-Keywords=zip;7z;rar;tar;gz;xz;zstd;extract;compress;unzip;archive;ark;
-# What Archive opens. Explorer reads this list to decide when to offer
-# Extract. ISO and RPM are listed but stay the defaults of Disks and the Store
-# (docs/DESIGN.md, "Mime types and defaults").
+Type=Service
 MimeType=application/zip;application/x-7z-compressed;application/x-tar;application/x-compressed-tar;application/x-bzip2-compressed-tar;application/x-bzip-compressed-tar;application/x-xz-compressed-tar;application/x-zstd-compressed-tar;application/x-lz4-compressed-tar;application/gzip;application/x-xz;application/zstd;application/x-bzip2;application/x-bzip;application/x-lz4;application/vnd.rar;application/x-rar;application/vnd.ms-cab-compressed;application/x-cpio;application/x-archive;application/vnd.debian.binary-package;application/x-cd-image;application/x-iso9660-image;application/x-rpm;application/java-archive;
-Actions=ExtractHere;ExtractToFolder;
-StartupNotify=true
-X-KDE-StartupNotify=true
+Actions=extractHere;extractToFolder;
+X-KDE-Priority=TopLevel
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
 
-[Desktop Action ExtractHere]
+[Desktop Action extractHere]
 Name=Extract Here
+Icon=archive-extract
 Exec=atlas-archive --extract-here -- %F
-Icon=archive-extract
 
-[Desktop Action ExtractToFolder]
+[Desktop Action extractToFolder]
 Name=Extract to Folder
-Exec=atlas-archive --extract-to-folder -- %F
 Icon=archive-extract
+Exec=atlas-archive --extract-to-folder -- %F
