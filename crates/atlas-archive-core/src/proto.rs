@@ -496,6 +496,11 @@ pub enum Reply {
         index: u32,
         reason: String,
     },
+    /// `count` more entries were skipped, past the `tree::MAX_SKIPPED`
+    /// individually reported ones.
+    SkippedMore {
+        count: u64,
+    },
     /// The job finished. `written`: the top-level names it wrote in staging.
     Done {
         written: Vec<Vec<u8>>,
@@ -553,6 +558,9 @@ impl Reply {
             }
             Reply::Skipped { index, reason } => {
                 e.u8(7).u32(*index).text(reason);
+            }
+            Reply::SkippedMore { count } => {
+                e.u8(10).u64(*count);
             }
             Reply::Done { written } => {
                 e.u8(8).u32(written.len() as u32);
@@ -621,6 +629,7 @@ impl Reply {
                 Reply::Done { written }
             }
             9 => Reply::Failed { reason: d.text()? },
+            10 => Reply::SkippedMore { count: d.u64()? },
             t => return Err(ProtoError::BadTag(t)),
         };
         d.end()?;
@@ -683,6 +692,7 @@ mod tests {
                 written: vec![b"a".to_vec(), b"\xFF".to_vec()],
             },
             Reply::Failed { reason: "x".into() },
+            Reply::SkippedMore { count: u64::MAX },
         ]
     }
 

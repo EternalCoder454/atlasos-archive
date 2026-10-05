@@ -135,9 +135,16 @@ mod tests {
     const CHILD: &str = "ATLAS_ARCHIVE_SANDBOX_CHILD";
 
     fn scratch() -> PathBuf {
+        // On disk, in the cargo target dir, never in tmpfs.
         let base = std::env::var_os("ATLAS_ARCHIVE_TEST_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("../test-scratch")
+            });
         base.join(format!("atlas-sandbox-{}", std::process::id()))
     }
 

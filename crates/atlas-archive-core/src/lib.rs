@@ -2,6 +2,7 @@
 //! on data that came from an archive, through the sandboxed worker, and
 //! treats it as untrusted (docs/DESIGN.md, "Extraction rules" and "Names").
 
+pub mod audit;
 pub mod limits;
 pub mod link;
 pub mod name;

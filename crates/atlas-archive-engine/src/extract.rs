@@ -236,8 +236,13 @@ impl Writer {
 
     /// Removes what was written for an entry the archive stores again.
     pub fn replace(&mut self, tree: &Tree, id: u32) -> io::Result<()> {
-        let node = &tree.nodes[id as usize];
         self.files.remove(&id);
+        self.unlink(tree, id)
+    }
+
+    /// Unlinks the node's path (never a folder); gone already is fine.
+    fn unlink(&mut self, tree: &Tree, id: u32) -> io::Result<()> {
+        let node = &tree.nodes[id as usize];
         let dir = openat2(
             &self.staging,
             &tree.disk_path(node.parent),
@@ -258,11 +263,19 @@ impl Writer {
     }
 
     /// Makes hard links, then symbolic links, then gives folders their modes
-    /// and times. Returns the entries that failed.
-    pub fn finish(&mut self, tree: &Tree) -> io::Result<Vec<EntryFailed>> {
+    /// and times. Links are made only for entries in `selected` (every one
+    /// when `None`). Returns the entries that failed.
+    pub fn finish(
+        &mut self,
+        tree: &Tree,
+        selected: Option<&HashSet<u32>>,
+    ) -> io::Result<Vec<EntryFailed>> {
+        let chosen = |n: &atlas_archive_core::tree::Node| {
+            selected.is_none_or(|set| n.entry.is_some_and(|i| set.contains(&i)))
+        };
         for (id, n) in tree.nodes.iter().enumerate() {
             let id = id as u32;
-            if n.refused.is_some() {
+            if n.refused.is_some() || !chosen(n) {
                 continue;
             }
             let r = match (n.kind, n.hardlink, &n.symlink) {
@@ -281,7 +294,7 @@ impl Writer {
         }
         for (id, n) in tree.nodes.iter().enumerate() {
             let id = id as u32;
-            if n.refused.is_some() || n.kind != Kind::Symlink {
+            if n.refused.is_some() || n.kind != Kind::Symlink || !chosen(n) {
                 continue;
             }
             let Some(target) = &n.symlink else { continue };
@@ -290,8 +303,17 @@ impl Writer {
             }
         }
         // Launchers never run: their files lose the execute bits, whatever
-        // name reached them (folders are still writable here).
-        for id in tree.launcher_files() {
+        // name reached them (folders are still writable here). Every file
+        // written under a launcher name is stripped too, whatever the tree
+        // says about how it is reached. A file that can't be stripped is
+        // removed: never leave a launcher that runs.
+        let mut launchers = tree.launcher_files();
+        launchers.extend(self.files.iter().copied().filter(|&id| {
+            atlas_archive_core::name::is_launcher(&tree.nodes[id as usize].name.disk)
+        }));
+        launchers.sort_unstable();
+        launchers.dedup();
+        for id in launchers {
             if !self.files.contains(&id) {
                 continue;
             }
@@ -307,12 +329,14 @@ impl Writer {
                 check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
             });
             if let Err(e) = r {
+                self.unlink(tree, id)?;
+                self.files.remove(&id);
                 self.failed(id, e);
             }
         }
         // Deepest first: a folder made read-only must not stop its children.
         let mut dirs = std::mem::take(&mut self.dirs);
-        dirs.sort_by_key(|&d| std::cmp::Reverse(depth(tree, d)));
+        dirs.sort_by_cached_key(|&d| std::cmp::Reverse(depth(tree, d)));
         for d in dirs {
             let n = &tree.nodes[d as usize];
             let fd = openat2(
@@ -470,9 +494,16 @@ mod tests {
 
     impl Scratch {
         fn new(tag: &str) -> Scratch {
+            // On disk, in the cargo target dir, never in tmpfs.
             let base = std::env::var_os("ATLAS_ARCHIVE_TEST_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir);
+                .unwrap_or_else(|| {
+                    std::env::current_exe()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join("../test-scratch")
+                });
             let p = base.join(format!("atlas-archive-test-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
@@ -534,7 +565,7 @@ mod tests {
                 _ => {}
             }
         }
-        w.finish(&tree).unwrap()
+        w.finish(&tree, None).unwrap()
     }
 
     #[test]
@@ -587,6 +618,53 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_launcher_that_cannot_be_stripped_is_removed() {
+        let s = Scratch::new("failclosed");
+        let outside = Scratch::new("failclosed-outside");
+        let tree = Tree::build(fmt(), &[e(0, "x.desktop", Kind::File, 0o755, None)], None);
+        let mut w = Writer::new(open_dir(&s.0).unwrap(), 0o022);
+        let mut out = w.file(&tree, 1, Some(5)).unwrap();
+        out.write_all(b"hello").unwrap();
+        w.finish_file(&tree, out).unwrap();
+        // Something swaps the file for a link: opening it for the strip fails.
+        let victim = outside.0.join("victim");
+        std::fs::write(&victim, b"v").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(s.0.join("x.desktop")).unwrap();
+        std::os::unix::fs::symlink(&victim, s.0.join("x.desktop")).unwrap();
+        let failed = w.finish(&tree, None).unwrap();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(std::fs::symlink_metadata(s.0.join("x.desktop")).is_err());
+        let m = std::fs::metadata(&victim).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o755, "never followed");
+    }
+
+    #[test]
+    fn only_selected_links_are_made() {
+        let s = Scratch::new("selected");
+        let entries = [
+            e(0, "f", Kind::File, 0o644, None),
+            e(1, "hard", Kind::Hardlink, 0o644, Some("f")),
+            e(2, "sym", Kind::Symlink, 0o777, Some("f")),
+            e(3, "other/sym2", Kind::Symlink, 0o777, Some("../f")),
+        ];
+        let tree = Tree::build(fmt(), &entries, None);
+        let mut w = Writer::new(open_dir(&s.0).unwrap(), 0o022);
+        let mut out = w.file(&tree, tree.find(["f"]).unwrap(), Some(5)).unwrap();
+        out.write_all(b"hello").unwrap();
+        w.finish_file(&tree, out).unwrap();
+        let selected: HashSet<u32> = [0, 2].into();
+        assert!(w.finish(&tree, Some(&selected)).unwrap().is_empty());
+        assert!(s.0.join("f").is_file());
+        assert!(std::fs::symlink_metadata(s.0.join("sym")).is_ok());
+        assert!(std::fs::symlink_metadata(s.0.join("hard")).is_err());
+        assert!(
+            std::fs::symlink_metadata(s.0.join("other")).is_err(),
+            "no folder made for an unselected link"
+        );
     }
 
     #[test]
@@ -686,7 +764,7 @@ mod tests {
             w.finish_file(&tree, out).unwrap();
         }
         tree.finish();
-        assert!(w.finish(&tree).unwrap().is_empty());
+        assert!(w.finish(&tree, None).unwrap().is_empty());
         assert_eq!(std::fs::read(s.0.join("x (2)")).unwrap(), b"v0");
         assert_eq!(std::fs::read(s.0.join("x/y")).unwrap(), b"v2");
     }

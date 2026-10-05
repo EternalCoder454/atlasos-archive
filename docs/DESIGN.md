@@ -101,8 +101,10 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    tests.
 3. Requests and replies are length-prefixed binary frames (`core::proto`),
    capped at 1 MiB each, 64 MiB per listing. The client treats every reply as
-   untrusted: it re-checks paths, names, counts and sizes, so a compromised
-   worker can at worst lie about what it wrote inside staging.
+   untrusted: it re-checks paths, names, counts and sizes. A compromised
+   worker can put anything inside staging (Landlock stops it only from
+   writing elsewhere), so the client also audits staging before moving
+   anything out (see "Extraction rules").
 4. Cancel is `SIGKILL` to the worker, then the client deletes staging. A
    crash, a frame error or a limit overrun is an error with a plain message,
    never a hang: every read from the worker has a timeout that resets with
@@ -166,7 +168,9 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
 - **Extract to `<name>/`** (and Extract All): staging itself becomes the
   folder. If the archive holds one top-level folder, that folder is moved
   out instead, so `photos.zip` holding `photos/` never gives
-  `photos/photos/`. A name in use becomes `name (2)`.
+  `photos/photos/`, under the same `Tree::lone_top` rule as Extract here
+  (a folder holding `l -> ../.ssh/x` stays inside the new folder). A name in
+  use becomes `name (2)`.
 - **Extract here** (smart, as Explorer, macOS and PeaZip do): an archive
   holding one top-level item extracts as that item; anything else goes into a
   `<archive name>` folder. The lone item is moved out only when the tree
@@ -183,18 +187,35 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
 - Before writing, the free space below the destination is checked against
   the declared total; a full disk mid-way stops with "There isn't enough
   space on <device> for <archive>", and staging is removed.
-- The worker's `Done` names what it wrote at the top of staging, and the
-  worker is untrusted: the client takes only names that parse as one plain
-  component (`path::parse`, nothing renamed), that exist in staging as seen
-  through its own descriptor (`fstatat(AT_SYMLINK_NOFOLLOW)`), and moves
-  them with `renameat2(staging_fd, name, dest_fd, name, RENAME_NOREPLACE)`.
-  Never a path string joined from what the worker said.
-- `7z` and `unrar` write their own files, so after either the worker walks
-  staging by descriptor (`openat2` as above, never following links) and
-  applies the same rules to what it finds: symlinks re-checked with
-  `link::check_symlink` against the walked tree and removed when they fail,
-  device nodes, FIFOs and sockets removed, setuid/setgid/sticky dropped,
-  launcher execute bits removed, names re-sanitised. Only then is it `Done`.
+- **The staging audit** (`core::audit`, one walker used in two places):
+  walks staging by descriptor (`openat2` as above, never following links,
+  depth-first with the node, depth and path-length caps of the tree) and
+  enforces the extraction rules on what is actually there, whoever wrote
+  it: anything but regular files, folders and symlinks is removed; files
+  with more than one link are removed unless both names are in the tree
+  (hard links the writer made); setuid, setgid and sticky bits are dropped;
+  launcher files lose their execute bits; every symlink is re-checked with
+  `link::check_symlink` against the walked tree and removed when it fails;
+  every name must already be its own disk form (`path::parse` of it gives
+  it back unchanged), else the entry is removed. Removals are reported as
+  skipped entries.
+- **After a libarchive extraction** the client runs the audit itself, once
+  the worker has exited: it kills (`SIGKILL`) and reaps (`waitpid`) the
+  worker before the first look at staging, so nothing can change between
+  the check and the move.
+- **After `7z` or `unrar`** the worker runs the audit too, once the tool and
+  all its children have exited, also when the tool failed; then the client
+  runs it again as above. Neither tool is given link options (`-snl` for
+  7z, `-ol` for unrar), so they make no links; the audit removes any that
+  appear anyway.
+- **Moving out.** The worker's `Done` names what it wrote at the top of
+  staging; the client uses it only as a cross-check. What moves is the top
+  level of its own audited walk: each name a single component
+  (`components.len() == 1`, no `dir_hint`, the raw bytes equal to the disk
+  form, no duplicates), moved with `renameat2(staging_fd, name, dest_fd,
+  name, RENAME_NOREPLACE)`. Never a path string joined from what the worker
+  said. A `Done` that names something the walk didn't find, or misses
+  something it did, is logged as a worker fault.
 
 ### Bomb limits
 
@@ -204,11 +225,24 @@ written (declared sizes can lie, and tar.gz streams have none):
 | Limit | Default | Past it |
 |---|---|---|
 | Total expanded size | 16 GiB | ask |
-| Free space (`fstatvfs` of staging, in the worker) | what is free, less 1 GiB | stop; no answer goes past it |
+| Free space (`fstatvfs` of staging, in the worker) | what is free, less 1 GiB (a tenth of it on a smaller drive) | stop; no answer goes past it |
 | Ratio, expanded to archive size | 100:1, once past 256 MiB | ask |
 | Entries | 200,000 | ask |
 | One entry's ratio | 1,000:1, once past 64 MiB | ask |
 | Nested archive depth (opened in place) | 8 | refuse: "extract it first" |
+
+Every folder, file and link the extraction creates costs 4 KiB against the
+size limits on top of its data, and counts as an entry, so an archive of a
+million empty folders asks (and stops at the free space) like one of a
+million bytes. The free-space reserve is 1 GiB, or a tenth of what is free
+on a smaller drive. `Reply::Limit` for the free space or the nesting depth
+is a failure, never a question: the client offers no "go on" and never
+sends `GoOn(true)` for them (the worker would not ask).
+
+The worker measures the archive's ratio against bytes read from the file
+(`archive_filter_bytes(-1)`). libarchive gives no per-entry packed size, so
+the one-entry ratio applies only where a backend knows it (the zip crate,
+7z's listing); the whole-archive ratio covers the rest.
 
 The question is in plain words, with Cancel the default: "This archive would
 expand to 48 GB, 4,800 times its own size. Archives built to fill a disk look

@@ -10,6 +10,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
+use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use atlas_archive_core::proto::{Entry, Kind};
@@ -108,14 +109,18 @@ impl Error {
 }
 
 /// One archive being read, front to back.
-pub struct Reader {
+///
+/// libarchive reads the descriptor as it goes, so the reader borrows it: the
+/// fd can't be closed first.
+pub struct Reader<'fd> {
     a: *mut archive,
     entry: *mut archive_entry,
     index: u32,
+    _fd: PhantomData<BorrowedFd<'fd>>,
 }
 
 // The handle is used from one thread at a time.
-unsafe impl Send for Reader {}
+unsafe impl Send for Reader<'_> {}
 
 fn cstr_bytes(p: *const c_char) -> Option<Vec<u8>> {
     // SAFETY: libarchive returns NUL-terminated strings valid until the next
@@ -123,16 +128,16 @@ fn cstr_bytes(p: *const c_char) -> Option<Vec<u8>> {
     (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_bytes().to_vec())
 }
 
-impl Reader {
+impl<'fd> Reader<'fd> {
     /// Opens the archive at `fd` (read from its current offset). The fd must
     /// stay open while the reader lives.
-    pub fn open(fd: BorrowedFd<'_>) -> Result<Reader, Error> {
+    pub fn open(fd: BorrowedFd<'fd>) -> Result<Reader<'fd>, Error> {
         Reader::open_with(fd, None)
     }
 
     /// As `open`, with the password for encrypted entries. libarchive keeps
     /// its own copy, which lives until the worker exits after this job.
-    pub fn open_with(fd: BorrowedFd<'_>, password: Option<&[u8]>) -> Result<Reader, Error> {
+    pub fn open_with(fd: BorrowedFd<'fd>, password: Option<&[u8]>) -> Result<Reader<'fd>, Error> {
         let password = match password {
             Some(p) if p.contains(&0) => {
                 return Err(Error("The password can't contain a NUL character.".into()));
@@ -156,6 +161,7 @@ impl Reader {
                 a,
                 entry: std::ptr::null_mut(),
                 index: 0,
+                _fd: PhantomData,
             };
             // Only filters libarchive decodes itself: one built without its
             // library falls back to running an outside program (and lrzip,
@@ -413,7 +419,7 @@ fn short_format(name: &str) -> String {
     short.into()
 }
 
-impl Drop for Reader {
+impl Drop for Reader<'_> {
     fn drop(&mut self) {
         // SAFETY: the handle is ours and freed once.
         unsafe { archive_read_free(self.a) };
@@ -429,9 +435,16 @@ mod tests {
     use std::process::Command;
 
     fn scratch(tag: &str) -> PathBuf {
+        // On disk, in the cargo target dir, never in tmpfs.
         let base = std::env::var_os("ATLAS_ARCHIVE_TEST_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("../test-scratch")
+            });
         let p = base.join(format!("atlas-la-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();

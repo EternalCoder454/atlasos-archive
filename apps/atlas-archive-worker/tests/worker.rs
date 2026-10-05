@@ -11,9 +11,16 @@ use atlas_archive_core::proto::{self, Reply, Request};
 use zeroize::Zeroizing;
 
 fn scratch(tag: &str) -> PathBuf {
+    // On disk, in the cargo target dir, never in tmpfs.
     let base = std::env::var_os("ATLAS_ARCHIVE_TEST_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("../test-scratch")
+        });
     let p = base.join(format!("atlas-worker-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();

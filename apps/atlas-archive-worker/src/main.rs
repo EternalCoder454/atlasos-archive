@@ -129,7 +129,15 @@ fn run(conn: &mut impl Conn, archive: Option<OwnedFd>, staging: Option<OwnedFd>)
             let Some(encoding) = NameEncoding::from_label(&encoding) else {
                 return fail(conn, "The name encoding isn't one Atlas Archive knows.");
             };
-            let limits = Limits::new(job::free_space(staging.as_fd()));
+            // Without the free space, the one limit that can't be gone past
+            // would be off: refuse rather than run unlimited.
+            let Some(free) = job::free_space(staging.as_fd()) else {
+                return fail(
+                    conn,
+                    "Atlas Archive couldn't tell how much space is free on the drive.",
+                );
+            };
+            let limits = Limits::new(Some(free));
             job::extract(
                 conn,
                 ExtractJob {

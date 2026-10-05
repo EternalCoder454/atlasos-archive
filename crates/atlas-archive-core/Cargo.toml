@@ -12,3 +12,4 @@ log.workspace = true
 encoding_rs.workspace = true
 chardetng.workspace = true
 zeroize.workspace = true
+libc.workspace = true

@@ -19,7 +19,7 @@
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
 use crate::link::{self, LinkError, SymlinkTarget};
 use crate::name::{self, NameEncoding};
@@ -168,8 +168,12 @@ pub struct Tree {
     /// thousand entries with one disk name cost a thousand probes, not a
     /// million.
     next_number: HashMap<Key, u32>,
-    /// Raw path of each non-folder node, to tell a duplicate from a clash.
-    raw_of: HashMap<u32, Box<[u8]>>,
+    /// Keyed hash of each non-folder node's raw path, to tell a duplicate
+    /// from a clash without keeping the path (an archive can hold a million
+    /// long ones). The key is random per tree, so no entry can be built to
+    /// collide.
+    raw_of: HashMap<u32, u64>,
+    hasher: RandomState,
     /// Link entries by node: a later duplicate replaces the earlier one.
     links: HashMap<u32, PendingLink>,
 }
@@ -275,6 +279,7 @@ impl Tree {
             by_name: HashMap::new(),
             next_number: HashMap::new(),
             raw_of: HashMap::new(),
+            hasher: RandomState::new(),
             links: HashMap::new(),
         }
     }
@@ -320,7 +325,7 @@ impl Tree {
         }
         if let Some(old) = self.child(at, &last.disk)
             && self.nodes[old as usize].kind != Kind::Dir
-            && self.raw_of.get(&old).is_some_and(|r| **r == *e.path)
+            && self.raw_of.get(&old) == Some(&self.hasher.hash_one(&e.path[..]))
         {
             // Stored twice: the later one wins.
             let old_index = self.nodes[old as usize].entry.expect("listed");
@@ -342,7 +347,8 @@ impl Tree {
         self.free_name(at, &mut name);
         let id = self.push(at, name, e.kind);
         self.set_entry(id, e);
-        self.raw_of.insert(id, e.path.clone().into_boxed_slice());
+        let h = self.hasher.hash_one(&e.path[..]);
+        self.raw_of.insert(id, h);
         self.pend_link(id, e, enc);
         Added::Node {
             id,

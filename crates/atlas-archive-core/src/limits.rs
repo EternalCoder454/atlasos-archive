@@ -9,7 +9,8 @@
 //! Most limits are a question, not a failure: the worker pauses and the job
 //! asks in plain words, Cancel being the default. When the user goes on, that
 //! limit is off for the rest of the job. Two never are: the free space on the
-//! destination less 1 GiB, and the nesting depth.
+//! destination less a reserve (a tenth of it, at most 1 GiB), and the nesting
+//! depth.
 
 use std::fmt;
 
@@ -37,8 +38,19 @@ pub struct Limits {
     pub nest_depth: u32,
 }
 
-/// Room left free on the destination's file system.
+/// The most room kept free on the destination's file system. On a small drive
+/// the reserve is a tenth of what is free, so a small drive isn't refused
+/// outright.
 pub const FREE_SPACE_RESERVE: u64 = GIB;
+
+/// What an inode and its directory entry are counted to cost on disk, in
+/// bytes, so an archive of millions of empty files meets the size limits.
+pub const NODE_COST: u64 = 4096;
+
+/// The room kept free of `free` bytes: a tenth, at most `FREE_SPACE_RESERVE`.
+pub fn reserve_for(free: u64) -> u64 {
+    FREE_SPACE_RESERVE.min(free / 10)
+}
 
 impl Limits {
     /// The default limits. `free_space`: the bytes free on the destination's
@@ -46,7 +58,7 @@ impl Limits {
     pub fn new(free_space: Option<u64>) -> Limits {
         Limits {
             total_bytes: 16 * GIB,
-            free_space: free_space.map_or(u64::MAX, |f| f.saturating_sub(FREE_SPACE_RESERVE)),
+            free_space: free_space.map_or(u64::MAX, |f| f.saturating_sub(reserve_for(f))),
             ratio: 100,
             ratio_after: 256 * MIB,
             entries: 200_000,
@@ -90,7 +102,7 @@ impl Exceeded {
     pub fn question(&self) -> String {
         match self.kind {
             Kind::FreeSpace => format!(
-                "There isn't enough space on this drive: the archive unpacks to more than the {} free (keeping 1 GiB spare).",
+                "There isn't enough space on this drive: the archive unpacks to more than the {} that can be used on this drive.",
                 format_size(self.limit)
             ),
             Kind::TotalSize => format!(
@@ -198,14 +210,20 @@ impl Meter {
         Ok(())
     }
 
-    /// Counts the start of an entry.
-    pub fn start_entry(&mut self) -> Result<(), Exceeded> {
-        self.entries += 1;
+    /// Starts counting a new entry's bytes.
+    pub fn start_entry(&mut self) {
         self.entry_written = 0;
+    }
+
+    /// Counts `n` new tree nodes (the entries and the folders made for them):
+    /// each is an entry and costs `NODE_COST` bytes of disk.
+    pub fn add_nodes(&mut self, n: u64) -> Result<(), Exceeded> {
+        self.entries = self.entries.saturating_add(n);
+        self.written = self.written.saturating_add(n.saturating_mul(NODE_COST));
         if self.on(Kind::Entries) && self.entries > self.limits.entries {
             return Err(self.exceeded(Kind::Entries, self.limits.entries));
         }
-        Ok(())
+        self.check_size(self.written)
     }
 
     /// Counts `n` bytes written for the current entry. `archive_read`: the
@@ -287,20 +305,29 @@ mod tests {
     #[test]
     fn free_space_is_a_hard_stop() {
         assert_eq!(Limits::new(None).free_space, u64::MAX);
-        assert_eq!(Limits::new(Some(5 * GIB)).free_space, 4 * GIB);
-        assert_eq!(Limits::new(Some(MIB)).free_space, 0);
-        let mut m = Meter::new(Limits::new(Some(5 * GIB)));
-        let e = m.check_declared(1, 5 * GIB, 5 * GIB).unwrap_err();
+        assert_eq!(Limits::new(Some(20 * GIB)).free_space, 19 * GIB);
+        assert_eq!(Limits::new(Some(5 * GIB)).free_space, 5 * GIB - GIB / 2);
+        // A small drive keeps a tenth, not a whole GiB.
+        assert_eq!(Limits::new(Some(GIB)).free_space, GIB - GIB / 10);
+        assert_eq!(Limits::new(Some(10 * MIB)).free_space, 9 * MIB);
+        assert_eq!(Limits::new(Some(0)).free_space, 0);
+        let mut m = Meter::new(Limits::new(Some(20 * GIB)));
+        let e = m.check_declared(1, 20 * GIB, 20 * GIB).unwrap_err();
         assert_eq!(e.kind, Kind::FreeSpace);
         assert!(!e.kind.askable());
-        assert!(e.question().contains("4 GiB free"), "{}", e.question());
+        assert!(
+            e.question()
+                .contains("more than the 19 GiB that can be used"),
+            "{}",
+            e.question()
+        );
         // Saying yes to everything still stops at the free space.
         for k in [Kind::TotalSize, Kind::Ratio, Kind::FreeSpace] {
             m.allow(k);
         }
-        m.start_entry().unwrap();
-        assert!(m.add(4 * GIB, 4 * GIB, None).is_ok());
-        assert_eq!(m.add(1, 4 * GIB, None).unwrap_err().kind, Kind::FreeSpace);
+        m.start_entry();
+        assert!(m.add(19 * GIB, 19 * GIB, None).is_ok());
+        assert_eq!(m.add(1, 19 * GIB, None).unwrap_err().kind, Kind::FreeSpace);
     }
 
     #[test]
@@ -327,7 +354,7 @@ mod tests {
     fn a_bomb_is_caught_while_writing() {
         // 42.zip-like: 1 MiB read, output keeps coming.
         let mut m = Meter::new(Limits::new(None));
-        m.start_entry().unwrap();
+        m.start_entry();
         let mut err = None;
         for _ in 0..1024 {
             if let Err(e) = m.add(MIB, MIB, None) {
@@ -343,13 +370,13 @@ mod tests {
     #[test]
     fn one_entry_ratio() {
         let mut m = Meter::new(Limits::new(None));
-        m.start_entry().unwrap();
+        m.start_entry();
         // 64 MiB from 64 KiB: under the threshold, fine.
         assert!(m.add(64 * MIB, 128 * MIB, Some(64 * 1024)).is_ok());
         let e = m.add(1, 128 * MIB, Some(64 * 1024)).unwrap_err();
         assert_eq!(e.kind, Kind::EntryRatio);
         // A new entry starts its own count.
-        m.start_entry().unwrap();
+        m.start_entry();
         assert!(m.add(MIB, 129 * MIB, Some(1)).is_ok());
     }
 
@@ -359,14 +386,35 @@ mod tests {
             entries: 2,
             ..Limits::new(None)
         });
-        m.start_entry().unwrap();
-        m.start_entry().unwrap();
-        assert_eq!(m.start_entry().unwrap_err().kind, Kind::Entries);
+        m.add_nodes(2).unwrap();
+        assert_eq!(m.add_nodes(1).unwrap_err().kind, Kind::Entries);
         m.allow(Kind::Entries);
-        m.start_entry().unwrap();
+        m.add_nodes(1).unwrap();
         assert!(m.check_nesting(8).is_ok());
         m.allow(Kind::NestDepth);
         assert_eq!(m.check_nesting(9).unwrap_err().kind, Kind::NestDepth);
+    }
+
+    #[test]
+    fn nodes_cost_disk() {
+        let mut m = Meter::new(Limits {
+            total_bytes: 10 * NODE_COST,
+            ..Limits::new(None)
+        });
+        m.add_nodes(10).unwrap();
+        assert_eq!(m.written(), 10 * NODE_COST);
+        assert_eq!(m.add_nodes(1).unwrap_err().kind, Kind::TotalSize);
+        // Free space is a hard stop for nodes too.
+        let mut m = Meter::new(Limits {
+            free_space: 2 * NODE_COST,
+            ..Limits::new(None)
+        });
+        m.allow(Kind::FreeSpace);
+        m.add_nodes(2).unwrap();
+        assert_eq!(m.add_nodes(1).unwrap_err().kind, Kind::FreeSpace);
+        // Counts can't overflow.
+        let mut m = Meter::new(Limits::new(None));
+        assert!(m.add_nodes(u64::MAX).is_err());
     }
 
     #[test]
@@ -375,7 +423,7 @@ mod tests {
             total_bytes: 10,
             ..Limits::new(None)
         });
-        m.start_entry().unwrap();
+        m.start_entry();
         assert!(m.add(10, 10, None).is_ok());
         assert_eq!(m.add(1, 11, None).unwrap_err().kind, Kind::TotalSize);
     }

@@ -203,6 +203,7 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{180B}'..='\u{180F}'
             | '\u{200B}'..='\u{200D}'
             | '\u{2060}'..='\u{2065}'
+            | '\u{206A}'..='\u{206F}'
             | '\u{2800}'
             | '\u{3164}'
             | '\u{FE00}'..='\u{FE0F}'
@@ -213,6 +214,29 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{1D173}'..='\u{1D17A}'
             | '\u{E0000}'..='\u{E0FFF}'
     )
+}
+
+/// Is `p` a character outside ASCII (where joiners and selectors do work)?
+fn non_ascii(p: Option<&Piece>) -> bool {
+    matches!(p, Some(&Piece::Char(c)) if !c.is_ascii())
+}
+
+/// The length of a well-formed tag flag starting at `i` (U+1F3F4, 2 to 7
+/// tag letters, U+E007F: the flags of England, Scotland, Wales), or 0.
+fn tag_flag(pieces: &[Piece], i: usize) -> usize {
+    if pieces.get(i) != Some(&Piece::Char('\u{1F3F4}')) {
+        return 0;
+    }
+    let tags = pieces[i + 1..]
+        .iter()
+        .take_while(|p| matches!(p, Piece::Char('\u{E0020}'..='\u{E007E}')))
+        .count();
+    let ends = pieces.get(i + 1 + tags) == Some(&Piece::Char('\u{E007F}'));
+    if (2..=7).contains(&tags) && ends {
+        tags + 2
+    } else {
+        0
+    }
 }
 
 /// Is `p` a character that shows as something (not a space, control, bidi
@@ -227,9 +251,10 @@ fn visible(p: Option<&Piece>) -> bool {
 /// - controls and undecodable bytes become `\xNN` (`\x??` for a byte a
 ///   legacy decoder rejected), and a literal `\` becomes `\\`, so the
 ///   escapes can't be faked;
-/// - bidi characters and invisible ones become `<U+202E>`; joiners and
-///   variation selectors are kept where they join something (emoji,
-///   Persian), as are tag characters after a flag;
+/// - bidi characters and invisible ones become `<U+202E>`; joiners are kept
+///   between two visible characters when one is outside ASCII (emoji,
+///   Persian), variation selectors after a character outside ASCII, and tag
+///   characters only inside a well-formed tag flag;
 /// - spaces other than U+0020 become `<U+XXXX>` unless alone between two
 ///   visible characters;
 /// - a name that starts or ends with a space, holds two in a row, or holds
@@ -237,7 +262,11 @@ fn visible(p: Option<&Piece>) -> bool {
 pub fn display(pieces: &[Piece]) -> (String, bool) {
     let mut s = String::with_capacity(pieces.len());
     let mut unusual = false;
+    let mut flag_until = 0;
     for (i, &p) in pieces.iter().enumerate() {
+        if i >= flag_until {
+            flag_until = i + tag_flag(pieces, i);
+        }
         let before = i.checked_sub(1).and_then(|j| pieces.get(j));
         let after = pieces.get(i + 1);
         match p {
@@ -246,18 +275,15 @@ pub fn display(pieces: &[Piece]) -> (String, bool) {
                 let _ = write!(s, "\\x{:02X}", c as u32);
             }
             Piece::Char('\\') => s.push_str("\\\\"),
-            Piece::Char(c @ ('\u{200C}' | '\u{200D}')) if visible(before) && visible(after) => {
-                s.push(c)
-            }
-            Piece::Char(c @ '\u{FE00}'..='\u{FE0F}') if visible(before) => s.push(c),
-            Piece::Char(c @ '\u{E0020}'..='\u{E007F}')
-                if matches!(
-                    before,
-                    Some(&Piece::Char('\u{1F3F4}' | '\u{E0020}'..='\u{E007E}'))
-                ) =>
+            Piece::Char(c @ ('\u{200C}' | '\u{200D}'))
+                if visible(before) && visible(after) && (non_ascii(before) || non_ascii(after)) =>
             {
                 s.push(c)
             }
+            Piece::Char(c @ '\u{FE00}'..='\u{FE0F}') if visible(before) && non_ascii(before) => {
+                s.push(c)
+            }
+            Piece::Char(c @ '\u{E0020}'..='\u{E007F}') if i < flag_until => s.push(c),
             Piece::Char(c) if is_control(c) || is_bidi_control(c) || is_invisible(c) => {
                 unusual = true;
                 let _ = write!(s, "<U+{:04X}>", c as u32);
@@ -446,6 +472,24 @@ mod tests {
         assert_eq!(show("👩\u{200D}💻.png"), ("👩\u{200D}💻.png".into(), false));
         assert_eq!(show("❤\u{FE0F}.txt"), ("❤\u{FE0F}.txt".into(), false));
         assert_eq!(show("می\u{200C}خواهم.txt").1, false);
+        // ...but not between ASCII, where they only hide.
+        assert_eq!(
+            show("invoice\u{200D}.pdf"),
+            ("invoice<U+200D>.pdf".into(), true)
+        );
+        assert_eq!(
+            show("invoice.pdf\u{FE0F}"),
+            ("invoice.pdf<U+FE0F>".into(), true)
+        );
+        assert_eq!(show("a\u{206A}b"), ("a<U+206A>b".into(), true));
+        // Tags only as a flag: England stays, a hidden message doesn't.
+        let england = "🏴\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}.png";
+        assert_eq!(show(england), (england.into(), false));
+        let hidden = format!("🏴{}.png", "\u{E0068}".repeat(40));
+        assert!(show(&hidden).1);
+        assert!(show(&hidden).0.contains("<U+E0068>"));
+        assert!(show("🏴\u{E0067}\u{E0062}.png").1, "no cancel tag");
+        assert!(show("x\u{E0067}\u{E0062}\u{E007F}").1, "no flag");
     }
 
     #[test]
