@@ -7,26 +7,51 @@ use atlas_archive_core::tree::Tree;
 
 use crate::term;
 
-/// The child of `parent` that `part` names: by display name first, by disk
-/// name only when no display name matches. `Ok(None)`: nothing matches.
-fn child(tree: &Tree, parent: u32, part: &str) -> Result<Option<u32>, ()> {
-    let kids = &tree.nodes[parent as usize].children;
-    for disk in [false, true] {
-        let mut found = None;
-        for &k in kids {
-            let n = &tree.nodes[k as usize].name;
-            if (if disk { &n.disk } else { &n.display }) == part {
-                if found.is_some() {
-                    return Err(());
-                }
-                found = Some(k);
-            }
-        }
-        if found.is_some() {
-            return Ok(found);
+/// One folder's children by name: the id, or `None` when two share the name.
+type ByName<'a> = HashMap<&'a str, Option<u32>>;
+
+/// Name maps for the folders looked into, built on first use so a wide
+/// folder costs one pass, not one per path component.
+struct Lookup<'a> {
+    tree: &'a Tree,
+    maps: HashMap<u32, (ByName<'a>, ByName<'a>)>,
+}
+
+impl<'a> Lookup<'a> {
+    fn new(tree: &'a Tree) -> Self {
+        Lookup {
+            tree,
+            maps: HashMap::new(),
         }
     }
-    Ok(None)
+
+    /// The child of `parent` that `part` names: by display name first, by
+    /// disk name only when no display name matches. `Ok(None)`: nothing
+    /// matches; `Err`: more than one item does.
+    fn child(&mut self, parent: u32, part: &str) -> Result<Option<u32>, ()> {
+        let tree = self.tree;
+        let (display, disk) = self.maps.entry(parent).or_insert_with(|| {
+            let mut display = ByName::new();
+            let mut disk = ByName::new();
+            for &k in &tree.nodes[parent as usize].children {
+                let n = &tree.nodes[k as usize].name;
+                for (map, name) in [(&mut display, &n.display), (&mut disk, &n.disk)] {
+                    map.entry(name.as_str())
+                        .and_modify(|e| *e = None)
+                        .or_insert(Some(k));
+                }
+            }
+            (display, disk)
+        });
+        for map in [display, disk] {
+            match map.get(part) {
+                Some(Some(k)) => return Ok(Some(*k)),
+                Some(None) => return Err(()),
+                None => {}
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// The archive indices of the named items. A name matches a path as listed
@@ -35,13 +60,14 @@ fn child(tree: &Tree, parent: u32, part: &str) -> Result<Option<u32>, ()> {
 /// sentence naming what wasn't found, or what named more than one item.
 pub fn resolve(tree: &Tree, wanted: &[OsString]) -> Result<Vec<u32>, String> {
     let mut out = Vec::new();
+    let mut lookup = Lookup::new(tree);
     for w in wanted {
         let text = w.to_string_lossy();
         let key = text.trim_start_matches("./").trim_end_matches('/');
         let mut at = Some(0u32);
         for part in key.split('/') {
             let Some(from) = at else { break };
-            at = child(tree, from, part).map_err(|()| {
+            at = lookup.child(from, part).map_err(|()| {
                 format!(
                     "\"{}\" names more than one item in this archive.",
                     term::safe_os(w)
@@ -205,5 +231,20 @@ mod tests {
         assert_eq!(one("we_ird.txt").unwrap(), [0]);
         // A folder reached by its disk name, with a display name below it.
         assert_eq!(one("d_/in.txt").unwrap(), [2]);
+    }
+
+    #[test]
+    fn a_wide_folder_is_looked_up_fast() {
+        let entries: Vec<Entry> = (0..50_000)
+            .map(|i| entry(i, &format!("wide/file{i}.txt"), Kind::File))
+            .collect();
+        let t = Tree::build(format(), &entries, None);
+        let wanted: Vec<OsString> = (0..5_000)
+            .map(|i| OsString::from(format!("wide/file{}.txt", i * 10)))
+            .collect();
+        let start = std::time::Instant::now();
+        let got = resolve(&t, &wanted).unwrap();
+        assert_eq!(got.len(), 5_000);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }

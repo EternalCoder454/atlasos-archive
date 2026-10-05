@@ -32,7 +32,8 @@ if ! podman image exists "$image"; then
     fi
     # No SELinux relabelling (:z/:Z) of host folders: it would lock other
     # containers and tools out of them. Labels are off for the container.
-    ctr=$(podman run -d --security-opt label=disable \
+    # --init: `sleep infinity` as PID 1 ignores SIGTERM.
+    ctr=$(podman run -d --init --security-opt label=disable \
         -v "$repo/packaging":/packaging:ro \
         -v "$rpms":/atlas-rpms:ro \
         -v atlas-dnf:/var/cache/libdnf5 \
@@ -57,7 +58,7 @@ fi
 
 tty=()
 [ -t 0 ] && tty=(-it)
-exec podman run --rm "${tty[@]}" --security-opt label=disable \
+exec podman run --rm --init "${tty[@]}" --security-opt label=disable \
     -v "$repo":/src -w /src \
     -v "$work":/work \
     -v atlas-cargo:/root/.cargo/registry \

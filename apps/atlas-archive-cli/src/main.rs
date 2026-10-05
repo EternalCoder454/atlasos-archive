@@ -94,11 +94,15 @@ fn harden() -> Result<(), io::Error> {
     Ok(())
 }
 
-/// A panic says one fixed sentence: the payload may hold archive text. The
-/// terminal is put back and the program ends with exit 1.
+/// A panic says one fixed sentence: the payload may hold archive text. With
+/// `-v` its file and line are logged. The terminal is put back and the program ends with exit 1.
 fn quiet_panics() {
-    std::panic::set_hook(Box::new(|_| {
+    std::panic::set_hook(Box::new(|info| {
         term::restore_terminal();
+        // Only the place, for a `-v` log: the payload may hold archive text.
+        if let Some(at) = info.location() {
+            ::log::error!("panic at {}:{}", at.file(), at.line());
+        }
         let msg = b"atlas-archive-cli: Something went wrong inside the program.\n";
         // SAFETY: writes from a live buffer, then ends the process.
         unsafe {

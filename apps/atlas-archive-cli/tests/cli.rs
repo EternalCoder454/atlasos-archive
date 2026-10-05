@@ -15,18 +15,16 @@ fn worker() -> Option<PathBuf> {
     w.exists().then_some(w)
 }
 
-/// Skips the test, saying why, when the worker isn't built.
+/// Fails the test, saying why, when the worker isn't built: a silent skip
+/// would pass a run that tested nothing.
 macro_rules! scratch {
     ($tag:expr) => {{
         match Scratch::new($tag) {
             Some(s) => s,
-            None => {
-                eprintln!(
-                    "SKIPPED: build the worker first: cargo build -p atlas-archive-worker \
-                     (same target dir as this test)"
-                );
-                return;
-            }
+            None => panic!(
+                "build the worker first: cargo build -p atlas-archive-worker \
+                 (same target dir as this test)"
+            ),
         }
     }};
 }
@@ -1282,4 +1280,95 @@ fn input_typed_before_a_cancel_is_thrown_away() {
     // SAFETY: FIONREAD writes one int.
     unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::FIONREAD, &mut n) };
     assert_eq!(n, 0, "{n} bytes of input were left");
+}
+
+#[test]
+fn password_fd_0_with_piped_stdin_never_turns_interactive() {
+    use std::io::Write;
+    let s = scratch!("fd0");
+    let pty = Pty::new();
+    let a = s.fixture("aes256-secret.zip");
+    let mut cmd = s.base(vec![
+        "test".into(),
+        "--password-fd".into(),
+        "0".into(),
+        a.into_os_string(),
+    ]);
+    let slave = pty.slave.as_raw_fd();
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: setsid and ioctl only, in the child.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            if libc::ioctl(slave, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    // A wrong password: with a terminal in reach, the bug asked again there.
+    child.stdin.take().unwrap().write_all(b"wrong\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err.contains("didn't work"), "{err}");
+    let seen = pty.wait_for("Password");
+    assert!(!seen.contains("Password"), "a prompt appeared: {seen:?}");
+}
+
+#[test]
+fn a_second_signal_while_a_job_is_stuck_exits_130_promptly() {
+    let s = scratch!("stuck");
+    // A "worker" that ignores TERM and never answers: the job is stuck.
+    let fake = s.write(
+        "stuck-worker.sh",
+        b"#!/bin/sh\ntrap '' TERM INT HUP\nsleep 60\n",
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let a = sample(&s, "sample.zip");
+    let mut cmd = Command::new(CLI);
+    cmd.arg("--worker")
+        .arg(&fake)
+        .args(["list"])
+        .arg(&a)
+        .env("HOME", s.path("home"))
+        .env("XDG_STATE_HOME", s.path("state"))
+        .env("XDG_DATA_HOME", s.path("data"))
+        .env("XDG_CACHE_HOME", s.path("cache"))
+        .env("XDG_CONFIG_HOME", s.path("config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let pid = child.id() as i32;
+    let kill = |sig| {
+        // SAFETY: signals our own child.
+        unsafe { libc::kill(pid, sig) }
+    };
+    kill(libc::SIGTERM);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if child.try_wait().unwrap().is_none() {
+        kill(libc::SIGTERM);
+    }
+    let t = std::time::Instant::now();
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(t.elapsed() < std::time::Duration::from_secs(3));
+}
+
+#[test]
+fn two_quick_signals_at_the_prompt_still_restore_echo() {
+    let s = scratch!("twice");
+    let pty = Pty::new();
+    let mut child = at_the_prompt(&s, &pty);
+    pty.type_byte(0x1c);
+    pty.type_byte(0x1c);
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(pty.echo(), "echo was left off");
 }
