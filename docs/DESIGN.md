@@ -117,7 +117,16 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256. On a kernel without Landlock the
    worker refuses to run unless the build was made for tests. The client
    starts it in its own process group with `PR_SET_PDEATHSIG(SIGKILL)` and
-   kills the group. The `7z` and `unrar` jobs, which must start a program,
+   kills the group (by pidfd where the kernel has it). Its working folder is
+   `/`, its signal dispositions and mask are reset, and every descriptor
+   above 4 is closed at exec. The archive is opened `O_PATH` first, checked
+   to be a regular file, then reopened read-only (`O_NOCTTY`) and checked to
+   be the same file. `PR_SET_PDEATHSIG` is bound to the thread that starts
+   the worker, so that thread lives until the job returns. After the kill,
+   the client waits at most 10 s for the worker to go; a worker stuck on a
+   dead drive gets "The archive's drive isn't responding.", is left to a
+   reaper thread, and its staging is kept for the next start's cleanup. The
+   `7z` and `unrar` jobs, which must start a program,
    get their own profile when those drivers land: the tool runs in a new
    PID namespace (inside a user namespace) whose init is the worker, so
    killing the worker kills every process the tool started, and the worker
@@ -130,8 +139,18 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    anything out (see "Extraction rules").
 4. Cancel is `SIGKILL` to the worker, then the client deletes staging. A
    crash, a frame error or a limit overrun is an error with a plain message,
-   never a hang: every read from the worker has a timeout that resets with
-   progress (30 s without a byte).
+   never a hang: every read from the worker has a timeout that resets only
+   when the job advances (30 s without more Progress bytes or items, a
+   listing batch or the answer to a question; Progress that goes backwards
+   is a protocol error). A job may send at most 4,000,000 frames and
+   1,000,000 skipped-entry frames; each kind of limit is asked once; after a
+   declined limit only `Failed` is accepted; a password is asked 5 times at
+   most. The client enforces the size limits too: it checks staging's file
+   system at least once a second and kills the worker when the free space
+   falls below the reserve, or the space used passes the approved size plus
+   an eighth (at least 16 MiB). Writes to the worker never raise `SIGPIPE`
+   (blocked on the writing thread), so a host that doesn't ignore it can't
+   be killed by a worker that closed its end.
 
 Passwords reach the worker over its request pipe, never through argv, the
 environment or a file, and `7z`/`unrar` get them on stdin. In Rust
@@ -204,11 +223,31 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   never land loose in the user's folder). On a name clash the job asks, with Explorer's
   choices: Replace, Skip, Keep Both (default), "Do this for all conflicts".
   Replace moves the old item to the trash (XDG trash spec, same file system),
-  never deletes it.
-- A cancel deletes staging (by descriptor, never following links). A crash
-  leaves only the hidden staging folder: each job records its staging path
-  in `~/.local/state/atlas-archive/jobs/`, and the next start removes the
-  ones whose job is dead. The user's files never mix with half a tree.
+  never deletes it; if the move out then fails, the old item is put back
+  from the trash, and if that fails too, staging is kept and the message
+  says where both are. Before and after the move out, the name in the
+  destination is checked (device, inode, type) to be staging's descriptor.
+  A destination folder others can write to is refused unless it is sticky
+  ("Choose a folder of your own"). What remains is a race with the user's
+  own processes, which have the user's rights anyway. On file systems
+  without `RENAME_NOREPLACE` (FAT, exFAT, some FUSE, NFS and SMB mounts) the
+  move falls back to a check then `renameat`, and modes that can't be set
+  there are left as the file system gives them.
+- A cancel deletes staging (by descriptor, never following links,
+  iteratively with a bounded number of descriptors: subtrees deeper than a
+  bound are renamed up to the top and deleted from there; names are read in
+  batches; the whole delete is bounded in time). A crash leaves only the
+  hidden staging folder: each job records its staging path, the boot id and
+  the destination folder's device and inode in
+  `~/.local/state/atlas-archive/jobs/` (0700, records ours and not group or
+  other writable), and the next start removes the ones whose job is dead
+  (another boot, or the pid gone or reused). A record proves nothing by
+  itself: the target's name must match `.<name>.atlas-partial-<16 hex>`,
+  and only a folder of ours with mode 0700 is deleted. When the device
+  number differs (btrfs changes it across boots) but the folder's inode and
+  that proof hold, it is deleted; otherwise the record is kept. This runs
+  off the UI thread, since a dead mount can block it. The user's files
+  never mix with half a tree.
 - Before writing, the free space below the destination is checked against
   the declared total; a full disk mid-way stops with "There isn't enough
   space on <device> for <archive>", and staging is removed.

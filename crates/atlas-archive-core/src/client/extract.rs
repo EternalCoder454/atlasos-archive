@@ -200,14 +200,27 @@ fn move_item(
 
 /// Renames staging itself to `name` (numbered when taken) and opens it up
 /// for its owner's umask: it was made 0700 so nobody else saw it half done.
+/// The destination's setgid bit is kept. The folder is checked by identity
+/// (device, inode, type) under its old name before the rename and under the
+/// new one after; on a mismatch nothing is placed and staging is emptied by
+/// descriptor. What this can't close: a process allowed to write the
+/// destination can still swap a name between the check and the rename.
 fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String, Error> {
-    sys::fchmod(staging.fd(), (0o777 & !umask) | 0o700).map_err(|e| move_failed(&e))?;
+    let ours = sys::fstat(staging.fd()).map_err(|e| move_failed(&e))?;
+    let dest = sys::fstat(staging.dest()).map_err(|e| move_failed(&e))?;
+    let mode = ((0o777 & !umask) | 0o700) | (dest.st_mode & libc::S_ISGID);
+    sys::fchmod_soft(staging.fd(), mode).map_err(|e| move_failed(&e))?;
     for n in 1..=MAX_TRIES {
         let cand = if n == 1 {
             name.to_string()
         } else {
             numbered_name(name, n, true)
         };
+        match staging.name_is_ours() {
+            Ok(true) => {}
+            Ok(false) => return Err(swapped(staging, "before the move")),
+            Err(e) => return Err(move_failed(&e)),
+        }
         match sys::rename_noreplace(
             staging.dest(),
             staging.name().as_bytes(),
@@ -215,6 +228,10 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
             cand.as_bytes(),
         ) {
             Ok(()) => {
+                match sys::lstatat(staging.dest(), cand.as_bytes()) {
+                    Ok(now) if sys::same_file(&now, &ours) => {}
+                    _ => return Err(swapped(staging, "after the move")),
+                }
                 staging.forget();
                 return Ok(cand);
             }
@@ -225,6 +242,18 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
     Err(Error::Failed(
         "Too many items with this name are already in the folder.".into(),
     ))
+}
+
+/// The staging folder's name led somewhere else: refuse, and empty what is
+/// ours by descriptor (the folder itself then goes when `staging` drops).
+fn swapped(staging: &Staging, when: &str) -> Error {
+    if let Err(e) = staging.clear() {
+        log::warn!("The staging folder couldn't be emptied: {e}");
+    }
+    fail(
+        "The extracted files couldn't be moved into place safely, so nothing was kept.",
+        format!("the staging folder was replaced {when}"),
+    )
 }
 
 /// Extract here met an item of the same name: ask, then do as told.
@@ -286,8 +315,8 @@ fn resolve_clash(
             let Some(trash) = job.trash else {
                 return Err(not_replaced(&shown, "there is no Trash to use"));
             };
-            trash
-                .trash(staging.dest(), job.dest_path, item)
+            let trashed = trash
+                .trash_item(staging.dest(), job.dest_path, item)
                 .map_err(|e| not_replaced(&shown, &e.to_string()))?;
             match sys::rename_noreplace(
                 staging.fd(),
@@ -299,7 +328,25 @@ fn resolve_clash(
                     finish_staging(staging);
                     Ok(at(item))
                 }
-                Err(e) => Err(move_failed(&e)),
+                Err(e) => {
+                    // The old item is in the Trash and the new one didn't
+                    // get its place: put the old one back.
+                    match trashed.undo(staging.dest(), item.as_bytes()) {
+                        Ok(()) => Err(move_failed(&e)),
+                        Err(undo) => {
+                            // Both are kept, and the user is told where.
+                            let old = sys::log_path(&trashed.files_path);
+                            let new = sys::log_path(&job.dest_path.join(staging.name()).join(item));
+                            staging.forget();
+                            Err(fail(
+                                format!(
+                                    "“{shown}” couldn't be replaced. The old one is in the Trash at {old} and the new one is at {new}."
+                                ),
+                                format!("replace failed: {e}; undo failed: {undo}"),
+                            ))
+                        }
+                    }
+                }
             }
         }
     }

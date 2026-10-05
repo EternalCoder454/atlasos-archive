@@ -83,7 +83,7 @@ pub fn list(conn: &mut impl Conn, archive: BorrowedFd<'_>) -> io::Result<()> {
     let mut count: u32 = 0;
     let mut last_progress = Instant::now();
     loop {
-        let entry = match reader.next() {
+        let entry = match reader.next_header() {
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(e) => return conn.send(&Reply::Failed { reason: e.0 }),
@@ -146,7 +146,7 @@ pub fn free_space(dir: BorrowedFd<'_>) -> Option<u64> {
     }
     // SAFETY: initialised by the successful call above.
     let st = unsafe { st.assume_init() };
-    Some(u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize)))
+    Some(st.f_bavail.saturating_mul(st.f_frsize))
 }
 
 /// Asks the client about a limit. `Ok`: go on, with that limit off. A limit
@@ -281,7 +281,7 @@ fn run_extract(
     let mut skips = SkipOut::default();
 
     loop {
-        let mut entry = match reader.next() {
+        let mut entry = match reader.next_header() {
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(e) => return Err(Stop::Failed(e.0)),
@@ -451,7 +451,7 @@ pub fn test(
     let mut skips = SkipOut::default();
     let mut last_progress = Instant::now();
     loop {
-        let entry: Entry = match reader.next() {
+        let entry: Entry = match reader.next_header() {
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(e) => return conn.send(&Reply::Failed { reason: e.0 }),

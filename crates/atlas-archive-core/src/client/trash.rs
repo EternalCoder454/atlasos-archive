@@ -55,17 +55,33 @@ impl Trash {
     /// Moves `name` in the folder `dir` (at `dir_path`, for the record) to the
     /// Trash. Returns where it is now. Nothing is deleted on failure.
     pub fn trash(&self, dir: BorrowedFd<'_>, dir_path: &Path, name: &str) -> io::Result<PathBuf> {
+        self.trash_item(dir, dir_path, name).map(|t| t.files_path)
+    }
+
+    /// Like `trash`, and keeps what is needed to undo it.
+    pub(super) fn trash_item(
+        &self,
+        dir: BorrowedFd<'_>,
+        dir_path: &Path,
+        name: &str,
+    ) -> io::Result<Trashed> {
         let item = sys::lstatat(dir, name.as_bytes())?;
-        let abs = std::path::absolute(dir_path)?.join(name);
+        // Where the folder is now, from the descriptor: the string may lead
+        // elsewhere by the time it is used. The string is the fallback when
+        // /proc can't say.
+        let real = sys::fd_path(dir).unwrap_or_else(|| {
+            std::path::absolute(dir_path).unwrap_or_else(|_| dir_path.to_path_buf())
+        });
+        let abs = real.join(name);
         let mut errors = Vec::new();
 
         match self.home_trash(item.st_dev) {
-            Ok(Some(t)) => return self.put(dir, name, &t, &abs, None),
+            Ok(Some((t, fd))) => return self.put(dir, name, &t, &fd, &abs, None),
             Ok(None) => {}
             Err(e) => errors.push(e),
         }
-        match self.top_trash(dir_path, item.st_dev) {
-            Ok((t, top)) => return self.put(dir, name, &t, &abs, Some(&top)),
+        match self.top_trash(&real, item.st_dev) {
+            Ok((t, top, fd)) => return self.put(dir, name, &t, &fd, &abs, Some(&top)),
             Err(e) => errors.push(e),
         }
         let why = errors
@@ -73,24 +89,24 @@ impl Trash {
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
             .join("; ");
-        log::warn!("No Trash works for {}: {why}", abs.display());
+        log::warn!("No Trash works for {}: {why}", sys::log_path(&abs));
         Err(io::Error::other(why))
     }
 
     /// The home Trash, when it exists (or can be made) on the device `dev`.
-    fn home_trash(&self, dev: libc::dev_t) -> io::Result<Option<PathBuf>> {
-        make_trash_dir(&self.home, true)?;
-        let st = std::fs::metadata(&self.home)?;
-        use std::os::unix::fs::MetadataExt;
-        Ok((st.dev() == dev).then(|| self.home.clone()))
+    /// It may be a link to a folder of the user's (a common setup).
+    fn home_trash(&self, dev: libc::dev_t) -> io::Result<Option<(PathBuf, OwnedFd)>> {
+        let fd = make_trash_dir(&self.home, true, true)?;
+        let st = sys::fstat(bfd(&fd))?;
+        Ok((st.st_dev == dev).then(|| (self.home.clone(), fd)))
     }
 
     /// `$topdir/.Trash/$uid` when `$topdir/.Trash` is a sticky folder that
     /// isn't a link, else `$topdir/.Trash-$uid`, with the mount's top folder.
-    fn top_trash(&self, dir_path: &Path, dev: libc::dev_t) -> io::Result<(PathBuf, PathBuf)> {
+    /// `real` is the item's folder as the kernel names it.
+    fn top_trash(&self, real: &Path, dev: libc::dev_t) -> io::Result<(PathBuf, PathBuf, OwnedFd)> {
         use std::os::unix::fs::MetadataExt;
-        let real = std::fs::canonicalize(dir_path)?;
-        let mut top = real.as_path();
+        let mut top = real;
         while let Some(parent) = top.parent() {
             if std::fs::metadata(parent)?.dev() != dev {
                 break;
@@ -103,29 +119,30 @@ impl Trash {
             && m.mode() & libc::S_ISVTX != 0
         {
             let mine = shared.join(self.uid.to_string());
-            match make_trash_dir(&mine, false) {
-                Ok(()) => return Ok((mine, top.to_path_buf())),
-                Err(e) => log::debug!("{} isn't usable: {e}", mine.display()),
+            match make_trash_dir(&mine, false, false) {
+                Ok(fd) => return Ok((mine, top.to_path_buf(), fd)),
+                Err(e) => log::debug!("{} isn't usable: {e}", sys::log_path(&mine)),
             }
         }
         let own = top.join(format!(".Trash-{}", self.uid));
-        make_trash_dir(&own, false)?;
-        Ok((own, top.to_path_buf()))
+        let fd = make_trash_dir(&own, false, false)?;
+        Ok((own, top.to_path_buf(), fd))
     }
 
     /// Writes the `.trashinfo` (O_EXCL, so a name is never shared), then
-    /// moves the item in. Removes the info again if the move fails.
+    /// moves the item in. Removes the info again if the move fails. A topdir
+    /// Trash records the path relative to the mount's top, as the spec says.
     fn put(
         &self,
         dir: BorrowedFd<'_>,
         name: &str,
         trash: &Path,
+        trash_fd: &OwnedFd,
         abs: &Path,
         top: Option<&Path>,
-    ) -> io::Result<PathBuf> {
-        let info_dir = open_trash_sub(trash, "info")?;
-        let files_dir = open_trash_sub(trash, "files")?;
-        // A topdir Trash records the path relative to the mount's top.
+    ) -> io::Result<Trashed> {
+        let info_dir = open_trash_sub(trash_fd, "info")?;
+        let files_dir = open_trash_sub(trash_fd, "files")?;
         let recorded = match top {
             Some(t) => abs.strip_prefix(t).unwrap_or(abs),
             None => abs,
@@ -150,7 +167,15 @@ impl Trash {
                 Err(e) => return Err(e),
             }
             match sys::rename_noreplace(dir, name.as_bytes(), bfd(&files_dir), cand.as_bytes()) {
-                Ok(()) => return Ok(trash.join("files").join(&cand)),
+                Ok(()) => {
+                    return Ok(Trashed {
+                        files_path: trash.join("files").join(&cand),
+                        files_dir,
+                        info_dir,
+                        cand,
+                        info_name,
+                    });
+                }
                 Err(e) => {
                     let _ = sys::unlinkat(bfd(&info_dir), info_name.as_bytes(), 0);
                     // A leftover in files/ without an info: try the next name.
@@ -163,6 +188,28 @@ impl Trash {
         Err(io::Error::other(
             "too many items with this name are in the Trash",
         ))
+    }
+}
+
+/// An item that was moved to the Trash, and the way back.
+pub(super) struct Trashed {
+    /// Where the item is now.
+    pub files_path: PathBuf,
+    files_dir: OwnedFd,
+    info_dir: OwnedFd,
+    cand: String,
+    info_name: String,
+}
+
+impl Trashed {
+    /// Moves the item back as `name` in `dir` (never over anything there) and
+    /// removes its `.trashinfo`.
+    pub fn undo(&self, dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<()> {
+        sys::rename_noreplace(bfd(&self.files_dir), self.cand.as_bytes(), dir, name)?;
+        if let Err(e) = sys::unlinkat(bfd(&self.info_dir), self.info_name.as_bytes(), 0) {
+            log::warn!("The Trash's info for a restored item couldn't be removed: {e}");
+        }
+        Ok(())
     }
 }
 
@@ -192,13 +239,20 @@ fn create_info(info_dir: &OwnedFd, file: &str, text: &str) -> io::Result<()> {
     }
     // SAFETY: a new descriptor we own.
     let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    f.write_all(text.as_bytes())
+    if let Err(e) = f.write_all(text.as_bytes()) {
+        // No half-written info is left to be mistaken for a record.
+        drop(f);
+        let _ = sys::unlinkat(bfd(info_dir), file.as_bytes(), 0);
+        return Err(e);
+    }
+    Ok(())
 }
 
-/// Makes `path` (and its `files` and `info`) a Trash folder owned by us:
-/// a real folder, not a link, 0700. `parents`: make the missing parents too.
-fn make_trash_dir(path: &Path, parents: bool) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
+/// Makes `path` (and its `files` and `info`) a Trash folder owned by us and
+/// returns it open. `parents`: make the missing parents too. `follow_final`:
+/// the home Trash may be a link to a folder of ours; any other must be a real
+/// folder. `files` and `info` are never followed.
+fn make_trash_dir(path: &Path, parents: bool, follow_final: bool) -> io::Result<OwnedFd> {
     let mut b = std::fs::DirBuilder::new();
     b.mode(0o700).recursive(parents);
     match b.create(path) {
@@ -206,28 +260,38 @@ fn make_trash_dir(path: &Path, parents: bool) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    let m = std::fs::symlink_metadata(path)?;
-    // SAFETY: getuid has no failure.
-    if !m.is_dir() || m.uid() != unsafe { libc::getuid() } {
+    let fd = if follow_final {
+        sys::open_dir(path)?
+    } else {
+        sys::open_dir_nofollow(path)?
+    };
+    let st = sys::fstat(bfd(&fd))?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != sys::getuid() {
         return Err(io::Error::other(format!(
             "{} isn't a folder of yours",
-            path.display()
+            sys::log_path(path)
         )));
     }
     for sub in ["files", "info"] {
-        match b.create(path.join(sub)) {
+        match sys::mkdirat(bfd(&fd), sub.as_bytes(), 0o700) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(fd)
 }
 
-/// Opens `trash/<sub>` without following a link.
-fn open_trash_sub(trash: &Path, sub: &str) -> io::Result<OwnedFd> {
-    let t = sys::open_dir(trash)?;
-    sys::open_subdir(bfd(&t), sub.as_bytes())
+/// Opens `trash/<sub>` without following a link; it must be ours.
+fn open_trash_sub(trash: &OwnedFd, sub: &str) -> io::Result<OwnedFd> {
+    let fd = sys::open_subdir(bfd(trash), sub.as_bytes())?;
+    let st = sys::fstat(bfd(&fd))?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != sys::getuid() {
+        return Err(io::Error::other(format!(
+            "the Trash's {sub} folder isn't yours"
+        )));
+    }
+    Ok(fd)
 }
 
 /// Now, in local time, as the spec writes it: `YYYY-MM-DDThh:mm:ss`.

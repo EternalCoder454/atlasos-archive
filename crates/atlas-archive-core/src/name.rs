@@ -482,7 +482,7 @@ mod tests {
         // Joiners and variation selectors that join something stay.
         assert_eq!(show("👩\u{200D}💻.png"), ("👩\u{200D}💻.png".into(), false));
         assert_eq!(show("❤\u{FE0F}.txt"), ("❤\u{FE0F}.txt".into(), false));
-        assert_eq!(show("می\u{200C}خواهم.txt").1, false);
+        assert!(!show("می\u{200C}خواهم.txt").1);
         // ...but not between ASCII, where they only hide.
         assert_eq!(
             show("invoice\u{200D}.pdf"),

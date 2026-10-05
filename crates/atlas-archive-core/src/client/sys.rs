@@ -121,6 +121,13 @@ pub fn unlinkat(dir: BorrowedFd<'_>, name: &[u8], flags: i32) -> io::Result<()> 
 
 /// Moves `from` in `from_dir` to `to` in `to_dir`, failing with EEXIST when
 /// `to` is there.
+///
+/// Where the file system has no `RENAME_NOREPLACE` (FAT and exFAT, some FUSE,
+/// NFS and SMB mounts: EINVAL, ENOSYS or EOPNOTSUPP) this looks first with
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` and then renames. That guarantee is weaker:
+/// a name created by someone else between the two calls is replaced. The
+/// destination folder is the user's own (checked by the caller), so only a
+/// process of the same user can win that race.
 pub fn rename_noreplace(
     from_dir: BorrowedFd<'_>,
     from: &[u8],
@@ -128,7 +135,7 @@ pub fn rename_noreplace(
     to: &[u8],
 ) -> io::Result<()> {
     let (f, t) = (cstr(from)?, cstr(to)?);
-    retry(|| {
+    let r = retry(|| {
         // SAFETY: valid descriptors and C strings.
         check(unsafe {
             libc::renameat2(
@@ -139,7 +146,163 @@ pub fn rename_noreplace(
                 libc::RENAME_NOREPLACE,
             )
         })
+    });
+    match r {
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            ) =>
+        {
+            match lstatat(to_dir, to) {
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            rename(from_dir, from, to_dir, to)
+        }
+        r => r,
+    }
+}
+
+/// A plain `renameat`: replaces `to` when it is a file, or an empty folder.
+pub fn rename(
+    from_dir: BorrowedFd<'_>,
+    from: &[u8],
+    to_dir: BorrowedFd<'_>,
+    to: &[u8],
+) -> io::Result<()> {
+    let (f, t) = (cstr(from)?, cstr(to)?);
+    retry(|| {
+        // SAFETY: valid descriptors and C strings.
+        check(unsafe {
+            libc::renameat(
+                from_dir.as_raw_fd(),
+                f.as_ptr(),
+                to_dir.as_raw_fd(),
+                t.as_ptr(),
+            )
+        })
     })
+}
+
+/// Whether two `stat`s name the same file.
+pub fn same_file(a: &libc::stat, b: &libc::stat) -> bool {
+    a.st_dev == b.st_dev
+        && a.st_ino == b.st_ino
+        && (a.st_mode & libc::S_IFMT) == (b.st_mode & libc::S_IFMT)
+}
+
+pub fn getuid() -> u32 {
+    // SAFETY: getuid has no failure.
+    unsafe { libc::getuid() }
+}
+
+/// `fchmod` where the file system may not keep modes (FAT, some network
+/// mounts: EPERM, ENOTSUP, EINVAL): that is not an error there.
+pub fn fchmod_soft(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
+    match fchmod(fd, mode) {
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EPERM | libc::ENOTSUP | libc::EINVAL)
+            ) =>
+        {
+            log::debug!("This file system doesn't keep modes: {e}");
+            Ok(())
+        }
+        r => r,
+    }
+}
+
+/// Opens a folder by path without following a link in its last component.
+pub fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = cstr(path.as_os_str().as_bytes())?;
+    retry(|| {
+        // SAFETY: a C string; a new descriptor we own.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(owned(fd))
+        }
+    })
+}
+
+/// The path the kernel says `fd` is at now (`/proc/self/fd/N`), when it can.
+pub fn fd_path(fd: BorrowedFd<'_>) -> Option<std::path::PathBuf> {
+    let p = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).ok()?;
+    p.is_absolute().then_some(p)
+}
+
+/// The bytes a non-root user can still write on the file system of `fd`.
+pub fn free_bytes(fd: BorrowedFd<'_>) -> io::Result<u64> {
+    let mut v = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: a valid descriptor; `v` is filled on success.
+    check(unsafe { libc::fstatvfs(fd.as_raw_fd(), v.as_mut_ptr()) })?;
+    // SAFETY: initialised by the successful call.
+    let v = unsafe { v.assume_init() };
+    Ok(v.f_bavail.saturating_mul(v.f_frsize))
+}
+
+/// This boot's id, when `/proc` says.
+pub fn boot_id() -> Option<String> {
+    let t = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let t = t.trim();
+    (!t.is_empty() && t.len() <= 64 && t.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        .then(|| t.to_string())
+}
+
+/// Whether `c` is one that must not reach a screen or a log from an
+/// untrusted source: a control character (Cc), a format character (Cf: bidi
+/// overrides and isolates, zero-width, joiners, tags), or a line or paragraph
+/// separator (Zl, Zp).
+pub fn is_unsafe_char(c: char) -> bool {
+    let u = c as u32;
+    c.is_control()
+        || matches!(
+            u,
+            0x00AD
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x0890..=0x0891
+                | 0x08E2
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x2028..=0x202E
+                | 0x2060..=0x2064
+                | 0x2066..=0x206F
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0x110BD
+                | 0x110CD
+                | 0x13430..=0x1343F
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0001
+                | 0xE0020..=0xE007F
+        )
+}
+
+/// `text` cut to `max` characters with every unsafe character replaced.
+pub fn sanitize(text: &str, max: usize, with: char) -> String {
+    text.chars()
+        .take(max)
+        .map(|c| if is_unsafe_char(c) { with } else { c })
+        .collect()
+}
+
+/// A path for a log line: lossy, capped, nothing unsafe in it.
+pub fn log_path(p: &Path) -> String {
+    sanitize(&p.to_string_lossy(), 512, '?')
 }
 
 /// `lstat` of `name` in `dir`.
@@ -298,6 +461,14 @@ mod tests {
         assert_eq!(pct_decode(&enc).unwrap(), raw);
         assert_eq!(pct_decode("%zz"), None);
         assert_eq!(pct_decode("%4"), None);
+    }
+
+    #[test]
+    fn sanitize_removes_controls_bidi_and_separators() {
+        let evil = "a\u{202E}b\u{2066}c\u{200B}d\u{2028}e\u{2029}f\u{7}g\u{FEFF}h";
+        assert_eq!(sanitize(evil, 100, '?'), "a?b?c?d?e?f?g?h");
+        assert_eq!(sanitize("héllo wörld", 5, '?'), "héllo");
+        assert!(!is_unsafe_char('é') && !is_unsafe_char('日'));
     }
 
     #[test]

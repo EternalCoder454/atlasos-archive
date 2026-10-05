@@ -4,7 +4,6 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -26,6 +25,10 @@ const HIGH_FD: RawFd = 100;
 /// The longest log line kept, and the most lines per worker.
 const LOG_LINE_MAX: usize = 512;
 const LOG_LINES_MAX: usize = 200;
+/// How long the wait for a killed worker may take before its drive is
+/// called unresponsive (a process in uninterruptible I/O on a dead mount
+/// doesn't die at SIGKILL until the I/O returns).
+const KILL_WAIT: Duration = Duration::from_secs(10);
 
 /// Stops a running job from any thread. Cheap to clone; every clone is the
 /// same handle.
@@ -159,46 +162,93 @@ fn wait(fd: RawFd, events: i16, cancel: &Cancel, deadline: Instant) -> io::Resul
 /// A running worker. It is killed and reaped by `finish` or, failing that,
 /// when this is dropped.
 pub struct Running {
-    child: Child,
+    /// `None` once reaped, or handed to a reaper thread.
+    child: Option<Child>,
+    pid: libc::pid_t,
+    /// A handle on the child that can't name a later process; `None` where
+    /// the kernel has no `pidfd_open` (before Linux 5.3).
+    pidfd: Option<OwnedFd>,
+    killed: bool,
     input: Option<OwnedFd>,
     output: OwnedFd,
     buf: Vec<u8>,
     start: usize,
-    reaped: bool,
     timeout: Duration,
 }
 
-/// Opens the archive for a worker: read-only, never blocking on a pipe, and
-/// a regular file (the worker checks too; this is the first answer).
+/// Opens the archive for a worker: first with `O_PATH`, which never blocks
+/// and never reads, to learn what it is, then for reading, and only if it is a
+/// regular file and the same one. This can still block on a dead network or
+/// removable mount: call it off the UI thread.
 pub fn open_archive(path: &Path) -> io::Result<File> {
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    let m = f.metadata()?;
-    if !m.is_file() {
-        let what = if m.is_dir() {
-            "a folder"
-        } else if m.file_type().is_fifo() || m.file_type().is_socket() {
-            "a pipe or socket"
-        } else {
-            "a device"
+    use std::os::unix::ffi::OsStrExt;
+    let c = sys::cstr(path.as_os_str().as_bytes())?;
+    let open = |p: &std::ffi::CStr, flags: i32| -> io::Result<OwnedFd> {
+        sys::retry(|| {
+            // SAFETY: a C string; a new descriptor we own.
+            let fd = unsafe { libc::open(p.as_ptr(), flags) };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                // SAFETY: a new descriptor returned by a successful call.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+        })
+    };
+    let probe = open(&c, libc::O_PATH | libc::O_CLOEXEC)?;
+    let first = sys::fstat(bfd(&probe))?;
+    let kind = first.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG {
+        let what = match kind {
+            libc::S_IFDIR => "a folder",
+            libc::S_IFIFO | libc::S_IFSOCK => "a pipe or socket",
+            _ => "a device",
         };
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("This is {what}, not an archive file."),
         ));
     }
-    Ok(f)
+    let flags = libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // Through the probe descriptor, the very file just looked at; by path
+    // (and then compared) only when /proc isn't there.
+    let via_proc = sys::cstr(format!("/proc/self/fd/{}", probe.as_raw_fd()).as_bytes())?;
+    let fd = match open(&via_proc, flags) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => open(&c, flags)?,
+        r => r?,
+    };
+    let second = sys::fstat(bfd(&fd))?;
+    if second.st_mode & libc::S_IFMT != libc::S_IFREG || !sys::same_file(&first, &second) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The archive changed while it was being opened.",
+        ));
+    }
+    Ok(File::from(fd))
 }
 
 /// Starts `exe` with the archive on 3 and, when given, the staging folder on 4.
+///
+/// The worker gets `PR_SET_PDEATHSIG`: it dies with the *thread* that started
+/// it, so the calling thread must live until the job returns. A program that
+/// ignores `SIGCHLD` (`SIG_IGN`) can't wait for its children: that is refused.
 pub fn spawn(
     exe: &Path,
     timeout: Duration,
     archive: &File,
     staging: Option<&OwnedFd>,
 ) -> io::Result<Running> {
+    // SAFETY: sigaction with a null new action only reads the current one.
+    let ignored = unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
+    };
+    if ignored {
+        return Err(io::Error::other(
+            "SIGCHLD is ignored by this program, so the archive reader can't be waited for",
+        ));
+    }
     // Copies above the target range first: the pipes std makes for 0 to 2 can
     // be any numbers, and placing one descriptor must never overwrite another
     // still to come.
@@ -211,15 +261,24 @@ pub fn spawn(
     let mut cmd = Command::new(exe);
     cmd.env_clear()
         .env("LANG", "C.UTF-8")
+        .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Its own group, so a kill reaches 7z and unrar too.
         .process_group(0);
-    // SAFETY: the closure makes only async-signal-safe calls (dup2, close,
-    // prctl) and touches no memory it didn't get before the fork.
+    // SAFETY: the closure makes only async-signal-safe calls (signal,
+    // sigprocmask, prctl, dup2, close, fcntl, syscall) and touches no memory
+    // it didn't get before the fork.
     unsafe {
         cmd.pre_exec(move || {
+            // Nothing the parent ignored or blocked may reach the worker.
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGPIPE] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
             // The worker dies with the thread that started it.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) < 0 {
                 return Err(io::Error::last_os_error());
@@ -238,11 +297,35 @@ pub fn spawn(
                     libc::close(STAGING_FD);
                 }
             }
+            // Everything above 4 is closed at exec, whatever the parent left
+            // open without close-on-exec. (Marked, not closed now: std's pipe
+            // that reports a failed exec must live until then.)
+            let first_extra: libc::c_uint = 5;
+            let r = libc::syscall(
+                libc::SYS_close_range,
+                first_extra,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            );
+            if r < 0 {
+                // Before Linux 5.11: mark them one by one.
+                for fd in first_extra as libc::c_int..4096 {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
             Ok(())
         });
     }
     let mut child = cmd.spawn()?;
     drop((a, s));
+    let pid = child.id() as libc::pid_t;
+    // Right away: the child is not reaped (only we reap it), so the number
+    // can't have been reused yet.
+    // SAFETY: pidfd_open takes no pointers; the result is a new descriptor.
+    let pidfd = unsafe {
+        let r = libc::syscall(libc::SYS_pidfd_open, pid, 0);
+        (r >= 0).then(|| OwnedFd::from_raw_fd(r as libc::c_int))
+    };
 
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -253,12 +336,14 @@ pub fn spawn(
     };
     let (input, output) = (OwnedFd::from(stdin), OwnedFd::from(stdout));
     let mut running = Running {
-        child,
+        child: Some(child),
+        pid,
+        pidfd,
+        killed: false,
         input: None,
         output,
         buf: Vec::new(),
         start: 0,
-        reaped: false,
         timeout,
     };
     // Our ends only: a worker that doesn't read or write must never block us.
@@ -274,7 +359,7 @@ pub fn spawn(
 }
 
 /// Copies the worker's stderr into the log: capped lines, capped count, no
-/// control characters. Never request frames; the worker doesn't log those.
+/// control or format characters. Never request frames; the worker doesn't log those.
 fn drain_log(mut err: impl Read) {
     let mut line: Vec<u8> = Vec::new();
     let mut lines = 0usize;
@@ -285,10 +370,7 @@ fn drain_log(mut err: impl Read) {
         }
         *lines += 1;
         if *lines <= LOG_LINES_MAX {
-            let text: String = String::from_utf8_lossy(line)
-                .chars()
-                .map(|c| if c.is_control() { '?' } else { c })
-                .collect();
+            let text = sys::sanitize(&String::from_utf8_lossy(line), usize::MAX, '?');
             log::warn!("atlas-archive-worker: {text}");
         } else if *lines == LOG_LINES_MAX + 1 {
             log::warn!("atlas-archive-worker: more output was dropped");
@@ -314,10 +396,56 @@ fn drain_log(mut err: impl Read) {
     flush(&mut line, &mut lines);
 }
 
+/// `write` that can't raise SIGPIPE. The GUI's C++ `main` leaves SIGPIPE at
+/// its default, and a plain write to a pipe whose reader is gone would kill
+/// the process. This blocks SIGPIPE on this thread for the call, and on EPIPE
+/// takes the signal that call made (thread-directed, so it is pending on this
+/// thread alone) before the old mask returns. No process-wide state changes.
+fn write_no_sigpipe(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: sigset operations on local, zeroed sets; the mask is restored
+    // before returning; write reads from a live buffer of the length passed.
+    unsafe {
+        let mut pipe: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut pipe);
+        libc::sigaddset(&mut pipe, libc::SIGPIPE);
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &pipe, &mut old);
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        let was_blocked = libc::sigismember(&old, libc::SIGPIPE) == 1;
+        let n = libc::write(fd, buf.as_ptr().cast(), buf.len());
+        let err = (n < 0).then(io::Error::last_os_error);
+        if !was_blocked && err.as_ref().and_then(|e| e.raw_os_error()) == Some(libc::EPIPE) {
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            loop {
+                let r = libc::sigtimedwait(&pipe, std::ptr::null_mut(), &zero);
+                if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+        }
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        match err {
+            Some(e) => Err(e),
+            None => Ok(n as usize),
+        }
+    }
+}
+
 impl Running {
+    /// How long a reply may go without the job advancing.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Sends one frame. The frame (a password may be in it) is wiped after.
     /// A worker that has already gone is not an error here: its replies, or
-    /// their end, say what happened.
+    /// their end, say what happened. Never raises SIGPIPE.
     pub fn send(&mut self, payload: &[u8], cancel: &Cancel) -> Result<(), Stop> {
         if payload.len() > MAX_FRAME {
             return Err(Stop::Proto(ProtoError::TooLarge));
@@ -332,38 +460,40 @@ impl Running {
                 return Ok(());
             };
             let fd = input.as_raw_fd();
-            // SAFETY: writes from the live, in-bounds rest of `frame`.
-            let n = unsafe { libc::write(fd, frame[at..].as_ptr().cast(), frame.len() - at) };
-            if n >= 0 {
-                at += n as usize;
-                continue;
-            }
-            let e = io::Error::last_os_error();
-            match e.kind() {
-                io::ErrorKind::Interrupted => {}
-                io::ErrorKind::WouldBlock => {
-                    match wait(fd, libc::POLLOUT, cancel, deadline).map_err(Stop::Io)? {
-                        Ready::Yes => {}
-                        Ready::Cancelled => return Err(Stop::Cancelled),
-                        Ready::TimedOut => return Err(Stop::Timeout),
+            match write_no_sigpipe(fd, &frame[at..]) {
+                Ok(n) => at += n,
+                Err(e) => match e.kind() {
+                    io::ErrorKind::Interrupted => {}
+                    io::ErrorKind::WouldBlock => {
+                        match wait(fd, libc::POLLOUT, cancel, deadline).map_err(Stop::Io)? {
+                            Ready::Yes => {}
+                            Ready::Cancelled => return Err(Stop::Cancelled),
+                            Ready::TimedOut => return Err(Stop::Timeout),
+                        }
                     }
-                }
-                io::ErrorKind::BrokenPipe => {
-                    log::debug!("The worker closed its request pipe.");
-                    self.input = None;
-                    return Ok(());
-                }
-                _ => return Err(Stop::Io(e)),
+                    io::ErrorKind::BrokenPipe => {
+                        log::debug!("The worker closed its request pipe.");
+                        self.input = None;
+                        return Ok(());
+                    }
+                    _ => return Err(Stop::Io(e)),
+                },
             }
         }
         Ok(())
     }
 
-    /// The next reply, and the length of its frame. The timeout covers this
-    /// call alone, so it restarts with every frame, and doesn't run while the
-    /// caller is away answering a question.
-    pub fn recv(&mut self, cancel: &Cancel) -> Result<(Reply, usize), Stop> {
-        let deadline = Instant::now() + self.timeout;
+    /// The next reply, and the length of its frame, or `None` when `tick`
+    /// passed first (the caller looks at the staging folder and asks again).
+    /// Waits no longer than `deadline`; it is the caller's to move, and the
+    /// time the caller spends away isn't counted.
+    pub fn recv(
+        &mut self,
+        cancel: &Cancel,
+        deadline: Instant,
+        tick: Option<Duration>,
+    ) -> Result<Option<(Reply, usize)>, Stop> {
+        let wake = tick.map(|t| Instant::now() + t);
         loop {
             let avail = &self.buf[self.start..];
             if avail.len() >= 4 {
@@ -374,13 +504,15 @@ impl Running {
                 if avail.len() >= 4 + len {
                     let reply = Reply::decode(&avail[4..4 + len]).map_err(Stop::Proto)?;
                     self.start += 4 + len;
-                    return Ok((reply, len));
+                    return Ok(Some((reply, len)));
                 }
             }
-            match wait(self.output.as_raw_fd(), libc::POLLIN, cancel, deadline).map_err(Stop::Io)? {
+            let until = wake.map_or(deadline, |w| w.min(deadline));
+            match wait(self.output.as_raw_fd(), libc::POLLIN, cancel, until).map_err(Stop::Io)? {
                 Ready::Yes => {}
                 Ready::Cancelled => return Err(Stop::Cancelled),
-                Ready::TimedOut => return Err(Stop::Timeout),
+                Ready::TimedOut if Instant::now() >= deadline => return Err(Stop::Timeout),
+                Ready::TimedOut => return Ok(None),
             }
             if self.start > 0 {
                 self.buf.drain(..self.start);
@@ -414,27 +546,86 @@ impl Running {
         }
     }
 
-    /// Kills the worker and everything in its group, then reaps it. The kill
-    /// goes out before the reap, while the number still names our child: it
+    /// Kills the worker and everything in its group, then reaps it, waiting
+    /// at most `KILL_WAIT`. The kill goes out before the reap, while the
+    /// number still names our child (and the pidfd names it for good), so it
     /// can't have been reused. Nothing else may look at the staging folder
-    /// before this returns.
+    /// before this returns `Ok`.
+    ///
+    /// On `ErrorKind::TimedOut` the worker is stuck in the kernel (a dead
+    /// mount): it stays a zombie-to-be, reaped by a detached thread whenever
+    /// it ends, and the caller must leave the staging folder alone.
     pub fn finish(&mut self) -> io::Result<ExitStatus> {
-        if !self.reaped {
-            let pid = self.child.id() as libc::pid_t;
-            // SAFETY: the child is not reaped (only `wait` below does that),
-            // so `pid` is still its pid and its group's id.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if !self.killed {
+            self.killed = true;
+            // SAFETY: the child is not reaped (only the code below does
+            // that), so `pid` is still its pid and its group's id.
+            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
+            let sent = self.pidfd.as_ref().is_some_and(|p| {
+                // SAFETY: a valid pidfd; no siginfo, no flags.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        p.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    ) == 0
+                }
+            });
             // The group may be gone while the child is not (setpgid failed).
-            let _ = self.child.kill();
-            self.reaped = true;
+            if !sent && let Some(c) = self.child.as_mut() {
+                let _ = c.kill();
+            }
         }
-        self.child.wait()
+        let Some(child) = self.child.as_mut() else {
+            return Err(io::Error::other("the archive reader was already reaped"));
+        };
+        let deadline = Instant::now() + KILL_WAIT;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.child = None;
+                return Ok(status);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match &self.pidfd {
+                Some(p) => {
+                    let mut fds = [libc::pollfd {
+                        fd: p.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }];
+                    let ms = remaining.as_millis().min(i32::MAX as u128) as i32 + 1;
+                    // SAFETY: one valid pollfd; EINTR just loops.
+                    unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+                }
+                None => std::thread::sleep(remaining.min(Duration::from_millis(10))),
+            }
+        }
+        // Still not gone. Hand the zombie-to-be to a thread that waits for it.
+        if let Some(mut child) = self.child.take() {
+            let spawned = std::thread::Builder::new()
+                .name("archive-worker-reaper".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+            if let Err(e) = spawned {
+                log::warn!("No thread to reap a stuck archive reader: {e}");
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "The archive's drive isn't responding.",
+        ))
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        if !self.reaped
+        if self.child.is_some()
             && let Err(e) = self.finish()
         {
             log::warn!("The archive reader couldn't be reaped: {e}");

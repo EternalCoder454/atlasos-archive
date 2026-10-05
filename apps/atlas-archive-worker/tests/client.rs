@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use atlas_archive_core::client::{
     Callbacks, Cancel, Clash, ClashAnswer, Error, ExtractRequest, Mode, Trash, Worker, clean_stale,
 };
+use atlas_archive_core::limits::{Exceeded, Kind};
 use atlas_archive_core::name::NameEncoding;
 use atlas_archive_core::proto::{self, Reply};
 use zeroize::Zeroizing;
@@ -143,6 +144,8 @@ struct Rec {
     entries: usize,
     formats: u32,
     cancel_on_progress: Option<Cancel>,
+    accept_limits: bool,
+    on_clash: Option<Box<dyn FnMut()>>,
 }
 
 impl Callbacks for Rec {
@@ -164,7 +167,13 @@ impl Callbacks for Rec {
             .pop_front()
             .map(|p| Zeroizing::new(p.to_vec()))
     }
+    fn limit(&mut self, _: &Exceeded) -> bool {
+        self.accept_limits
+    }
     fn clash(&mut self, name: &str) -> ClashAnswer {
+        if let Some(hook) = &mut self.on_clash {
+            hook();
+        }
         self.clashes.push(name.to_string());
         self.clash.expect("no answer for a clash")
     }
@@ -711,6 +720,8 @@ fn clean_stale_removes_a_dead_jobs_staging_and_only_that() {
     for n in [dead, reused, live] {
         let d = s.dest.join(n);
         std::fs::create_dir_all(d.join("x/y")).unwrap();
+        // The mode every staging folder has until it moves out.
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(d.join("x/y/f"), "f").unwrap();
         // A link to a folder outside, and a locked folder: neither is followed
         // or left behind.
@@ -804,4 +815,406 @@ fn proto_frames_for_fakes_are_well_formed() {
     let mut bytes = Vec::new();
     proto::write_frame(&mut bytes, &Reply::Listed { entries: 0 }.encode()).unwrap();
     assert!(proto::read_frame(&mut &bytes[..]).unwrap().is_some());
+}
+
+// ---- the audit round: what the client no longer trusts ----
+
+fn limit_reply(kind: Kind) -> Reply {
+    Reply::Limit(Exceeded { kind, limit: 5 })
+}
+
+fn start_time() -> u64 {
+    std::fs::read_to_string("/proc/self/stat")
+        .unwrap()
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+const SIGPIPE_CHILD: &str = "ATLAS_TEST_SIGPIPE_CHILD";
+
+/// Runs in a child whose SIGPIPE is at its default, as a C++ `main` leaves it
+/// (the Rust test harness ignores it, which would hide the bug).
+fn sigpipe_scenarios() {
+    let s = Scratch::new("sigpipe");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    // A worker that closes its stdin and then asks a question: the answer is
+    // written to a pipe nobody reads.
+    s.frame("limit.bin", &limit_reply(Kind::Entries));
+    let w = s.fake("exec 0<&-\ncat \"$DIR/limit.bin\"\nexec sleep 30");
+    for _ in 0..3 {
+        let r = w.extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut Rec::default(),
+            &Cancel::new(),
+        );
+        assert!(r.is_err());
+    }
+    // A worker that is gone before the first request is written.
+    let w = s.fake("exit 0");
+    for _ in 0..30 {
+        let r = w.test(&a, &mut Rec::default(), &Cancel::new());
+        assert!(r.is_err());
+    }
+    assert!(s.ls().is_empty());
+}
+
+#[test]
+fn a_closed_request_pipe_cannot_kill_the_client() {
+    if std::env::var_os(SIGPIPE_CHILD).is_some() {
+        // SAFETY: sets the default disposition, as a C++ main leaves it.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        sigpipe_scenarios();
+        return;
+    }
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_closed_request_pipe_cannot_kill_the_client",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SIGPIPE_CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the client died: {:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn progress_that_does_not_advance_does_not_extend_the_deadline() {
+    let s = Scratch::new("flood");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("p.bin", &Reply::Progress { bytes: 1, items: 1 });
+    let w = s.fake("while :; do cat \"$DIR/p.bin\" || exit 0; sleep 0.05; done");
+    let t = Instant::now();
+    let m = failing(&s, &w, &a);
+    assert_eq!(m, "The archive reader stopped responding.");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(s.ls().is_empty() && s.jobs().is_empty());
+}
+
+#[test]
+fn progress_that_goes_backwards_is_a_bad_worker() {
+    let s = Scratch::new("back");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("p5.bin", &Reply::Progress { bytes: 5, items: 5 });
+    s.frame("p1.bin", &Reply::Progress { bytes: 1, items: 9 });
+    let w = s.fake("cat \"$DIR/p5.bin\" \"$DIR/p1.bin\"; exec sleep 30");
+    let m = failing(&s, &w, &a);
+    assert_eq!(m, "The archive reader sent something unexpected.");
+}
+
+#[test]
+fn a_limit_of_one_kind_is_asked_once() {
+    let s = Scratch::new("twice");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("l.bin", &limit_reply(Kind::Entries));
+    let w = s.fake("cat \"$DIR/l.bin\" \"$DIR/l.bin\"; exec sleep 30");
+    let mut rec = Rec {
+        accept_limits: true,
+        ..Rec::default()
+    };
+    let e = w
+        .extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut rec,
+            &Cancel::new(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "The archive reader sent something unexpected."
+    );
+    assert!(s.ls().is_empty());
+}
+
+#[test]
+fn done_after_a_declined_limit_is_refused() {
+    let s = Scratch::new("declined");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("l.bin", &limit_reply(Kind::TotalSize));
+    s.frame("done.bin", &Reply::Done { written: vec![] });
+    let w = s.fake("cat \"$DIR/l.bin\" \"$DIR/done.bin\"; exec sleep 30");
+    let m = failing(&s, &w, &a);
+    assert_eq!(m, "The archive reader sent something unexpected.");
+    assert!(s.ls().is_empty());
+    // The honest way: the limit declined, then Failed.
+    s.frame(
+        "failed.bin",
+        &Reply::Failed {
+            reason: "stopped".into(),
+        },
+    );
+    let w = s.fake("cat \"$DIR/l.bin\" \"$DIR/failed.bin\"; exec sleep 30");
+    let e = w
+        .extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut Rec::default(),
+            &Cancel::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(e, Error::LimitRefused(_)), "{e}");
+}
+
+#[test]
+fn the_worker_gets_only_its_descriptors_a_clean_cwd_and_no_text_tricks() {
+    let s = Scratch::new("hygiene");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    let marker = s.root.join("marker");
+    std::fs::write(&marker, "m").unwrap();
+    let c = std::ffi::CString::new(marker.to_str().unwrap()).unwrap();
+    // Open without close-on-exec, as careless code would leave it.
+    // SAFETY: a C string; the descriptor is closed below.
+    let leaked = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+    assert!(leaked > 4);
+    s.frame("done.bin", &Reply::Done { written: vec![] });
+    let w = s.fake(&format!(
+        "pwd > \"$DIR/cwd\"\n[ -e /proc/$$/fd/{leaked} ] && echo leaked > \"$DIR/leak\"\n\
+         for f in /proc/$$/fd/*; do case \"$f\" in */0|*/1|*/2|*/3|*/4) ;; *) [ -e \"$f\" ] && echo \"$f\" >> \"$DIR/extra\";; esac; done\n\
+         cat \"$DIR/done.bin\""
+    ));
+    let _ = w.extract(
+        &request(&a, &s.dest, to("out")),
+        &mut Rec::default(),
+        &Cancel::new(),
+    );
+    // SAFETY: closes the descriptor opened above.
+    unsafe { libc::close(leaked) };
+    assert_eq!(read(s.root.join("cwd")).trim(), "/");
+    assert!(
+        !s.root.join("leak").exists(),
+        "an inherited descriptor reached the worker"
+    );
+    // Only the shell's own script descriptor may be above 4.
+    let extra = std::fs::read_to_string(s.root.join("extra")).unwrap_or_default();
+    assert!(extra.lines().count() <= 1, "{extra}");
+}
+
+#[test]
+fn a_worker_that_writes_past_the_approved_size_is_stopped_by_the_client() {
+    let s = Scratch::new("size");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("p1.bin", &Reply::Progress { bytes: 1, items: 1 });
+    s.frame("p2.bin", &Reply::Progress { bytes: 2, items: 2 });
+    // Random data: a compressing file system would otherwise not notice it.
+    let w = s
+        .fake(
+            "cat \"$DIR/p1.bin\"\nhead -c 80000000 /dev/urandom > /proc/self/fd/4/big\n\
+             sync -f \"$DIR\"\ncat \"$DIR/p2.bin\"\nexec sleep 30",
+        )
+        .with_size_ceiling(1 << 20)
+        .with_timeout(Duration::from_secs(20));
+    let t = Instant::now();
+    let e = w
+        .extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut Rec::default(),
+            &Cancel::new(),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("more than it said"), "{e}");
+    assert!(t.elapsed() < Duration::from_secs(15));
+    assert!(s.ls().is_empty() && s.jobs().is_empty());
+}
+
+#[test]
+fn a_destination_others_can_write_is_refused() {
+    let s = Scratch::new("shared");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    std::fs::set_permissions(&s.dest, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let e = extract(&s, &a, Mode::ExtractHere, &mut Rec::default()).unwrap_err();
+    assert!(e.to_string().contains("Pick a folder of your own"), "{e}");
+    assert!(s.ls().is_empty() && s.jobs().is_empty());
+    // Sticky, like /tmp: allowed.
+    std::fs::set_permissions(&s.dest, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    extract(&s, &a, Mode::ExtractHere, &mut Rec::default()).unwrap();
+    assert_eq!(s.ls(), ["a.txt"]);
+}
+
+#[test]
+fn replace_puts_the_old_item_back_when_the_new_one_cannot_be_moved() {
+    let s = Scratch::new("rollback");
+    let a = s.tar("one.tar.gz", &[("note.txt", "new")]);
+    std::fs::write(s.dest.join("note.txt"), "old").unwrap();
+    let dest = s.dest.clone();
+    let mut rec = Rec {
+        clash: Some(ClashAnswer {
+            action: Clash::Replace,
+            all: false,
+        }),
+        // Between the question and the move, the new item vanishes from
+        // staging, so the rename after the Trash step fails.
+        on_clash: Some(Box::new(move || {
+            for e in std::fs::read_dir(&dest).unwrap().flatten() {
+                if e.file_name().to_string_lossy().starts_with('.') {
+                    std::fs::remove_file(e.path().join("note.txt")).unwrap();
+                }
+            }
+        })),
+        ..Rec::default()
+    };
+    let e = s
+        .worker()
+        .extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut rec,
+            &Cancel::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(e, Error::Failed(_)), "{e}");
+    assert_eq!(
+        s.ls(),
+        ["note.txt"],
+        "staging is gone, the old item is back"
+    );
+    assert_eq!(read(s.dest.join("note.txt")), "old");
+    assert!(
+        ls(&s.trash.join("files")).is_empty(),
+        "nothing is left in the Trash"
+    );
+    assert!(ls(&s.trash.join("info")).is_empty());
+}
+
+fn record_full(
+    s: &Scratch,
+    name: &str,
+    pid: u32,
+    start: u64,
+    boot: Option<&str>,
+    (dev, ino): (u64, u64),
+    staging: &str,
+) -> PathBuf {
+    let jobs = s.state.join("atlas-archive/jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    let path = jobs.join(name);
+    let boot = boot.map(|b| format!("boot={b}\n")).unwrap_or_default();
+    std::fs::write(
+        &path,
+        format!(
+            "pid={pid}\nstart={start}\n{boot}dev={dev}\nino={ino}\ndest={}\nstaging={staging}\n",
+            s.dest.display()
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn make_staging(s: &Scratch, name: &str, mode: u32) {
+    let d = s.dest.join(name);
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub/f"), "f").unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+const OTHER_BOOT: &str = "00000000-0000-0000-0000-000000000000";
+
+#[test]
+fn a_new_boot_or_device_number_still_cleans_up_what_is_proven() {
+    let s = Scratch::new("reboot");
+    let md = std::fs::metadata(&s.dest).unwrap();
+    let me = std::process::id();
+    let (dev, ino) = (md.dev(), md.ino());
+    let n1 = ".a.zip.atlas-partial-0000000000000011";
+    let n2 = ".b.zip.atlas-partial-0000000000000012";
+    let n3 = ".c.zip.atlas-partial-0000000000000013";
+    let n4 = ".d.zip.atlas-partial-0000000000000014";
+    for n in [n1, n2, n3, n4] {
+        make_staging(&s, n, 0o700);
+    }
+    // Another boot: dead whatever the pid says (this very process's own).
+    record_full(
+        &s,
+        "1.job",
+        me,
+        start_time(),
+        Some(OTHER_BOOT),
+        (dev, ino),
+        n1,
+    );
+    // The device number changed (btrfs subvolumes across boots), the inode didn't.
+    record_full(&s, "2.job", dead_pid(), 5, None, (dev + 7, ino), n2);
+    // Same device, another folder now: not ours to touch, and kept.
+    record_full(&s, "3.job", dead_pid(), 5, None, (dev, ino + 1), n3);
+    // Nothing matches: kept too.
+    record_full(&s, "4.job", dead_pid(), 5, None, (dev + 7, ino + 1), n4);
+    let c = clean_stale(&s.state).unwrap();
+    assert_eq!((c.removed, c.live, c.failed), (2, 0, 2), "{c:?}");
+    assert_eq!(s.ls(), [n3, n4]);
+    assert_eq!(
+        s.jobs(),
+        ["3.job", "4.job"],
+        "records that couldn't be proven stay"
+    );
+}
+
+#[test]
+fn a_record_cannot_name_a_folder_that_isnt_a_staging_folder() {
+    let s = Scratch::new("notours");
+    let md = std::fs::metadata(&s.dest).unwrap();
+    let ids = (md.dev(), md.ino());
+    // A user's own folder with the tag in its name, made the ordinary way.
+    let plain = ".Photos.atlas-partial-0000000000000021";
+    let wide = ".Wide.atlas-partial-0000000000000022";
+    let tagless = "Documents";
+    make_staging(&s, plain, 0o755);
+    make_staging(&s, wide, 0o770);
+    make_staging(&s, tagless, 0o700);
+    record_full(&s, "1.job", dead_pid(), 5, None, ids, plain);
+    record_full(&s, "2.job", dead_pid(), 5, None, ids, wide);
+    record_full(&s, "3.job", dead_pid(), 5, None, ids, tagless);
+    // A record anyone else could have written.
+    let n = ".Mine.atlas-partial-0000000000000023";
+    make_staging(&s, n, 0o700);
+    let path = record_full(&s, "4.job", dead_pid(), 5, None, ids, n);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    // A job folder anyone could read is narrowed.
+    std::fs::set_permissions(
+        s.state.join("atlas-archive/jobs"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let c = clean_stale(&s.state).unwrap();
+    assert_eq!((c.removed, c.live, c.failed), (0, 0, 0), "{c:?}");
+    assert_eq!(s.ls(), [n, plain, wide, tagless]);
+    for d in [plain, wide, tagless, n] {
+        assert_eq!(read(s.dest.join(d).join("sub/f")), "f", "{d}");
+    }
+    assert!(s.jobs().is_empty(), "unusable records are dropped");
+    let mode = std::fs::metadata(s.state.join("atlas-archive/jobs"))
+        .unwrap()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[test]
+fn a_record_with_no_start_time_is_dead_once_a_later_process_has_its_pid() {
+    let s = Scratch::new("nostart");
+    let md = std::fs::metadata(&s.dest).unwrap();
+    let ids = (md.dev(), md.ino());
+    let n = ".a.zip.atlas-partial-0000000000000031";
+    let m = ".b.zip.atlas-partial-0000000000000032";
+    make_staging(&s, n, 0o700);
+    make_staging(&s, m, 0o700);
+    let me = std::process::id();
+    // Written long ago: this process (started minutes ago at most) isn't its job.
+    let old = record_full(&s, "1.job", me, 0, None, ids, n);
+    let f = std::fs::File::options().write(true).open(&old).unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600))
+        .unwrap();
+    // Written just now: it may well be this process.
+    record_full(&s, "2.job", me, 0, None, ids, m);
+    let c = clean_stale(&s.state).unwrap();
+    assert_eq!((c.removed, c.live, c.failed), (1, 1, 0), "{c:?}");
+    assert_eq!(s.ls(), [m]);
 }

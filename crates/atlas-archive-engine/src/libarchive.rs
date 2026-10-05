@@ -214,7 +214,7 @@ impl<'fd> Reader<'fd> {
     }
 
     /// The next entry's header, or `None` at the end.
-    pub fn next(&mut self) -> Result<Option<Entry>, Error> {
+    pub fn next_header(&mut self) -> Result<Option<Entry>, Error> {
         let mut e = std::ptr::null_mut();
         // SAFETY: valid handle; `e` is owned by libarchive until the next call.
         let r = unsafe { archive_read_next_header(self.a, &mut e) };
@@ -455,7 +455,7 @@ mod tests {
         let f = std::fs::File::open(path).unwrap();
         let mut r = Reader::open(f.as_fd()).unwrap();
         let mut out = Vec::new();
-        while let Some(e) = r.next().unwrap() {
+        while let Some(e) = r.next_header().unwrap() {
             r.skip().unwrap();
             out.push(e);
         }
@@ -512,7 +512,7 @@ mod tests {
         );
         let file = std::fs::File::open(d.join("notes.txt.gz")).unwrap();
         let mut r = Reader::open(file.as_fd()).unwrap();
-        let e = r.next().unwrap().unwrap();
+        let e = r.next_header().unwrap().unwrap();
         assert_eq!(e.kind, Kind::File);
         assert!(r.is_compressed_file() && !r.is_plain_file());
         let mut buf = [0u8; 64];
@@ -523,7 +523,7 @@ mod tests {
         match Reader::open(file.as_fd()) {
             Err(_) => {}
             Ok(mut r) => {
-                let _ = r.next();
+                let _ = r.next_header();
                 assert!(r.is_plain_file());
             }
         }
@@ -546,7 +546,7 @@ mod tests {
         let file = std::fs::File::open(d.join("bad.7z")).unwrap();
         if let Ok(mut r) = Reader::open(file.as_fd()) {
             let mut n = 0;
-            while let Ok(Some(_)) = r.next() {
+            while let Ok(Some(_)) = r.next_header() {
                 n += 1;
                 if n > 1000 {
                     break;

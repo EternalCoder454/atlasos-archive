@@ -650,7 +650,7 @@ mod tests {
             packed: None,
             mtime: Some(-5),
             mode: 0o644,
-            encrypted: i % 2 == 0,
+            encrypted: i.is_multiple_of(2),
             utf8: i != 1,
             link: (i == 3).then(|| b"../x".to_vec()),
         }

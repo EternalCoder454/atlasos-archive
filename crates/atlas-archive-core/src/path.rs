@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(disk(deeper.as_bytes()), Err(PathError::TooDeep));
         // 20 folders of 85 CP437 bytes: 1,720 bytes stored, 5,120 on disk.
         let wide: Vec<u8> = (0..20)
-            .flat_map(|_| [0xB0u8; 85].into_iter().chain([b'/']))
+            .flat_map(|_| [0xB0u8; 85].into_iter().chain(*b"/"))
             .collect();
         assert_eq!(
             parse(&wide, NameEncoding::Cp437, false),
