@@ -168,16 +168,17 @@ pub fn read_line(
 /// Why `--password-fd` gave no password.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FdError {
-    /// Nothing arrived in time: the archive needs a password (exit 3), where
-    /// anything else is a usage mistake.
-    pub timed_out: bool,
+    /// Nothing arrived (the wait ran out, or the descriptor ended with no
+    /// line): the archive needs a password (exit 3), where anything else is a
+    /// usage mistake.
+    pub no_password: bool,
     /// A sentence.
     pub message: String,
 }
 
 fn bad(message: String) -> FdError {
     FdError {
-        timed_out: false,
+        no_password: false,
         message,
     }
 }
@@ -186,7 +187,22 @@ fn bad(message: String) -> FdError {
 /// descriptor closed afterwards, 30 seconds at most. When the descriptor is
 /// 0 this takes the program's standard input.
 pub fn read_password_fd(fd: RawFd, wake: RawFd) -> Result<Option<Zeroizing<Vec<u8>>>, FdError> {
-    read_password_fd_within(fd, wake, FD_WAIT)
+    read_password_fd_within(fd, wake, fd_wait())
+}
+
+/// How long to wait for the line. The tests shorten it (a build with the
+/// `dev-worker` feature only, which is never shipped).
+#[cfg(feature = "dev-worker")]
+fn fd_wait() -> Duration {
+    std::env::var("ATLAS_ARCHIVE_TEST_FD_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(FD_WAIT, Duration::from_millis)
+}
+
+#[cfg(not(feature = "dev-worker"))]
+fn fd_wait() -> Duration {
+    FD_WAIT
 }
 
 fn read_password_fd_within(
@@ -226,10 +242,13 @@ fn read_password_fd_within(
     }
     match result {
         Ok(Line::Text(p)) => Ok(Some(p)),
-        Ok(Line::Eof) => Err(bad(format!("No password was sent on descriptor {fd}."))),
+        Ok(Line::Eof) => Err(FdError {
+            no_password: true,
+            message: format!("No password was sent on descriptor {fd}."),
+        }),
         Ok(Line::TooLong) => Err(bad("The password is too long.".into())),
         Ok(Line::TimedOut) => Err(FdError {
-            timed_out: true,
+            no_password: true,
             message: format!(
                 "No password arrived on descriptor {fd} within {} seconds.",
                 wait.as_secs().max(1)
@@ -328,6 +347,9 @@ impl Drop for EchoOff {
 pub struct Tty {
     file: File,
     wake: RawFd,
+    /// The terminal went away (a failed read, or a hangup): a SIGHUP is on
+    /// its way, and the run is a cancel, whatever the read said.
+    hung: std::sync::atomic::AtomicBool,
 }
 
 impl Tty {
@@ -339,7 +361,11 @@ impl Tty {
             .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
             .open("/dev/tty")
             .ok()?;
-        Some(Tty { file, wake })
+        Some(Tty {
+            file,
+            wake,
+            hung: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Writes to the screen. A terminal that can't be written to has no one
@@ -349,21 +375,50 @@ impl Tty {
         let _ = f.write_all(text.as_bytes()).and_then(|()| f.flush());
     }
 
+    /// Whether the terminal hung up or failed under a read.
+    pub fn hung_up(&self) -> bool {
+        self.hung.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Reads a line from the terminal. A failed read, or the end of input on
+    /// a terminal that has hung up (POLLHUP; Ctrl-D alone doesn't set it), is
+    /// `Interrupted`: the SIGHUP that follows may not be queued yet.
+    fn read(&self, max: usize) -> Line {
+        let line = read_line(self.file.as_raw_fd(), self.wake, max, None);
+        let gone = match &line {
+            Err(e) => {
+                log::warn!("reading the terminal: {e}");
+                true
+            }
+            Ok(Line::Eof) => {
+                let mut p = libc::pollfd {
+                    fd: self.file.as_raw_fd(),
+                    events: 0,
+                    revents: 0,
+                };
+                // SAFETY: one live pollfd, no waiting.
+                unsafe { libc::poll(&mut p, 1, 0) };
+                p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            }
+            Ok(_) => false,
+        };
+        if gone {
+            self.hung.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Line::Interrupted;
+        }
+        line.unwrap_or(Line::Interrupted)
+    }
+
     /// Asks a question and returns the answer, lowercased; `None` at the end
     /// of input, a signal, or a failed read.
     pub fn ask(&self, prompt: &str) -> Option<String> {
         self.say(prompt);
-        match read_line(self.file.as_raw_fd(), self.wake, MAX_ANSWER, None) {
-            Ok(Line::Text(t)) => Some(String::from_utf8_lossy(&t).trim().to_lowercase()),
+        match self.read(MAX_ANSWER) {
+            Line::Text(t) => Some(String::from_utf8_lossy(&t).trim().to_lowercase()),
             // The whole long line was read and dropped: no answer.
-            Ok(Line::TooLong) => Some(String::new()),
-            Ok(_) => {
+            Line::TooLong => Some(String::new()),
+            _ => {
                 self.say("\n");
-                self.flush_input();
-                None
-            }
-            Err(e) => {
-                log::warn!("reading the terminal: {e}");
                 self.flush_input();
                 None
             }
@@ -378,12 +433,14 @@ impl Tty {
     }
 
     /// Asks for a password with echo off. `Err` when it can't be hidden.
+    /// `Err` only for that: a failed read is `Interrupted`.
     pub fn password(&self, prompt: &str) -> io::Result<Line> {
         let _quiet = EchoOff::new(self.file.as_raw_fd())?;
         self.say(prompt);
-        let line = read_line(self.file.as_raw_fd(), self.wake, MAX_PASSWORD, None);
+        let line = self.read(MAX_PASSWORD);
         // Echo was off, so the Enter key showed nothing.
         self.say("\n");
+        let line = Ok(line);
         if !matches!(line, Ok(Line::Text(_))) {
             self.flush_input();
         }
@@ -497,7 +554,7 @@ mod tests {
         std::mem::forget(r);
         let e =
             read_password_fd_within(fd, wake.as_raw_fd(), Duration::from_millis(100)).unwrap_err();
-        assert!(e.timed_out, "{e:?}");
+        assert!(e.no_password, "{e:?}");
         assert!(e.message.contains("No password arrived"), "{e:?}");
     }
 
@@ -568,7 +625,8 @@ mod tests {
         drop(w);
         let fd = r.as_raw_fd();
         std::mem::forget(r);
-        let e = read_password_fd(fd, wake.as_raw_fd()).unwrap_err().message;
-        assert!(e.contains("No password"), "{e}");
+        let e = read_password_fd(fd, wake.as_raw_fd()).unwrap_err();
+        assert!(e.message.contains("No password"), "{e:?}");
+        assert!(e.no_password, "an empty descriptor is exit 3: {e:?}");
     }
 }

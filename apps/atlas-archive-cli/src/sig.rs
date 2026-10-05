@@ -27,11 +27,37 @@ impl Drop for Busy {
     }
 }
 
+/// The signal thread's name: the panic hook knows it by this.
+pub const THREAD: &str = "signals";
+
+/// What the signal thread does with a signal it took.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// Cancel the running job and keep waiting.
+    Cancel,
+    /// A second signal, or none to cancel: leave at once.
+    Leave,
+}
+
+/// `flag` says a signal came before (it is set by this call); `busy` counts
+/// the guards of running jobs.
+fn decide(flag: &AtomicBool, busy: &AtomicUsize) -> Action {
+    if flag.swap(true, Ordering::SeqCst) || busy.load(Ordering::SeqCst) == 0 {
+        Action::Leave
+    } else {
+        Action::Cancel
+    }
+}
+
 /// Ends the program with the cancelled code. Only async-signal-safe calls
 /// besides the terminal restore, and no locks on stderr.
 fn exit_now() -> ! {
+    leave(b"\natlas-archive-cli: Cancelled.\n")
+}
+
+/// Ends the program with the cancelled code and `msg` on stderr.
+pub fn leave(msg: &[u8]) -> ! {
     crate::term::restore_terminal();
-    let msg = b"\natlas-archive-cli: Cancelled.\n";
     // SAFETY: writes from a live buffer; the result can't be used anyway.
     unsafe {
         libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
@@ -92,21 +118,20 @@ pub fn watch(cancel: Cancel) -> io::Result<Signals> {
     );
     let waited = set(&[libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP]);
     std::thread::Builder::new()
-        .name("signals".into())
+        .name(THREAD.into())
         .spawn(move || {
             loop {
                 let mut got: libc::c_int = 0;
                 // SAFETY: `waited` is an initialised set and `got` a live int.
                 let rc = unsafe { libc::sigwait(&waited, &mut got) };
                 if rc != 0 {
-                    // EINTR can't happen here; anything else means nothing
-                    // can be waited for, so stop rather than spin.
+                    // EINTR can't happen here. Anything else means nothing
+                    // can be waited for, and with the signals blocked the
+                    // program could never be cancelled: end it, in words.
                     log::error!("sigwait failed: {}", io::Error::from_raw_os_error(rc));
-                    return;
+                    leave(b"\natlas-archive-cli: Signals can't be waited for, so the program stops.\n");
                 }
-                if flag.swap(true, Ordering::SeqCst) || busy_for_thread.load(Ordering::SeqCst) == 0
-                {
-                    // A second signal, or nothing to cancel: leave now.
+                if decide(&flag, &busy_for_thread) == Action::Leave {
                     exit_now();
                 }
                 log::info!("signal {got}: cancelling");
@@ -138,5 +163,35 @@ impl Signals {
 
     pub fn interrupted(&self) -> bool {
         self.interrupted.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_signal_cancels_a_running_job_and_the_second_leaves() {
+        let (flag, busy) = (AtomicBool::new(false), AtomicUsize::new(1));
+        assert_eq!(decide(&flag, &busy), Action::Cancel);
+        assert!(flag.load(Ordering::SeqCst));
+        assert_eq!(decide(&flag, &busy), Action::Leave);
+        assert_eq!(decide(&flag, &busy), Action::Leave);
+    }
+
+    #[test]
+    fn a_signal_with_no_job_running_leaves_at_once() {
+        let (flag, busy) = (AtomicBool::new(false), AtomicUsize::new(0));
+        assert_eq!(decide(&flag, &busy), Action::Leave);
+    }
+
+    #[test]
+    fn the_guard_counts_nested_jobs() {
+        let busy = Arc::new(AtomicUsize::new(0));
+        busy.fetch_add(2, Ordering::SeqCst);
+        drop(Busy(Arc::clone(&busy)));
+        assert_eq!(busy.load(Ordering::SeqCst), 1);
+        let flag = AtomicBool::new(false);
+        assert_eq!(decide(&flag, &busy), Action::Cancel);
     }
 }

@@ -14,7 +14,9 @@ mod show;
 mod sig;
 mod term;
 
+use std::fmt::Display;
 use std::io::{self, BufWriter, Write};
+use std::time::Instant;
 
 use zeroize::Zeroizing;
 
@@ -94,20 +96,43 @@ fn harden() -> Result<(), io::Error> {
     Ok(())
 }
 
+/// Says `msg` on stderr, best effort: a failed write there (a closed pipe,
+/// a full disk, a hung-up terminal) must never change the exit code, and
+/// `eprintln!` would panic on one.
+fn say(msg: impl Display) {
+    // One write, so lines from two threads never interleave.
+    let _ = io::stderr().write_all(format!("atlas-archive-cli: {msg}\n").as_bytes());
+}
+
 /// A panic says one fixed sentence: the payload may hold archive text. With
-/// `-v` its file and line are logged. The terminal is put back and the program ends with exit 1.
+/// `-v` its file and line are logged. The terminal is put back and the
+/// program ends, with exit 1 when the main thread panicked and 130 when the
+/// signal thread did (without it nothing could cancel the run). A panic in
+/// any other thread (the detached stale-staging sweep, the client's helpers)
+/// ends only that thread: it is logged and the run goes on.
 fn quiet_panics() {
     std::panic::set_hook(Box::new(|info| {
-        term::restore_terminal();
         // Only the place, for a `-v` log: the payload may hold archive text.
         if let Some(at) = info.location() {
             ::log::error!("panic at {}:{}", at.file(), at.line());
         }
-        let msg = b"atlas-archive-cli: Something went wrong inside the program.\n";
+        let thread = std::thread::current();
+        let (code, msg): (i32, &[u8]) = match thread.name() {
+            Some("main") => (
+                error::EXIT_FAILED,
+                b"atlas-archive-cli: Something went wrong inside the program.\n",
+            ),
+            Some(sig::THREAD) => (
+                error::EXIT_CANCELLED,
+                b"atlas-archive-cli: Something went wrong inside the program.\n",
+            ),
+            _ => return,
+        };
+        term::restore_terminal();
         // SAFETY: writes from a live buffer, then ends the process.
         unsafe {
             libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
-            libc::_exit(error::EXIT_FAILED)
+            libc::_exit(code)
         }
     }));
 }
@@ -115,20 +140,20 @@ fn quiet_panics() {
 fn run() -> i32 {
     quiet_panics();
     if let Err(e) = harden() {
-        eprintln!("atlas-archive-cli: The program couldn't be locked down ({e}).");
+        say(format_args!("The program couldn't be locked down ({e})."));
         return error::EXIT_FAILED;
     }
     // Before anything starts a thread: Ctrl-C and SIGTERM are blocked here,
     // and so in every thread made later.
     if let Err(e) = sig::block() {
-        eprintln!("atlas-archive-cli: Signals couldn't be set up ({e}).");
+        say(format_args!("Signals couldn't be set up ({e})."));
         return error::EXIT_FAILED;
     }
     let parsed = match args::parse(std::env::args_os().skip(1)) {
         Ok(p) => p,
         Err(args::Usage(m)) => {
-            eprintln!("atlas-archive-cli: {m}");
-            eprintln!("Try 'atlas-archive-cli --help'.");
+            say(&m);
+            let _ = writeln!(io::stderr(), "Try 'atlas-archive-cli --help'.");
             return error::EXIT_USAGE;
         }
     };
@@ -143,7 +168,7 @@ fn run() -> i32 {
             .map_err(Into::into),
         ),
         Command::Create => {
-            eprintln!("atlas-archive-cli: create isn't available yet");
+            say("create isn't available yet");
             error::EXIT_USAGE
         }
         command => {
@@ -152,11 +177,13 @@ fn run() -> i32 {
             let sigs = match sig::watch(cancel.clone()) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("atlas-archive-cli: Signals couldn't be set up ({e}).");
+                    say(format_args!("Signals couldn't be set up ({e})."));
                     return error::EXIT_FAILED;
                 }
             };
+            let started = Instant::now();
             ::log::debug!("atlas-archive-cli {} started", env!("CARGO_PKG_VERSION"));
+            log_command(&command);
             // Only extraction leaves a staging folder behind; the sweep
             // runs with the signal thread already watching.
             if matches!(command, Command::Extract(_)) {
@@ -166,8 +193,50 @@ fn run() -> i32 {
             let job = Job::with_worker(parsed.worker.as_deref(), cancel, &sigs);
             #[cfg(not(feature = "dev-worker"))]
             let job = Job::new(cancel, &sigs);
-            finish(run_command(command, &job, &sigs))
+            // Held until the exit code is known: once the files are in place a
+            // signal must not turn a finished extraction into "Cancelled"
+            // (exit 130). The first one is noted and ignored; a second still
+            // leaves.
+            let _done = matches!(command, Command::Extract(_)).then(|| sigs.busy());
+            let code = finish(run_command(command, &job, &sigs));
+            ::log::debug!(
+                "finished in {:.2?} with exit code {code}",
+                started.elapsed()
+            );
+            code
         }
+    }
+}
+
+/// The command and its options for a `-v` log. Paths go through `term::safe`;
+/// a password is never an option, only the descriptor's number is.
+fn log_command(command: &Command) {
+    let common = |name: &str, c: &Common| {
+        ::log::debug!(
+            "command: {name} {} (json {}, encoding {}, password descriptor {:?})",
+            term::safe_os(&c.archive),
+            c.json,
+            c.encoding.map_or("detect", |e| e.label()),
+            c.password_fd
+        );
+    };
+    match command {
+        Command::List(c) => common("list", c),
+        Command::Info(c) => common("info", c),
+        Command::Test(c) => common("test", c),
+        Command::Extract(a) => {
+            common("extract", &a.common);
+            ::log::debug!(
+                "extract options: to {:?}, here {}, name {:?}, {} entries, allow-large {}, on-clash {:?}",
+                a.to.as_deref().map(term::safe_os),
+                a.here,
+                a.name.as_deref().map(term::safe),
+                a.entries.len(),
+                a.allow_large,
+                a.on_clash
+            );
+        }
+        Command::Help | Command::Version | Command::Create => {}
     }
 }
 
@@ -177,7 +246,7 @@ fn finish(result: Result<(), CliError>) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             if let Some(m) = e.message() {
-                eprintln!("atlas-archive-cli: {m}");
+                say(m);
             }
             e.code()
         }
@@ -194,8 +263,21 @@ fn password(c: &Common, sigs: &Signals) -> Result<Option<Zeroizing<Vec<u8>>>, Cl
     match term::read_password_fd(fd, sigs.wake_fd()) {
         Ok(Some(p)) => Ok(Some(p)),
         Ok(None) => Err(CliError::Cancelled),
-        Err(e) if e.timed_out => Err(CliError::NeedsPassword(e.message)),
+        Err(e) if e.no_password => Err(CliError::NeedsPassword(e.message)),
         Err(e) => Err(CliError::Usage(e.message)),
+    }
+}
+
+/// A listing that broke part way was printed as far as it went: the reason
+/// goes to stderr and the exit code says it failed.
+fn broken(out: &mut impl Write, l: &job::Loaded) -> Result<(), CliError> {
+    match &l.broken {
+        None => Ok(()),
+        Some(why) => {
+            // What was printed is best effort; the reason is the result.
+            let _ = out.flush();
+            Err(CliError::Failed(why.clone()))
+        }
     }
 }
 
@@ -210,6 +292,7 @@ fn run_command(command: Command, job: &Job<'_>, sigs: &Signals) -> Result<(), Cl
             } else {
                 show::list_text(&mut out, &l)?;
             }
+            broken(&mut out, &l)?;
         }
         Command::Info(c) => {
             let l = job.list(&c, password(&c, sigs)?, false)?;
@@ -218,6 +301,7 @@ fn run_command(command: Command, job: &Job<'_>, sigs: &Signals) -> Result<(), Cl
             } else {
                 show::info_text(&mut out, &l)?;
             }
+            broken(&mut out, &l)?;
         }
         Command::Test(c) => {
             let t = job.test(&c, password(&c, sigs)?)?;
@@ -236,11 +320,24 @@ fn run_command(command: Command, job: &Job<'_>, sigs: &Signals) -> Result<(), Cl
         }
         Command::Extract(a) => {
             let x = job.extract(&a, password(&a.common, sigs)?)?;
-            if a.common.json {
-                show::extract_json(&mut out, &x)?;
+            let wrote = if a.common.json {
+                show::extract_json(&mut out, &x)
             } else {
-                show::extract_text(&mut out, &mut io::stderr().lock(), &x)?;
+                show::extract_text(&mut out, &mut io::stderr().lock(), &x)
             }
+            .and_then(|()| out.flush());
+            return match wrote {
+                Err(e) if x.left_out => Err(e.into()),
+                // The files are in place: the output is lost, the job isn't.
+                Err(e) => {
+                    say(format_args!(
+                        "The result couldn't be written ({e}), but the files were extracted to {}.",
+                        term::safe_os(x.path.as_os_str())
+                    ));
+                    Ok(())
+                }
+                Ok(()) => Ok(()),
+            };
         }
         Command::Help | Command::Version | Command::Create => {}
     }

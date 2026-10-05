@@ -242,6 +242,7 @@ pub fn list_json(out: &mut impl Write, l: &Loaded) -> io::Result<()> {
         .num("size", total_size(l))
         .num("refused", refused_count(l))
         .bool("overflow", l.tree.overflow)
+        .opt_str("broken", l.broken.as_deref())
         .finish();
     writeln!(out, "{}", Obj::new().raw("summary", &summary).finish())
 }
@@ -294,20 +295,23 @@ pub fn info_json(out: &mut impl Write, l: &Loaded) -> io::Result<()> {
         .bool("solid", f.solid)
         .num("volumes", u64::from(f.volumes))
         .str("encoding", l.tree.encoding.label())
-        .opt_str("comment", comment.as_deref());
+        .opt_str("comment", comment.as_deref())
+        .opt_str("broken", l.broken.as_deref());
     writeln!(out, "{}", o.finish())
 }
 
+/// The notes go to stderr on a best effort: a failed write there (a closed
+/// pipe, a full disk) never costs the result or the exit code.
 pub fn test_text(out: &mut impl Write, err: &mut impl Write, t: &Tested) -> io::Result<()> {
     for (i, reason) in &t.skipped {
-        writeln!(err, "atlas-archive-cli: Left out item {i}: {reason}")?;
+        let _ = writeln!(err, "atlas-archive-cli: Left out item {i}: {reason}");
     }
     if t.skipped_more > 0 {
-        writeln!(
+        let _ = writeln!(
             err,
             "atlas-archive-cli: {} more were left out.",
             count(t.skipped_more, "item", "items")
-        )?;
+        );
     }
     if t.ok() {
         writeln!(out, "No errors found.")?;
@@ -327,29 +331,37 @@ pub fn test_json(out: &mut impl Write, t: &Tested) -> io::Result<()> {
     writeln!(out, "{}", Obj::new().raw("summary", &summary).finish())
 }
 
+/// The notes go to stderr first and on a best effort, then the result line to
+/// stdout, so a failed stderr never hides where the files went.
 pub fn extract_text(out: &mut impl Write, err: &mut impl Write, x: &Extraction) -> io::Result<()> {
     for (name, reason) in &x.skipped {
-        writeln!(err, "atlas-archive-cli: Skipped {name}: {reason}")?;
+        let _ = writeln!(err, "atlas-archive-cli: Skipped {name}: {reason}");
     }
     if x.skipped_more > 0 {
-        writeln!(
+        let _ = writeln!(
             err,
             "atlas-archive-cli: {} more were skipped.",
             count(x.skipped_more, "item", "items")
-        )?;
+        );
     }
     for (path, reason) in &x.removed {
-        writeln!(err, "atlas-archive-cli: Removed {path}: {reason}")?;
+        let _ = writeln!(err, "atlas-archive-cli: Removed {path}: {reason}");
     }
-    if x.left_out {
-        writeln!(
+    let result = if x.left_out {
+        let _ = writeln!(
             err,
             "atlas-archive-cli: An item with that name is already in {}, and Skip was chosen, so nothing was extracted.",
             term::safe_os(x.path.as_os_str())
-        )
+        );
+        Ok(())
     } else {
         writeln!(out, "Extracted to {}", term::safe_os(x.path.as_os_str()))
+    };
+    // After the result line, so the line always comes first.
+    if let Some(w) = &x.unconfirmed {
+        let _ = writeln!(err, "atlas-archive-cli: Warning: {w}");
     }
+    result
 }
 
 fn path_fields(o: Obj, path: &Path) -> Obj {
@@ -375,6 +387,7 @@ pub fn extract_json(out: &mut impl Write, x: &Extraction) -> io::Result<()> {
         .bool("left_out", x.left_out)
         .num("skipped", x.skipped.len() as u64 + x.skipped_more)
         .num("removed", x.removed.len() as u64)
+        .opt_str("unconfirmed", x.unconfirmed.as_deref())
         .finish();
     writeln!(out, "{}", Obj::new().raw("summary", &summary).finish())
 }
@@ -382,6 +395,41 @@ pub fn extract_json(out: &mut impl Write, x: &Extraction) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extraction(unconfirmed: Option<&str>) -> Extraction {
+        Extraction {
+            path: std::path::PathBuf::from("/d/x"),
+            left_out: false,
+            removed: Vec::new(),
+            skipped: Vec::new(),
+            skipped_more: 0,
+            unconfirmed: unconfirmed.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_move_is_a_warning_after_the_result() {
+        let x = extraction(Some("look in the hidden folder"));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        extract_text(&mut out, &mut err, &x).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Extracted to /d/x\n");
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("Warning: look in the hidden folder"), "{err}");
+        let mut json = Vec::new();
+        extract_json(&mut json, &x).unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert!(
+            json.contains("\"unconfirmed\":\"look in the hidden folder\""),
+            "{json}"
+        );
+        let mut json = Vec::new();
+        extract_json(&mut json, &extraction(None)).unwrap();
+        assert!(
+            String::from_utf8(json)
+                .unwrap()
+                .contains("\"unconfirmed\":null")
+        );
+    }
 
     #[test]
     fn times_are_utc_civil_dates() {

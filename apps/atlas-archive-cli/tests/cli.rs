@@ -87,9 +87,14 @@ impl Scratch {
     /// The command with the real worker and every per-user place inside the
     /// scratch folder; no terminal, no display.
     fn base(&self, args: Vec<std::ffi::OsString>) -> Command {
+        self.base_with(&self.worker, args)
+    }
+
+    /// Like `base`, with another executable as the worker.
+    fn base_with(&self, worker: &Path, args: Vec<std::ffi::OsString>) -> Command {
         let mut cmd = Command::new(CLI);
         cmd.arg("--worker")
-            .arg(&self.worker)
+            .arg(worker)
             .args(args)
             .env("HOME", self.path("home"))
             .env("XDG_STATE_HOME", self.path("state"))
@@ -345,6 +350,21 @@ fn sample(s: &Scratch, name: &str) -> PathBuf {
     s.write(name, &bytes)
 }
 
+/// Parses every stdout line of a `--json` run: each must be one JSON object.
+fn json_lines(r: &Run) -> Vec<serde_json::Value> {
+    let t = r.text();
+    assert!(!t.is_empty(), "no output; stderr: {}", r.err);
+    t.lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let v: serde_json::Value = serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("line {i} isn't JSON ({e}): {l:?}"));
+            assert!(v.is_object(), "line {i} isn't an object: {l:?}");
+            v
+        })
+        .collect()
+}
+
 fn read(p: impl AsRef<Path>) -> String {
     std::fs::read_to_string(p.as_ref()).unwrap_or_else(|e| panic!("{}: {e}", p.as_ref().display()))
 }
@@ -429,6 +449,22 @@ fn list_json_is_one_object_per_line_with_a_summary() {
     let last = lines.last().unwrap();
     assert!(last.starts_with("{\"summary\":{"), "{last}");
     assert!(last.contains("\"format\":\"zip\""), "{last}");
+    // Every line really parses, and says what the text checks above say.
+    let v = json_lines(&r);
+    assert_eq!(v.len(), lines.len());
+    let (summary, entries) = v.split_last().unwrap();
+    assert_eq!(summary["summary"]["format"], "zip");
+    assert!(entries.iter().all(|e| e.get("summary").is_none()));
+    let a_txt = entries.iter().find(|e| e["path"] == "docs/a.txt").unwrap();
+    assert_eq!(a_txt["size"], 6);
+    assert_eq!(a_txt["kind"], "file");
+    let cafe = entries.iter().find(|e| e.get("raw_hex").is_some()).unwrap();
+    assert_eq!(cafe["path"], "café.txt");
+    let esc = entries
+        .iter()
+        .find(|e| e["display"] == "x\\x1B[31m.txt")
+        .unwrap();
+    assert_eq!(esc["path"], "x\u{1b}[31m.txt");
 }
 
 #[test]
@@ -440,6 +476,11 @@ fn list_of_an_encrypted_zip_names_it_encrypted() {
     let t = r.text();
     assert!(t.contains("\"path\":\"f.txt\""), "{t}");
     assert!(t.contains("\"encrypted\":true"), "{t}");
+    let v = json_lines(&r);
+    assert!(
+        v.iter()
+            .any(|e| e["path"] == "f.txt" && e["encrypted"] == true)
+    );
 }
 
 // ---- info ----
@@ -472,6 +513,11 @@ fn info_describes_the_archive() {
     ] {
         assert!(t.contains(want), "{t}");
     }
+    let v = json_lines(&r);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0]["format"], "zip");
+    assert_eq!(v[0]["entries"], 8);
+    assert_eq!(v[0]["comment"], serde_json::Value::Null);
     let aes = s.fixture("aes256-secret.zip");
     let r = s.run(&["info", aes.to_str().unwrap()], None);
     r.assert_ok();
@@ -494,6 +540,8 @@ fn test_passes_a_good_archive() {
         "{}",
         r.text()
     );
+    let v = json_lines(&r);
+    assert_eq!(v.last().unwrap()["summary"]["ok"], true);
 }
 
 #[test]
@@ -514,6 +562,9 @@ fn test_fails_a_corrupt_archive() {
     assert_eq!(r.code, 1);
     assert!(r.text().contains("{\"skipped\":{"), "{}", r.text());
     assert!(r.text().contains("\"ok\":false"), "{}", r.text());
+    let v = json_lines(&r);
+    assert!(v.iter().any(|e| e.get("skipped").is_some()));
+    assert_eq!(v.last().unwrap()["summary"]["ok"], false);
 }
 
 #[test]
@@ -549,7 +600,12 @@ fn a_password_is_never_logged() {
         Some("secret"),
     );
     r.assert_ok();
-    assert!(!r.err.contains("secret"), "{}", r.err);
+    // (The archive's own name has "secret" in it.)
+    assert!(
+        !r.err.replace("zipcrypto-secret.zip", "").contains("secret"),
+        "{}",
+        r.err
+    );
     assert!(!r.text().contains("secret"));
     let r = s.run(
         &["-v", "test", "--password-fd", "3", a.to_str().unwrap()],
@@ -777,6 +833,11 @@ fn extract_json_reports_where_it_went() {
     assert!(last.contains(&want), "{last}\nwanted {want}");
     assert!(last.contains("\"left_out\":false"), "{last}");
     assert!(t.contains("{\"skipped\":{"), "{t}");
+    let v = json_lines(&r);
+    let summary = &v.last().unwrap()["summary"];
+    assert_eq!(summary["path"], dest.join("sample").to_str().unwrap());
+    assert_eq!(summary["left_out"], false);
+    assert!(v.iter().any(|e| e.get("skipped").is_some()));
 }
 
 #[test]
@@ -1096,7 +1157,7 @@ fn no_core_dump_and_no_attaching_while_it_runs() {
     let mut child = cmd.spawn().unwrap();
     let proc = format!("/proc/{}", child.id());
     let mut ok = false;
-    for _ in 0..100 {
+    for _ in 0..600 {
         let limits = std::fs::read_to_string(format!("{proc}/limits")).unwrap_or_default();
         let core = limits.lines().find(|l| l.starts_with("Max core file size"));
         // A process that isn't dumpable owns its /proc files as root.
@@ -1133,6 +1194,10 @@ impl Pty {
             )
         };
         assert_eq!(rc, 0, "openpty failed");
+        // The master stays ours: a child holding it would keep the terminal
+        // from hanging up when this closes it.
+        // SAFETY: fcntl on a descriptor we own.
+        unsafe { libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC) };
         // SAFETY: new descriptors we own.
         unsafe {
             Pty {
@@ -1152,10 +1217,21 @@ impl Pty {
         t.c_lflag & libc::ECHO != 0
     }
 
-    /// Reads from the master until `needle` shows or five seconds pass.
+    /// Reads from the master until `needle` shows or 30 seconds pass (it
+    /// returns as soon as the needle is there).
     fn wait_for(&self, needle: &str) -> String {
+        self.read_for(needle, 600)
+    }
+
+    /// What shows on the master in `ms` milliseconds, to check that something
+    /// does not appear.
+    fn quiet_for(&self, ms: u64, needle: &str) -> String {
+        self.read_for(needle, ms.div_ceil(50) as usize)
+    }
+
+    fn read_for(&self, needle: &str, polls: usize) -> String {
         let mut seen = Vec::new();
-        for _ in 0..100 {
+        for _ in 0..polls {
             let mut fds = libc::pollfd {
                 fd: self.master.as_raw_fd(),
                 events: libc::POLLIN,
@@ -1209,8 +1285,10 @@ fn at_the_prompt(s: &Scratch, pty: &Pty) -> std::process::Child {
     child
 }
 
+/// The exit code, waiting up to 30 seconds (it returns as soon as the process
+/// is gone); `None` if it had to be killed.
 fn wait_code(child: &mut std::process::Child) -> Option<i32> {
-    for _ in 0..100 {
+    for _ in 0..600 {
         if let Some(st) = child.try_wait().unwrap() {
             return st.code();
         }
@@ -1239,6 +1317,29 @@ fn ctrl_c_and_a_hangup_at_the_prompt_cancel_and_restore_echo() {
     pty.type_byte(0x03);
     assert_eq!(wait_code(&mut child), Some(130));
     assert!(pty.echo(), "echo was left off");
+}
+
+#[test]
+fn a_real_sighup_at_the_prompt_cancels_and_restores_echo() {
+    let s = scratch!("sighup");
+    let pty = Pty::new();
+    let mut child = at_the_prompt(&s, &pty);
+    kill(&child, libc::SIGHUP);
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(pty.echo(), "echo was left off");
+}
+
+#[test]
+fn the_terminal_hanging_up_at_the_prompt_exits_130() {
+    let s = scratch!("hangup");
+    let pty = Pty::new();
+    let mut child = at_the_prompt(&s, &pty);
+    // Closing the master hangs the terminal up: SIGHUP to the session, and
+    // the read fails.
+    let Pty { master, slave } = pty;
+    drop(master);
+    assert_eq!(wait_code(&mut child), Some(130));
+    drop(slave);
 }
 
 #[test]
@@ -1315,51 +1416,515 @@ fn password_fd_0_with_piped_stdin_never_turns_interactive() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{err}");
     assert!(err.contains("didn't work"), "{err}");
-    let seen = pty.wait_for("Password");
+    let seen = pty.quiet_for(500, "Password");
     assert!(!seen.contains("Password"), "a prompt appeared: {seen:?}");
 }
 
-#[test]
-fn a_second_signal_while_a_job_is_stuck_exits_130_promptly() {
-    let s = scratch!("stuck");
-    // A "worker" that ignores TERM and never answers: the job is stuck.
-    let fake = s.write(
-        "stuck-worker.sh",
-        b"#!/bin/sh\ntrap '' TERM INT HUP\nsleep 60\n",
-    );
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+/// A shell script as the worker. The client starts it with no arguments and
+/// an empty environment; descriptor 4 is open only for an extraction.
+fn fake_worker(s: &Scratch, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = s.write(name, format!("#!/bin/sh\n{body}\n").as_bytes());
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+    p
+}
+
+/// Waits (30 s at most; it returns as soon as the file is there) for `p`.
+fn wait_for_file(p: &Path) {
+    for _ in 0..1500 {
+        if p.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    panic!("{} never appeared", p.display());
+}
+
+fn kill(child: &std::process::Child, sig: libc::c_int) {
+    // SAFETY: signals our own, still unreaped, child.
+    unsafe { libc::kill(child.id() as i32, sig) };
+}
+
+/// Starts `list` against a worker that ignores every signal and never
+/// answers, once it is running (it touches a marker; by then the CLI has long
+/// blocked its signals).
+fn start_stuck(s: &Scratch) -> std::process::Child {
+    let marker = s.path("started");
+    let fake = fake_worker(
+        s,
+        "stuck-worker.sh",
+        &format!(
+            "trap '' TERM INT HUP QUIT\n: > '{}'\nexec sleep 60",
+            marker.display()
+        ),
+    );
+    let a = sample(s, "sample.zip");
+    let mut cmd = s.base_with(&fake, vec!["list".into(), a.into_os_string()]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = cmd.spawn().unwrap();
+    wait_for_file(&marker);
+    child
+}
+
+#[test]
+fn a_signal_cancels_a_job_whose_worker_ignores_it() {
+    // The first signal cancels, and the client kills the worker for good:
+    // the job ends at once although the worker would sleep a minute.
+    let s = scratch!("stuck");
+    let mut child = start_stuck(&s);
+    kill(&child, libc::SIGTERM);
+    let t = std::time::Instant::now();
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn two_different_signals_in_a_row_exit_130_promptly() {
+    // Both are pending together, so the signal thread takes the second one
+    // with the first already counted: the leave-at-once path. (That the
+    // decision is right is unit-tested in sig.rs; the exit code alone can't
+    // tell this path from a first signal's, so this checks it ends cleanly.)
+    let s = scratch!("twosig");
+    let mut child = start_stuck(&s);
+    kill(&child, libc::SIGTERM);
+    kill(&child, libc::SIGHUP);
+    let t = std::time::Instant::now();
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn ctrl_c_mid_extract_with_a_running_worker_leaves_nothing() {
+    let s = scratch!("midextract");
+    let marker = s.path("extracting");
+    // Lists with the real worker; an extraction (descriptor 4 is open) hangs.
+    let fake = fake_worker(
+        &s,
+        "slow-worker.sh",
+        &format!(
+            "if [ -e /proc/self/fd/4 ]; then : > '{}'; exec sleep 60; fi\nexec '{}'",
+            marker.display(),
+            s.worker.display()
+        ),
+    );
     let a = sample(&s, "sample.zip");
-    let mut cmd = Command::new(CLI);
-    cmd.arg("--worker")
-        .arg(&fake)
-        .args(["list"])
-        .arg(&a)
-        .env("HOME", s.path("home"))
-        .env("XDG_STATE_HOME", s.path("state"))
-        .env("XDG_DATA_HOME", s.path("data"))
-        .env("XDG_CACHE_HOME", s.path("cache"))
-        .env("XDG_CONFIG_HOME", s.path("config"))
-        .stdin(Stdio::null())
+    let dest = s.dest();
+    let mut cmd = s.base_with(
+        &fake,
+        vec![
+            "extract".into(),
+            "--to".into(),
+            dest.clone().into_os_string(),
+            a.into_os_string(),
+        ],
+    );
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = cmd.spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    let pid = child.id() as i32;
-    let kill = |sig| {
-        // SAFETY: signals our own child.
-        unsafe { libc::kill(pid, sig) }
-    };
-    kill(libc::SIGTERM);
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    if child.try_wait().unwrap().is_none() {
-        kill(libc::SIGTERM);
-    }
-    let t = std::time::Instant::now();
+    wait_for_file(&marker);
+    // The staging folder is there while the worker runs.
+    assert_eq!(s.ls(&dest).len(), 1, "{:?}", s.ls(&dest));
+    kill(&child, libc::SIGINT);
     assert_eq!(wait_code(&mut child), Some(130));
-    assert!(t.elapsed() < std::time::Duration::from_secs(3));
+    assert!(s.ls(&dest).is_empty(), "left behind: {:?}", s.ls(&dest));
+}
+
+#[test]
+fn a_signal_after_the_files_are_in_place_doesnt_turn_it_into_a_cancel() {
+    let s = scratch!("lateint");
+    let a = sample(&s, "sample.zip");
+    let dest = s.dest();
+    // A stdout pipe that is full: the result line has to wait for a reader.
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 fills two descriptors.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both are new descriptors we own.
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: fcntl on descriptors we own; the writes are from a live buffer.
+    unsafe {
+        let fl = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        let junk = [b'.'; 4096];
+        while libc::write(w.as_raw_fd(), junk.as_ptr().cast(), junk.len()) > 0 {}
+        libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl);
+        let fl = libc::fcntl(r.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(r.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    let mut cmd = s.base(vec![
+        "extract".into(),
+        "--to".into(),
+        dest.clone().into_os_string(),
+        a.into_os_string(),
+    ]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(w))
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    wait_for_file(&dest.join("sample"));
+    kill(&child, libc::SIGTERM);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let early = child.try_wait().unwrap();
+    assert!(
+        early.is_none(),
+        "the signal ended a finished job: {early:?}"
+    );
+    // A reader comes: the line is written and the run is a success.
+    let mut buf = [0u8; 4096];
+    // SAFETY: reads into a live buffer.
+    while unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    assert_eq!(wait_code(&mut child), Some(0));
+    assert_eq!(read(dest.join("sample/top.txt")), "top\n");
+}
+
+// ---- standard streams that fail ----
+
+/// A pipe whose reader is gone: every write to the other end is EPIPE.
+fn closed_pipe() -> OwnedFd {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 fills two descriptors.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: new descriptors we own; the reader is closed right away.
+    unsafe {
+        drop(OwnedFd::from_raw_fd(fds[0]));
+        OwnedFd::from_raw_fd(fds[1])
+    }
+}
+
+fn dev_full() -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap()
+}
+
+/// Runs with no terminal and the given streams (stdin is /dev/null): the
+/// exit code, and what reached the streams that were pipes.
+fn run_streams(
+    s: &Scratch,
+    args: &[&str],
+    stdout: Stdio,
+    stderr: Stdio,
+) -> (Option<i32>, String, String) {
+    let mut cmd = s.base(args.iter().map(|a| a.to_string().into()).collect());
+    cmd.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
+    // SAFETY: setsid only, in the child: no terminal to prompt on.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let out = cmd.spawn().unwrap().wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn list_into_a_closed_pipe_exits_1_without_a_word() {
+    let s = scratch!("epipe");
+    let a = sample(&s, "sample.zip");
+    let (code, _, err) = run_streams(
+        &s,
+        &["list", a.to_str().unwrap()],
+        Stdio::from(closed_pipe()),
+        Stdio::piped(),
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.is_empty(), "{err}");
+}
+
+#[test]
+fn list_into_a_full_disk_exits_1_in_words_and_never_panics() {
+    let s = scratch!("devfull");
+    let a = sample(&s, "sample.zip");
+    for json in [false, true] {
+        let mut args = vec!["list"];
+        if json {
+            args.push("--json");
+        }
+        args.push(a.to_str().unwrap());
+        let (code, _, err) = run_streams(&s, &args, Stdio::from(dev_full()), Stdio::piped());
+        assert_eq!(code, Some(1), "{err}");
+        assert!(err.contains("couldn't be written"), "{err}");
+        assert!(!err.contains("Something went wrong"), "{err}");
+        assert!(!err.contains("panicked"), "{err}");
+    }
+}
+
+#[test]
+fn a_closed_or_full_stderr_never_changes_the_exit_code() {
+    let s = scratch!("badstderr");
+    let aes = s.fixture("aes256-secret.zip");
+    let aes = aes.to_str().unwrap();
+    // Needs a password: exit 3, the sentence nowhere to go.
+    let (code, ..) = run_streams(
+        &s,
+        &["test", aes],
+        Stdio::null(),
+        Stdio::from(closed_pipe()),
+    );
+    assert_eq!(code, Some(3));
+    let (code, ..) = run_streams(&s, &["test", aes], Stdio::null(), Stdio::from(dev_full()));
+    assert_eq!(code, Some(3));
+    // Bad usage: exit 2. A missing archive: exit 1. A limit: exit 4.
+    let (code, ..) = run_streams(&s, &["bogus"], Stdio::null(), Stdio::from(dev_full()));
+    assert_eq!(code, Some(2));
+    let (code, ..) = run_streams(
+        &s,
+        &["list", "/nonexistent/x.zip"],
+        Stdio::null(),
+        Stdio::from(closed_pipe()),
+    );
+    assert_eq!(code, Some(1));
+    if let Some(b) = bomb(&s) {
+        let dest = s.dest();
+        let (code, ..) = run_streams(
+            &s,
+            &[
+                "extract",
+                "--to",
+                dest.to_str().unwrap(),
+                b.to_str().unwrap(),
+            ],
+            Stdio::null(),
+            Stdio::from(dev_full()),
+        );
+        assert_eq!(code, Some(4));
+    }
+}
+
+#[test]
+fn a_finished_extraction_is_a_success_whatever_its_output_does() {
+    let s = scratch!("lostoutput");
+    let a = sample(&s, "sample.zip");
+    let dest = s.dest();
+    let args = [
+        "extract",
+        "--to",
+        dest.to_str().unwrap(),
+        a.to_str().unwrap(),
+    ];
+    // stderr can't take the notes: the result line is still printed.
+    let (code, out, _) = run_streams(&s, &args, Stdio::piped(), Stdio::from(closed_pipe()));
+    assert_eq!(code, Some(0));
+    assert!(out.contains("Extracted to"), "{out}");
+    assert_eq!(read(dest.join("sample/top.txt")), "top\n");
+    // stdout can't take the line: the files are in place, so exit 0 and a
+    // warning that says where they went.
+    let (code, _, err) = run_streams(&s, &args, Stdio::from(dev_full()), Stdio::piped());
+    assert_eq!(code, Some(0), "{err}");
+    assert!(err.contains("the files were extracted to"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+    let (code, _, err) = run_streams(&s, &args, Stdio::from(closed_pipe()), Stdio::piped());
+    assert_eq!(code, Some(0), "{err}");
+}
+
+// ---- passwords on a descriptor ----
+
+/// Gives the child `fd` as descriptor 3.
+fn pass_as_3(cmd: &mut Command, fd: &OwnedFd) {
+    let raw = fd.as_raw_fd();
+    // SAFETY: only dup2 and fcntl in the child.
+    unsafe {
+        cmd.pre_exec(move || {
+            if raw == 3 {
+                libc::fcntl(3, libc::F_SETFD, 0);
+            } else if libc::dup2(raw, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn an_empty_password_descriptor_is_exit_3_not_a_usage_error() {
+    let s = scratch!("fdeof");
+    let a = s.fixture("aes256-secret.zip");
+    let null = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+    let mut cmd = s.base(vec![
+        "test".into(),
+        "--password-fd".into(),
+        "3".into(),
+        a.into_os_string(),
+    ]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    pass_as_3(&mut cmd, &null);
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(
+        err.contains("No password was sent on descriptor 3."),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_password_descriptor_that_stays_silent_times_out_with_exit_3() {
+    // The 30 s wait is shortened by a knob that exists only with dev-worker.
+    let s = scratch!("fdwait");
+    let a = s.fixture("aes256-secret.zip");
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 fills two descriptors.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: new descriptors we own; the writer stays open and silent.
+    let (r, _w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let mut cmd = s.base(vec![
+        "test".into(),
+        "--password-fd".into(),
+        "3".into(),
+        a.into_os_string(),
+    ]);
+    cmd.env("ATLAS_ARCHIVE_TEST_FD_WAIT_MS", "300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    pass_as_3(&mut cmd, &r);
+    let t = std::time::Instant::now();
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{err}");
+    assert!(err.contains("No password arrived on descriptor 3"), "{err}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(10));
+}
+
+// ---- the -v log ----
+
+#[test]
+fn dash_v_logs_the_phases_and_never_a_password() {
+    let s = scratch!("vlog");
+    let a = s.fixture("aes256-secret.zip");
+    let dest = s.dest();
+    let r = s.run(
+        &[
+            "-v",
+            "extract",
+            "--password-fd",
+            "3",
+            "--to",
+            dest.to_str().unwrap(),
+            a.to_str().unwrap(),
+        ],
+        Some("secret"),
+    );
+    r.assert_ok();
+    for want in [
+        "command: extract",
+        "opening ",
+        "listed: format zip, 1 entries",
+        "password: from a descriptor, asked for 1 time(s)",
+        "extracting into ",
+        "finished in ",
+        "exit code 0",
+    ] {
+        assert!(r.err.contains(want), "no {want:?} in:\n{}", r.err);
+    }
+    assert!(
+        !r.err.replace("aes256-secret", "").contains("secret"),
+        "{}",
+        r.err
+    );
+}
+
+// ---- terminals ----
+
+/// Starts the CLI with the pty as stdin and controlling terminal (so it may
+/// ask questions), its output thrown away: the questions show on the pty.
+fn on_pty(s: &Scratch, pty: &Pty, args: Vec<std::ffi::OsString>) -> std::process::Child {
+    let mut cmd = s.base(args);
+    let slave = pty.slave.as_raw_fd();
+    cmd.stdin(Stdio::from(pty.slave.try_clone().unwrap()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid and ioctl only, in the child.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            if libc::ioctl(slave, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().unwrap()
+}
+
+/// `extract --here` of `only/x.txt` into a folder that already holds `only`.
+fn clash_setup(s: &Scratch) -> Vec<std::ffi::OsString> {
+    let a = s.write("pack.zip", &zip(&[z("only/", ""), z("only/x.txt", "x\n")]));
+    std::fs::create_dir(s.dest().join("only")).unwrap();
+    vec![
+        "extract".into(),
+        "--here".into(),
+        "--to".into(),
+        s.dest().into_os_string(),
+        a.into_os_string(),
+    ]
+}
+
+#[test]
+fn ctrl_c_at_the_clash_prompt_cancels_and_places_nothing() {
+    let s = scratch!("clashint");
+    let pty = Pty::new();
+    let mut child = on_pty(&s, &pty, clash_setup(&s));
+    let seen = pty.wait_for("[k] ");
+    assert!(seen.contains("already here"), "no prompt: {seen:?}");
+    pty.type_byte(0x03);
+    assert_eq!(wait_code(&mut child), Some(130));
+    // No "only (2)", and no staging folder.
+    assert_eq!(s.ls(&s.dest()), ["only"]);
+    assert!(s.ls(&s.dest().join("only")).is_empty());
+}
+
+#[test]
+fn answering_the_clash_prompt_is_honoured() {
+    let s = scratch!("clashans");
+    let args = clash_setup(&s);
+    let pty = Pty::new();
+    let mut child = on_pty(&s, &pty, args.clone());
+    pty.wait_for("[k] ");
+    for b in b"k\n" {
+        pty.type_byte(*b);
+    }
+    assert_eq!(wait_code(&mut child), Some(0));
+    assert_eq!(s.ls(&s.dest()), ["only", "only (2)"]);
+    let mut child = on_pty(&s, &pty, args);
+    pty.wait_for("[k] ");
+    for b in b"s\n" {
+        pty.type_byte(*b);
+    }
+    assert_eq!(wait_code(&mut child), Some(0));
+    assert_eq!(s.ls(&s.dest()), ["only", "only (2)"]);
+}
+
+#[test]
+fn ctrl_c_at_the_limit_prompt_cancels_with_exit_130() {
+    let s = scratch!("limitint");
+    let Some(a) = bomb(&s) else {
+        eprintln!("SKIPPED: gzip isn't available");
+        return;
+    };
+    let pty = Pty::new();
+    let mut child = on_pty(
+        &s,
+        &pty,
+        vec![
+            "extract".into(),
+            "--to".into(),
+            s.dest().into_os_string(),
+            a.into_os_string(),
+        ],
+    );
+    let seen = pty.wait_for("[y/N] ");
+    assert!(seen.contains("[y/N]"), "no prompt: {seen:?}");
+    pty.type_byte(0x03);
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(s.ls(&s.dest()).is_empty(), "{:?}", s.ls(&s.dest()));
 }
 
 #[test]
@@ -1371,4 +1936,66 @@ fn two_quick_signals_at_the_prompt_still_restore_echo() {
     pty.type_byte(0x1c);
     assert_eq!(wait_code(&mut child), Some(130));
     assert!(pty.echo(), "echo was left off");
+}
+
+// ---- a listing that breaks part way ----
+
+/// A tar of `a`, `b` and `c` whose third header is ruined.
+fn broken_tar(s: &Scratch) -> Option<PathBuf> {
+    std::fs::create_dir_all(s.path("src")).unwrap();
+    for n in ["a", "b", "c"] {
+        std::fs::write(s.path("src").join(n), n).unwrap();
+    }
+    let a = s.path("broken.tar");
+    let ok = Command::new("tar")
+        .arg("-cf")
+        .arg(&a)
+        .args(["-C"])
+        .arg(s.path("src"))
+        .args(["a", "b", "c"])
+        .status()
+        .ok()?;
+    if !ok.success() {
+        return None;
+    }
+    let mut bytes = std::fs::read(&a).unwrap();
+    bytes[2048..2148].fill(0xff);
+    std::fs::write(&a, &bytes).unwrap();
+    Some(a)
+}
+
+#[test]
+fn a_broken_listing_prints_what_was_read_then_fails_with_the_reason() {
+    let s = scratch!("brokenlist");
+    let Some(a) = broken_tar(&s) else {
+        eprintln!("SKIPPED: tar isn't available");
+        return;
+    };
+    let a = a.to_str().unwrap();
+    let r = s.run(&["list", a], None);
+    assert_eq!(r.code, 1, "{}\n{}", r.text(), r.err);
+    let t = r.text();
+    assert!(t.lines().any(|l| l.ends_with(" a")), "{t}");
+    assert!(t.lines().any(|l| l.ends_with(" b")), "{t}");
+    assert!(!t.lines().any(|l| l.ends_with(" c")), "{t}");
+    assert!(r.err.starts_with("atlas-archive-cli: "), "{}", r.err);
+    assert!(r.err.trim().len() > "atlas-archive-cli:".len(), "{}", r.err);
+    r.assert_clean();
+    let r = s.run(&["list", "--json", a], None);
+    assert_eq!(r.code, 1, "{}", r.err);
+    let v = json_lines(&r);
+    let last = &v.last().unwrap()["summary"];
+    assert!(last["broken"].is_string(), "{last}");
+    assert!(v.iter().any(|e| e["path"] == "b"));
+    // A whole listing says null.
+    let ok = sample(&s, "sample.zip");
+    let r = s.run(&["list", "--json", ok.to_str().unwrap()], None);
+    r.assert_ok();
+    let v = json_lines(&r);
+    assert!(v.last().unwrap()["summary"]["broken"].is_null());
+    // Extracting half a listing writes nothing.
+    let dest = s.dest();
+    let r = s.run(&["extract", "--to", dest.to_str().unwrap(), a], None);
+    assert_eq!(r.code, 1, "{}", r.err);
+    assert!(s.ls(&dest).is_empty(), "{:?}", s.ls(&dest));
 }

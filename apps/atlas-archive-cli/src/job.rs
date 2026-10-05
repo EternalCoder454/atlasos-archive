@@ -49,6 +49,9 @@ pub struct Loaded {
     pub raw: HashMap<u32, Raw>,
     /// How many entries the worker listed.
     pub entries: u64,
+    /// The archive broke part way: why, safe to print. The entries are those
+    /// read before that.
+    pub broken: Option<String>,
 }
 
 /// A finished test.
@@ -75,6 +78,8 @@ pub struct Extraction {
     /// What was not extracted: name and reason, safe to print.
     pub skipped: Vec<(String, String)>,
     pub skipped_more: u64,
+    /// The move couldn't be proven: a sentence, safe to print.
+    pub unconfirmed: Option<String>,
 }
 
 /// Starts the sweep of dead jobs' staging folders and returns at once: it runs
@@ -99,6 +104,8 @@ enum Pw {
     Rejected,
     /// The user gave up at the prompt.
     GaveUp,
+    /// The terminal hung up, or a signal came, at the prompt.
+    Interrupted,
 }
 
 /// The exit code and sentence for a client error.
@@ -114,7 +121,7 @@ fn map_error(err: Error, pw: Pw, interrupted: bool) -> CliError {
                     "This archive needs a password: run in a terminal or use --password-fd."
                 }
                 Pw::Rejected => "That password didn't work.",
-                Pw::GaveUp => "This archive needs a password.",
+                Pw::GaveUp | Pw::Interrupted => "This archive needs a password.",
             }
             .into(),
         ),
@@ -186,6 +193,8 @@ struct Front {
     saved: Option<Zeroizing<Vec<u8>>>,
     from_fd: bool,
     pw: Pw,
+    /// How many times the client asked for a password.
+    asked: u32,
     allow_large: bool,
     on_clash: Option<OnClash>,
     progress: Progress,
@@ -205,6 +214,7 @@ impl Front {
             from_fd: from_fd.is_some(),
             saved: from_fd,
             pw: Pw::Fine,
+            asked: 0,
             allow_large: false,
             on_clash: None,
             progress: Progress::new(label),
@@ -214,6 +224,19 @@ impl Front {
             skipped: Vec::new(),
             skipped_more: 0,
         }
+    }
+
+    /// Says for the `-v` log where the password came from and how often it
+    /// was asked for. Never the password.
+    fn log_password(&self) {
+        let source = if self.from_fd {
+            "from a descriptor"
+        } else if self.tty.is_some() {
+            "from the terminal, if asked"
+        } else {
+            "no way to ask"
+        };
+        log::debug!("password: {source}, asked for {} time(s)", self.asked);
     }
 
     /// Asks on the terminal; `None` when there is none, or on a signal.
@@ -268,6 +291,7 @@ impl Callbacks for Front {
     }
 
     fn password(&mut self, wrong: bool) -> Option<Zeroizing<Vec<u8>>> {
+        self.asked = self.asked.saturating_add(1);
         if !wrong && let Some(p) = &self.saved {
             return Some(p.clone());
         }
@@ -290,6 +314,10 @@ impl Callbacks for Front {
             Ok(Line::Text(p)) if !p.is_empty() => {
                 self.saved = Some(p.clone());
                 Some(p)
+            }
+            Ok(Line::Interrupted) => {
+                self.pw = Pw::Interrupted;
+                None
             }
             Ok(_) => {
                 self.pw = Pw::GaveUp;
@@ -370,8 +398,10 @@ impl<'a> Job<'a> {
 
     fn fail(&self, e: Error, front: &mut Front) -> CliError {
         front.progress.clear();
+        front.log_password();
         log::debug!("job ended: {e:?}");
-        map_error(e, front.pw, self.sigs.interrupted())
+        let hung = front.pw == Pw::Interrupted || front.tty.as_ref().is_some_and(Tty::hung_up);
+        map_error(e, front.pw, self.sigs.interrupted() || hung)
     }
 
     fn list_with(
@@ -380,13 +410,24 @@ impl<'a> Job<'a> {
         encoding: Option<NameEncoding>,
         front: &mut Front,
     ) -> Result<Loaded, CliError> {
+        log::debug!("opening {}", term::safe_os(archive.as_os_str()));
         match self.worker.list(archive, encoding, front, &self.cancel) {
-            Ok(l) => Ok(Loaded {
-                format: l.format,
-                tree: l.tree,
-                raw: std::mem::take(&mut front.raw),
-                entries: front.entries,
-            }),
+            Ok(l) => {
+                front.log_password();
+                log::debug!(
+                    "listed: format {}, {} entries, name encoding {}",
+                    term::safe(&l.format.name),
+                    front.entries,
+                    l.tree.encoding.label()
+                );
+                Ok(Loaded {
+                    format: l.format,
+                    tree: l.tree,
+                    raw: std::mem::take(&mut front.raw),
+                    entries: front.entries,
+                    broken: l.broken.as_deref().map(term::safe),
+                })
+            }
             Err(e) => Err(self.fail(e, front)),
         }
     }
@@ -412,6 +453,7 @@ impl<'a> Job<'a> {
         {
             Ok(()) => {
                 front.progress.clear();
+                front.log_password();
                 Ok(Tested {
                     skipped: std::mem::take(&mut front.skipped)
                         .into_iter()
@@ -438,6 +480,10 @@ impl<'a> Job<'a> {
         // The listing first: it detects the names' encoding, so the files
         // are named as the listing showed them, and it resolves ENTRY.
         let loaded = self.list_with(archive, a.common.encoding, &mut front)?;
+        if let Some(why) = &loaded.broken {
+            // Half a listing can't say what to extract: nothing is written.
+            return Err(CliError::Failed(why.clone()));
+        }
         let selection = if a.entries.is_empty() {
             None
         } else {
@@ -474,11 +520,26 @@ impl<'a> Job<'a> {
                 OnClash::KeepBoth => Clash::KeepBoth,
             }),
         };
+        log::debug!(
+            "extracting into {} ({}), {}",
+            term::safe_os(dest_dir.as_os_str()),
+            match &req.mode {
+                Mode::ExtractHere => "here".to_string(),
+                Mode::ExtractTo { name } => format!("folder {}", term::safe(name)),
+            },
+            req.selection
+                .as_ref()
+                .map_or("everything".to_string(), |s| format!(
+                    "{} selected",
+                    s.len()
+                ))
+        );
         let got = match self.worker.extract(&req, &mut front, &self.cancel) {
             Ok(g) => g,
             Err(e) => return Err(self.fail(e, &mut front)),
         };
         front.progress.clear();
+        front.log_password();
 
         // Names only for the items that are printed.
         let names = select::names_for(&loaded.tree, got.skipped.iter().map(|s| s.index).collect());
@@ -501,6 +562,8 @@ impl<'a> Job<'a> {
                 .map(|s| (name_of(s.index), term::safe(&s.reason)))
                 .collect(),
             skipped_more: got.skipped_more,
+            // Already escaped by the core's `display_text`.
+            unconfirmed: got.unconfirmed,
         })
     }
 }

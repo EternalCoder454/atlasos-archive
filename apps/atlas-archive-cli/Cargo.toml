@@ -13,6 +13,9 @@ log.workspace = true
 libc.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+serde_json = "1.0.151"
+
 [features]
 # `--worker PATH`: run any executable as the worker, unsandboxed. For the
 # integration tests only; never in a shipped build.
