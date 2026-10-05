@@ -120,10 +120,13 @@ each job, so libarchive's own copy dies with it.
 
 Every entry path is untrusted. In `core::path`:
 
-- Split on `/` (and `\` for zip entries made on DOS or Windows). Empty and
-  `.` components are dropped. An absolute path, `..` anywhere, a drive prefix
-  (`C:`), NUL, more than 256 components or more than 4,096 bytes rejects the
-  entry; it is listed in the report as skipped, with the reason.
+- Names are decoded first, then split on `/` (and `\` for archives made on
+  DOS or Windows). Empty and `.` components are dropped. An absolute path,
+  `..` anywhere, NUL, a drive prefix (`C:`, DOS archives only), more than 256
+  components or more than 4,096 bytes on disk rejects the entry; it is listed
+  in the report as skipped, with the reason.
+- The tree holds at most 1,000,000 nodes and reports at most 10,000 skipped
+  entries individually; past either, the rest are counted, not kept.
 - Each component is sanitised for disk (below); two entries that sanitise to
   the same path get `name (2)`, never a silent overwrite.
 
@@ -139,7 +142,9 @@ The writer (`engine::extract`) works below one descriptor, the staging folder:
 - Symlinks are created last, after every file and folder, and only when
   their target is relative, stays inside the extracted tree when resolved
   from the link's own folder, and passes through no other symlink of the
-  archive on the way (a link to `.` would otherwise let `x/..` climb out).
+  archive on the way (a link to `.` would otherwise let `x/..` climb out),
+  and does not name the top of the extracted tree itself (a link to the top
+  would point into the user's folder once the result moves out).
   Lexical resolution then matches what the kernel will do. Others are skipped
   and reported ("2 links that point outside the folder were not extracted").
   Hardlinks are made with `linkat` only to a regular file this run already
@@ -147,7 +152,10 @@ The writer (`engine::extract`) works below one descriptor, the staging folder:
 - Device nodes, FIFOs and sockets are never created. setuid, setgid and
   sticky bits are dropped; permissions are `mode & 0777 & ~umask`, with the
   owner's read and write kept (and search, for folders), so nothing extracted
-  is locked away from its owner. Owners, ACLs and xattrs are not
+  is locked away from its owner. A file reached by a launcher name
+  (`*.desktop`, `*.directory`, `*.kdelnk`, any case), whether directly,
+  through a hard link or at the end of symlinks, loses its execute bits, so a
+  click opens it as text instead of running it. Owners, ACLs and xattrs are not
   restored. Files are written 0600 and get their final mode and times
   (`futimens`) when complete; folders get theirs last, deepest first.
 - Each entry's bytes are counted as they are written. More than its declared
@@ -161,7 +169,10 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   `photos/photos/`. A name in use becomes `name (2)`.
 - **Extract here** (smart, as Explorer, macOS and PeaZip do): an archive
   holding one top-level item extracts as that item; anything else goes into a
-  `<archive name>` folder. On a name clash the job asks, with Explorer's
+  `<archive name>` folder. The lone item is moved out only when the tree
+  says it is safe (`Tree::lone_top`): a folder whose symlinks all stay inside
+  it, or a file whose name doesn't start with `.` (so `.bashrc` or `.config/`
+  never land loose in the user's folder). On a name clash the job asks, with Explorer's
   choices: Replace, Skip, Keep Both (default), "Do this for all conflicts".
   Replace moves the old item to the trash (XDG trash spec, same file system),
   never deletes it.
@@ -172,6 +183,18 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
 - Before writing, the free space below the destination is checked against
   the declared total; a full disk mid-way stops with "There isn't enough
   space on <device> for <archive>", and staging is removed.
+- The worker's `Done` names what it wrote at the top of staging, and the
+  worker is untrusted: the client takes only names that parse as one plain
+  component (`path::parse`, nothing renamed), that exist in staging as seen
+  through its own descriptor (`fstatat(AT_SYMLINK_NOFOLLOW)`), and moves
+  them with `renameat2(staging_fd, name, dest_fd, name, RENAME_NOREPLACE)`.
+  Never a path string joined from what the worker said.
+- `7z` and `unrar` write their own files, so after either the worker walks
+  staging by descriptor (`openat2` as above, never following links) and
+  applies the same rules to what it finds: symlinks re-checked with
+  `link::check_symlink` against the walked tree and removed when they fail,
+  device nodes, FIFOs and sockets removed, setuid/setgid/sticky dropped,
+  launcher execute bits removed, names re-sanitised. Only then is it `Done`.
 
 ### Bomb limits
 
@@ -180,11 +203,12 @@ written (declared sizes can lie, and tar.gz streams have none):
 
 | Limit | Default | Past it |
 |---|---|---|
-| Total expanded size | 16 GiB, or more than the free space less 1 GiB | ask; never past the free space |
+| Total expanded size | 16 GiB | ask |
+| Free space (`fstatvfs` of staging, in the worker) | what is free, less 1 GiB | stop; no answer goes past it |
 | Ratio, expanded to archive size | 100:1, once past 256 MiB | ask |
 | Entries | 200,000 | ask |
 | One entry's ratio | 1,000:1, once past 64 MiB | ask |
-| Nested archive depth (opened in place) | 8 | refuse |
+| Nested archive depth (opened in place) | 8 | refuse: "extract it first" |
 
 The question is in plain words, with Cancel the default: "This archive would
 expand to 48 GB, 4,800 times its own size. Archives built to fill a disk look
@@ -201,10 +225,17 @@ Shift_JIS, GBK, Big5, EUC-KR, CP866, Windows-1251 and Windows-1252 among the
 candidates. The window offers Name Encoding to override it. RAR and tar use
 libarchive's `hdrcharset` with the same guess.
 
-- **Shown:** control characters (C0, C1, DEL) as `\xNN` in a dimmed style,
-  bidi controls (U+202A–202E, U+2066–2069, U+200E/F, U+061C) as `<U+202E>`,
-  undecodable bytes as `\xNN`, and the row marked "Unusual name". All text
-  from an archive is set with `textFormat: Text.PlainText`.
+- **Shown:** control characters (C0, C1, DEL) as `\xNN` in a dimmed style
+  (a literal `\` as `\\`, so an escape can't be faked), bidi controls
+  (U+202A–202E, U+2066–2069, U+200E/F, U+061C) and invisible characters
+  (zero-width spaces, word joiners, Hangul fillers, variation selectors and
+  tags out of place, U+FEFF, U+2800 and the like) as `<U+202E>`, whitespace
+  other than a single space as `<U+3000>`, undecodable bytes as `\xNN`. The
+  row is marked "Unusual name" for any of these, and for leading, trailing
+  or doubled spaces. Joiners in emoji and scripts that need them are kept.
+  All text from an archive is set with `textFormat: Text.PlainText`.
+- Free text from the worker (failure reasons, archive comments) goes through
+  `name::display_text` before it is shown.
 - **On disk:** control characters become `_`, bidi controls are removed,
   undecodable bytes are decoded by the chosen encoding or become `_`, a
   component over 255 bytes is shortened (keeping its extension, plus a short

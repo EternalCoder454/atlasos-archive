@@ -6,10 +6,10 @@
 //! The declared sizes are checked too, before anything is written, so an
 //! honest large archive asks first instead of half way through.
 //!
-//! Going past a limit is a question, not a failure: the worker pauses and the
-//! job asks in plain words, Cancel being the default. When the user goes on,
-//! that limit is off for the rest of the job. A full disk still stops the
-//! writer (ENOSPC); these limits are what ask before it gets there.
+//! Most limits are a question, not a failure: the worker pauses and the job
+//! asks in plain words, Cancel being the default. When the user goes on, that
+//! limit is off for the rest of the job. Two never are: the free space on the
+//! destination less 1 GiB, and the nesting depth.
 
 use std::fmt;
 
@@ -19,8 +19,10 @@ const GIB: u64 = 1024 * MIB;
 /// The limits for one job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The most bytes written in all.
+    /// The most bytes written before asking.
     pub total_bytes: u64,
+    /// The most bytes written, ever: the free space less the reserve.
+    pub free_space: u64,
     /// The most bytes written per byte read from the archive...
     pub ratio: u64,
     /// ...once this many bytes have been written.
@@ -33,8 +35,6 @@ pub struct Limits {
     pub entry_ratio_after: u64,
     /// The most archives inside archives opened in place.
     pub nest_depth: u32,
-    /// The free space, not the 16 GiB default, set `total_bytes`.
-    pub by_free_space: bool,
 }
 
 /// Room left free on the destination's file system.
@@ -42,21 +42,17 @@ pub const FREE_SPACE_RESERVE: u64 = GIB;
 
 impl Limits {
     /// The default limits. `free_space`: the bytes free on the destination's
-    /// file system, when known; the total is then at most that less 1 GiB.
+    /// file system, when known.
     pub fn new(free_space: Option<u64>) -> Limits {
-        let default = 16 * GIB;
-        let total_bytes = free_space.map_or(default, |free| {
-            default.min(free.saturating_sub(FREE_SPACE_RESERVE))
-        });
         Limits {
-            total_bytes,
+            total_bytes: 16 * GIB,
+            free_space: free_space.map_or(u64::MAX, |f| f.saturating_sub(FREE_SPACE_RESERVE)),
             ratio: 100,
             ratio_after: 256 * MIB,
             entries: 200_000,
             entry_ratio: 1000,
             entry_ratio_after: 64 * MIB,
             nest_depth: 8,
-            by_free_space: total_bytes < default,
         }
     }
 }
@@ -69,25 +65,33 @@ pub enum Kind {
     Entries,
     EntryRatio,
     NestDepth,
+    FreeSpace,
 }
 
-/// A limit was reached: what to ask the user.
+impl Kind {
+    /// The user may choose to go past it.
+    pub fn askable(self) -> bool {
+        !matches!(self, Kind::NestDepth | Kind::FreeSpace)
+    }
+}
+
+/// A limit was reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Exceeded {
     pub kind: Kind,
-    /// The limit's value, for the question.
+    /// The limit's value, for the words. It may come from the worker: shown,
+    /// never computed with.
     pub limit: u64,
-    /// The free space was what set the total size limit.
-    pub by_free_space: bool,
 }
 
 impl Exceeded {
-    /// The question the job asks, in plain words.
+    /// What the job says, in plain words: a question when `kind.askable()`,
+    /// otherwise why it stopped.
     pub fn question(&self) -> String {
         match self.kind {
-            Kind::TotalSize if self.by_free_space => format!(
-                "This archive unpacks to more than the {} free on this drive (keeping 1 GiB spare). Unpack it anyway?",
-                format_size(self.limit + FREE_SPACE_RESERVE)
+            Kind::FreeSpace => format!(
+                "There isn't enough space on this drive: the archive unpacks to more than the {} free (keeping 1 GiB spare).",
+                format_size(self.limit)
             ),
             Kind::TotalSize => format!(
                 "This archive unpacks to more than {}. Unpack it anyway?",
@@ -95,7 +99,7 @@ impl Exceeded {
             ),
             Kind::Ratio => format!(
                 "This archive unpacks to more than {} times its own size. Archives made to fill a disk look like this. Unpack it anyway?",
-                self.limit
+                group(self.limit)
             ),
             Kind::Entries => format!(
                 "This archive holds more than {} items. Unpack it anyway?",
@@ -106,8 +110,8 @@ impl Exceeded {
                 group(self.limit)
             ),
             Kind::NestDepth => format!(
-                "This archive is inside more than {} other archives. Open it anyway?",
-                self.limit
+                "This archive is inside more than {} other archives, so it can't be opened in place. Extract it first.",
+                group(self.limit)
             ),
         }
     }
@@ -141,8 +145,9 @@ impl Meter {
     }
 
     /// Turns a limit off for the rest of the job: the user chose to go on.
+    /// Limits that aren't `askable` stay on.
     pub fn allow(&mut self, kind: Kind) {
-        if !self.off.contains(&kind) {
+        if kind.askable() && !self.off.contains(&kind) {
             self.off.push(kind);
         }
     }
@@ -156,15 +161,23 @@ impl Meter {
     }
 
     fn exceeded(&self, kind: Kind, limit: u64) -> Exceeded {
-        Exceeded {
-            kind,
-            limit,
-            by_free_space: kind == Kind::TotalSize && self.limits.by_free_space,
+        Exceeded { kind, limit }
+    }
+
+    fn check_size(&self, size: u64) -> Result<(), Exceeded> {
+        let l = &self.limits;
+        if size > l.free_space {
+            return Err(self.exceeded(Kind::FreeSpace, l.free_space));
         }
+        if self.on(Kind::TotalSize) && size > l.total_bytes {
+            return Err(self.exceeded(Kind::TotalSize, l.total_bytes));
+        }
+        Ok(())
     }
 
     /// Checks what the archive declares before anything is written: its
-    /// entry count, the sum of its entries' sizes and its own size.
+    /// entry count, the sum of its entries' sizes (add them with
+    /// `saturating_add`) and its own size.
     pub fn check_declared(
         &self,
         entries: u64,
@@ -175,9 +188,7 @@ impl Meter {
         if self.on(Kind::Entries) && entries > l.entries {
             return Err(self.exceeded(Kind::Entries, l.entries));
         }
-        if self.on(Kind::TotalSize) && unpacked > l.total_bytes {
-            return Err(self.exceeded(Kind::TotalSize, l.total_bytes));
-        }
+        self.check_size(unpacked)?;
         if self.on(Kind::Ratio)
             && unpacked > l.ratio_after
             && unpacked / archive_size.max(1) >= l.ratio
@@ -208,10 +219,8 @@ impl Meter {
     ) -> Result<(), Exceeded> {
         self.written = self.written.saturating_add(n);
         self.entry_written = self.entry_written.saturating_add(n);
+        self.check_size(self.written)?;
         let l = &self.limits;
-        if self.on(Kind::TotalSize) && self.written > l.total_bytes {
-            return Err(self.exceeded(Kind::TotalSize, l.total_bytes));
-        }
         if self.on(Kind::EntryRatio)
             && let Some(packed) = entry_packed
             && self.entry_written > l.entry_ratio_after
@@ -230,7 +239,7 @@ impl Meter {
 
     /// Checks opening an archive `depth` archives deep (1: inside one).
     pub fn check_nesting(&self, depth: u32) -> Result<(), Exceeded> {
-        if self.on(Kind::NestDepth) && depth > self.limits.nest_depth {
+        if depth > self.limits.nest_depth {
             return Err(self.exceeded(Kind::NestDepth, self.limits.nest_depth.into()));
         }
         Ok(())
@@ -276,15 +285,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn free_space_caps_the_total() {
-        assert_eq!(Limits::new(None).total_bytes, 16 * GIB);
-        assert_eq!(Limits::new(Some(5 * GIB)).total_bytes, 4 * GIB);
-        assert_eq!(Limits::new(Some(100 * GIB)).total_bytes, 16 * GIB);
-        assert_eq!(Limits::new(Some(MIB)).total_bytes, 0);
-        let m = Meter::new(Limits::new(Some(5 * GIB)));
+    fn free_space_is_a_hard_stop() {
+        assert_eq!(Limits::new(None).free_space, u64::MAX);
+        assert_eq!(Limits::new(Some(5 * GIB)).free_space, 4 * GIB);
+        assert_eq!(Limits::new(Some(MIB)).free_space, 0);
+        let mut m = Meter::new(Limits::new(Some(5 * GIB)));
         let e = m.check_declared(1, 5 * GIB, 5 * GIB).unwrap_err();
-        assert!(e.by_free_space);
-        assert!(e.question().contains("5 GiB free"), "{}", e.question());
+        assert_eq!(e.kind, Kind::FreeSpace);
+        assert!(!e.kind.askable());
+        assert!(e.question().contains("4 GiB free"), "{}", e.question());
+        // Saying yes to everything still stops at the free space.
+        for k in [Kind::TotalSize, Kind::Ratio, Kind::FreeSpace] {
+            m.allow(k);
+        }
+        m.start_entry().unwrap();
+        assert!(m.add(4 * GIB, 4 * GIB, None).is_ok());
+        assert_eq!(m.add(1, 4 * GIB, None).unwrap_err().kind, Kind::FreeSpace);
     }
 
     #[test]
@@ -338,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn allowing_turns_a_limit_off() {
+    fn allowing_turns_an_askable_limit_off() {
         let mut m = Meter::new(Limits {
             entries: 2,
             ..Limits::new(None)
@@ -349,6 +365,7 @@ mod tests {
         m.allow(Kind::Entries);
         m.start_entry().unwrap();
         assert!(m.check_nesting(8).is_ok());
+        m.allow(Kind::NestDepth);
         assert_eq!(m.check_nesting(9).unwrap_err().kind, Kind::NestDepth);
     }
 
@@ -378,14 +395,15 @@ mod tests {
             Kind::Entries,
             Kind::EntryRatio,
             Kind::NestDepth,
+            Kind::FreeSpace,
         ] {
+            // A worker's u64::MAX can't overflow the words.
             let q = Exceeded {
                 kind,
-                limit: 8,
-                by_free_space: false,
+                limit: u64::MAX,
             }
             .question();
-            assert!(q.ends_with("anyway?"), "{q}");
+            assert_eq!(q.ends_with("anyway?"), kind.askable(), "{q}");
         }
     }
 }

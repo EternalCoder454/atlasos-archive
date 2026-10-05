@@ -187,20 +187,84 @@ pub fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// The display form of one name, and whether it held anything unusual
-/// (controls, bidi characters, undecodable bytes), which the window marks.
-/// Controls and undecodable bytes become `\xNN`, bidi characters `<U+202E>`,
-/// a byte a legacy decoder rejected `\x??`.
+/// Characters that show as nothing, or as blank: zero-width spaces and
+/// joiners, the soft hyphen, Hangul and Braille blanks, variation selectors,
+/// tag characters, the BOM, interlinear annotations, invisible operators.
+/// `invoice.pdf` and `invoice.pdf\u{200B}` would look the same.
+pub fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2060}'..='\u{2065}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Is `p` a character that shows as something (not a space, control, bidi
+/// or invisible character, nor an undecodable byte)?
+fn visible(p: Option<&Piece>) -> bool {
+    matches!(p, Some(&Piece::Char(c)) if !c.is_whitespace() && !is_control(c) && !is_bidi_control(c) && !is_invisible(c))
+}
+
+/// The display form of one name, and whether it held anything unusual,
+/// which the window marks. Nothing can hide or reorder text:
+///
+/// - controls and undecodable bytes become `\xNN` (`\x??` for a byte a
+///   legacy decoder rejected), and a literal `\` becomes `\\`, so the
+///   escapes can't be faked;
+/// - bidi characters and invisible ones become `<U+202E>`; joiners and
+///   variation selectors are kept where they join something (emoji,
+///   Persian), as are tag characters after a flag;
+/// - spaces other than U+0020 become `<U+XXXX>` unless alone between two
+///   visible characters;
+/// - a name that starts or ends with a space, holds two in a row, or holds
+///   `<U+` is marked unusual.
 pub fn display(pieces: &[Piece]) -> (String, bool) {
     let mut s = String::with_capacity(pieces.len());
     let mut unusual = false;
-    for &p in pieces {
+    for (i, &p) in pieces.iter().enumerate() {
+        let before = i.checked_sub(1).and_then(|j| pieces.get(j));
+        let after = pieces.get(i + 1);
         match p {
             Piece::Char(c) if is_control(c) && (c as u32) <= 0xff => {
                 unusual = true;
                 let _ = write!(s, "\\x{:02X}", c as u32);
             }
-            Piece::Char(c) if is_control(c) || is_bidi_control(c) => {
+            Piece::Char('\\') => s.push_str("\\\\"),
+            Piece::Char(c @ ('\u{200C}' | '\u{200D}')) if visible(before) && visible(after) => {
+                s.push(c)
+            }
+            Piece::Char(c @ '\u{FE00}'..='\u{FE0F}') if visible(before) => s.push(c),
+            Piece::Char(c @ '\u{E0020}'..='\u{E007F}')
+                if matches!(
+                    before,
+                    Some(&Piece::Char('\u{1F3F4}' | '\u{E0020}'..='\u{E007E}'))
+                ) =>
+            {
+                s.push(c)
+            }
+            Piece::Char(c) if is_control(c) || is_bidi_control(c) || is_invisible(c) => {
+                unusual = true;
+                let _ = write!(s, "<U+{:04X}>", c as u32);
+            }
+            Piece::Char(c)
+                if c.is_whitespace() && c != ' ' && !(visible(before) && visible(after)) =>
+            {
                 unusual = true;
                 let _ = write!(s, "<U+{:04X}>", c as u32);
             }
@@ -215,7 +279,26 @@ pub fn display(pieces: &[Piece]) -> (String, bool) {
             }
         }
     }
+    let spaces = |p: Option<&Piece>| matches!(p, Some(Piece::Char(c)) if c.is_whitespace());
+    if spaces(pieces.first())
+        || spaces(pieces.last())
+        || pieces
+            .windows(2)
+            .any(|w| spaces(w.first()) && spaces(w.get(1)))
+        || s.contains("<U+") && !unusual
+    {
+        unusual = true;
+    }
     (s, unusual)
+}
+
+/// Free text from an archive or the worker (a comment, an error message)
+/// made safe to show, as `display` does for names. Line breaks are kept.
+pub fn display_text(text: &str) -> String {
+    text.split('\n')
+        .map(|line| display(&line.chars().map(Piece::Char).collect::<Vec<_>>()).0)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The disk form of one name (never `/`: `path` split on it already), and
@@ -251,6 +334,23 @@ pub fn disk(pieces: &[Piece]) -> (String, bool) {
     (s, changed)
 }
 
+/// A name the desktop treats as a launcher when it is executable
+/// (`.desktop`, `.directory`, `.kdelnk`, in any case). Extracted launchers
+/// never keep their execute bits, so a click opens them as text instead of
+/// running what they name.
+pub fn is_launcher(name: &str) -> bool {
+    let lower = name
+        .as_bytes()
+        .rsplit(|&b| b == b'.')
+        .next()
+        .map(<[u8]>::to_ascii_lowercase);
+    name.contains('.')
+        && matches!(
+            lower.as_deref(),
+            Some(b"desktop" | b"directory" | b"kdelnk")
+        )
+}
+
 /// `name` with a number added before its extension, the way Keep Both
 /// names a copy: "photo.jpg", 2 gives "photo (2).jpg". Shortened again if
 /// that passes 255 bytes. Works on display and disk forms alike.
@@ -260,7 +360,11 @@ pub fn numbered(name: &str, n: u32) -> String {
         _ => "",
     };
     let out = format!("{} ({n}){ext}", &name[..name.len() - ext.len()]);
-    if out.len() > MAX_COMPONENT_BYTES { shorten(&out) } else { out }
+    if out.len() > MAX_COMPONENT_BYTES {
+        shorten(&out)
+    } else {
+        out
+    }
 }
 
 /// Shortens a name to at most 255 bytes: `<start>~<hash><extension>`, the
@@ -320,6 +424,67 @@ mod tests {
     fn both(raw: &[u8], e: NameEncoding) -> ((String, bool), (String, bool)) {
         let p = pieces(raw, e);
         (display(&p), disk(&p))
+    }
+
+    fn show(name: &str) -> (String, bool) {
+        display(&name.chars().map(Piece::Char).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn invisible_characters_are_shown() {
+        assert_eq!(
+            show("invoice.pdf\u{200B}"),
+            ("invoice.pdf<U+200B>".into(), true)
+        );
+        assert_eq!(
+            show("\u{3164}\u{3164}.exe"),
+            ("<U+3164><U+3164>.exe".into(), true)
+        );
+        assert_eq!(show("a\u{FEFF}b").0, "a<U+FEFF>b");
+        assert_eq!(show("\u{200D}x").0, "<U+200D>x");
+        // Joiners and variation selectors that join something stay.
+        assert_eq!(show("👩\u{200D}💻.png"), ("👩\u{200D}💻.png".into(), false));
+        assert_eq!(show("❤\u{FE0F}.txt"), ("❤\u{FE0F}.txt".into(), false));
+        assert_eq!(show("می\u{200C}خواهم.txt").1, false);
+    }
+
+    #[test]
+    fn spaces_are_shown_or_marked() {
+        assert_eq!(show("a\u{00A0}b"), ("a\u{00A0}b".into(), false));
+        assert_eq!(
+            show("\u{2003}\u{2003}.exe"),
+            ("<U+2003><U+2003>.exe".into(), true)
+        );
+        assert!(show("invoice.pdf ").1);
+        assert!(show(" invoice.pdf").1);
+        assert!(show(&format!("{}.exe", " ".repeat(200))).1);
+        assert!(!show("two words.txt").1);
+    }
+
+    #[test]
+    fn escapes_cannot_be_faked() {
+        assert_eq!(show(r"a\x41").0, r"a\\x41");
+        assert!(show("a<U+202E>b").1);
+        assert_eq!(
+            display_text("line one\nbad\u{202E}line"),
+            "line one\nbad<U+202E>line"
+        );
+    }
+
+    #[test]
+    fn launchers() {
+        for n in [
+            "a.desktop",
+            "A.DESKTOP",
+            ".directory",
+            "x.kdelnk",
+            "a.b.Desktop",
+        ] {
+            assert!(is_launcher(n), "{n}");
+        }
+        for n in ["desktop", "a.desktop.txt", "a.desk", "adesktop"] {
+            assert!(!is_launcher(n), "{n}");
+        }
     }
 
     #[test]

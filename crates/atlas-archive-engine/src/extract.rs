@@ -19,8 +19,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use atlas_archive_core::proto::Kind;
 use atlas_archive_core::tree::{Moved, ROOT, Tree};
 
-const RESOLVE: u64 =
-    libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV;
+const RESOLVE: u64 = libc::RESOLVE_BENEATH
+    | libc::RESOLVE_NO_SYMLINKS
+    | libc::RESOLVE_NO_MAGICLINKS
+    | libc::RESOLVE_NO_XDEV;
 
 /// `struct open_how` (libc's is `non_exhaustive`).
 #[repr(C)]
@@ -33,7 +35,11 @@ struct OpenHow {
 /// `openat2` below `dir` with the writer's resolve flags. `path` is relative.
 fn openat2(dir: &OwnedFd, path: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
     let c = cstr(if path.is_empty() { "." } else { path })?;
-    let how = OpenHow { flags: (flags | libc::O_CLOEXEC) as u64, mode: mode.into(), resolve: RESOLVE };
+    let how = OpenHow {
+        flags: (flags | libc::O_CLOEXEC) as u64,
+        mode: mode.into(),
+        resolve: RESOLVE,
+    };
     loop {
         // SAFETY: valid C string and open_how of the size passed.
         let fd = unsafe {
@@ -57,17 +63,28 @@ fn openat2(dir: &OwnedFd, path: &str, flags: i32, mode: u32) -> io::Result<Owned
 }
 
 fn cstr(s: &str) -> io::Result<CString> {
-    CString::new(s).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name holds a NUL byte"))
+    CString::new(s)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a name holds a NUL byte"))
 }
 
 fn check(r: libc::c_int) -> io::Result<()> {
-    if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn timespec(mtime: Option<i64>) -> [libc::timespec; 2] {
-    let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT };
+    let omit = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::UTIME_OMIT,
+    };
     let m = match mtime {
-        Some(s) => libc::timespec { tv_sec: s as libc::time_t, tv_nsec: 0 },
+        Some(s) => libc::timespec {
+            tv_sec: s as libc::time_t,
+            tv_nsec: 0,
+        },
         None => omit,
     };
     [omit, m]
@@ -133,7 +150,12 @@ impl Writer {
         let node = &tree.nodes[id as usize];
         debug_assert_eq!(node.kind, Kind::Dir);
         self.dir(tree, node.parent)?;
-        let parent = openat2(&self.staging, &tree.disk_path(node.parent), libc::O_PATH | libc::O_DIRECTORY, 0)?;
+        let parent = openat2(
+            &self.staging,
+            &tree.disk_path(node.parent),
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )?;
         let name = cstr(&node.name.disk)?;
         // SAFETY: valid descriptor and C string.
         match check(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) }) {
@@ -141,7 +163,12 @@ impl Writer {
             // Made already by this run: the tree has one node per path, so an
             // existing folder here is ours unless the file system folds case.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                openat2(&self.staging, &tree.disk_path(id), libc::O_PATH | libc::O_DIRECTORY, 0)?;
+                openat2(
+                    &self.staging,
+                    &tree.disk_path(id),
+                    libc::O_PATH | libc::O_DIRECTORY,
+                    0,
+                )?;
             }
             Err(e) => return Err(e),
         }
@@ -163,7 +190,12 @@ impl Writer {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
             0o600,
         )?;
-        Ok(FileOut { file: File::from(fd), id, written: 0, declared })
+        Ok(FileOut {
+            file: File::from(fd),
+            id,
+            written: 0,
+            declared,
+        })
     }
 
     /// Completes a file: mode and time. Only then is it a hard link target.
@@ -188,7 +220,13 @@ impl Writer {
         // SAFETY: valid descriptor and C strings. Same folder: a move only
         // renames within it.
         let r = unsafe {
-            libc::renameat2(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE)
+            libc::renameat2(
+                dir.as_raw_fd(),
+                from.as_ptr(),
+                dir.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
         };
         match check(r) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -200,7 +238,12 @@ impl Writer {
     pub fn replace(&mut self, tree: &Tree, id: u32) -> io::Result<()> {
         let node = &tree.nodes[id as usize];
         self.files.remove(&id);
-        let dir = openat2(&self.staging, &tree.disk_path(node.parent), libc::O_PATH | libc::O_DIRECTORY, 0)?;
+        let dir = openat2(
+            &self.staging,
+            &tree.disk_path(node.parent),
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )?;
         let name = cstr(&node.name.disk)?;
         // SAFETY: valid descriptor and C string. Never a folder (flags 0).
         match check(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) }) {
@@ -216,14 +259,16 @@ impl Writer {
 
     /// Makes hard links, then symbolic links, then gives folders their modes
     /// and times. Returns the entries that failed.
-    pub fn finish(mut self, tree: &Tree) -> io::Result<Vec<EntryFailed>> {
+    pub fn finish(&mut self, tree: &Tree) -> io::Result<Vec<EntryFailed>> {
         for (id, n) in tree.nodes.iter().enumerate() {
             let id = id as u32;
             if n.refused.is_some() {
                 continue;
             }
             let r = match (n.kind, n.hardlink, &n.symlink) {
-                (Kind::Hardlink, Some(to), _) if self.files.contains(&to) => self.hardlink(tree, id, to),
+                (Kind::Hardlink, Some(to), _) if self.files.contains(&to) => {
+                    self.hardlink(tree, id, to)
+                }
                 (Kind::Hardlink, _, _) => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "the file it links to wasn't extracted",
@@ -244,35 +289,107 @@ impl Writer {
                 self.failed(id, e);
             }
         }
+        // Launchers never run: their files lose the execute bits, whatever
+        // name reached them (folders are still writable here).
+        for id in tree.launcher_files() {
+            if !self.files.contains(&id) {
+                continue;
+            }
+            let r = openat2(
+                &self.staging,
+                &tree.disk_path(id),
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                0,
+            )
+            .and_then(|fd| {
+                let mode = file_mode(tree.nodes[id as usize].mode, self.umask) & !0o111;
+                // SAFETY: valid descriptor.
+                check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
+            });
+            if let Err(e) = r {
+                self.failed(id, e);
+            }
+        }
         // Deepest first: a folder made read-only must not stop its children.
         let mut dirs = std::mem::take(&mut self.dirs);
         dirs.sort_by_key(|&d| std::cmp::Reverse(depth(tree, d)));
         for d in dirs {
             let n = &tree.nodes[d as usize];
-            let fd = openat2(&self.staging, &tree.disk_path(d), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let fd = openat2(
+                &self.staging,
+                &tree.disk_path(d),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?;
             // SAFETY: valid descriptor; times array of two.
             check(unsafe { libc::fchmod(fd.as_raw_fd(), dir_mode(n.mode, self.umask)) })?;
             check(unsafe { libc::futimens(fd.as_raw_fd(), timespec(n.mtime).as_ptr()) })?;
         }
-        Ok(self.failed)
+        Ok(std::mem::take(&mut self.failed))
+    }
+
+    /// The root's children that exist in staging, by disk name.
+    pub fn top_level(&self, tree: &Tree) -> Vec<String> {
+        tree.nodes[ROOT as usize]
+            .children
+            .iter()
+            .map(|&c| &tree.nodes[c as usize].name.disk)
+            .filter(|name| {
+                let Ok(c) = cstr(name) else { return false };
+                let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: valid descriptor, C string and stat buffer.
+                unsafe {
+                    libc::fstatat(
+                        self.staging.as_raw_fd(),
+                        c.as_ptr(),
+                        st.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    ) == 0
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     fn hardlink(&mut self, tree: &Tree, id: u32, to: u32) -> io::Result<()> {
         let n = &tree.nodes[id as usize];
         self.dir(tree, n.parent)?;
-        let from_dir = openat2(&self.staging, &tree.disk_path(tree.nodes[to as usize].parent), libc::O_PATH | libc::O_DIRECTORY, 0)?;
-        let to_dir = openat2(&self.staging, &tree.disk_path(n.parent), libc::O_PATH | libc::O_DIRECTORY, 0)?;
+        let from_dir = openat2(
+            &self.staging,
+            &tree.disk_path(tree.nodes[to as usize].parent),
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )?;
+        let to_dir = openat2(
+            &self.staging,
+            &tree.disk_path(n.parent),
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )?;
         let from = cstr(&tree.nodes[to as usize].name.disk)?;
         let name = cstr(&n.name.disk)?;
         // SAFETY: valid descriptors and C strings. Flags 0: a symlink at the
         // source is linked itself, never followed.
-        check(unsafe { libc::linkat(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), name.as_ptr(), 0) })
+        check(unsafe {
+            libc::linkat(
+                from_dir.as_raw_fd(),
+                from.as_ptr(),
+                to_dir.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        })
     }
 
     fn symlink(&mut self, tree: &Tree, id: u32, target: &str) -> io::Result<()> {
         let n = &tree.nodes[id as usize];
         self.dir(tree, n.parent)?;
-        let dir = openat2(&self.staging, &tree.disk_path(n.parent), libc::O_PATH | libc::O_DIRECTORY, 0)?;
+        let dir = openat2(
+            &self.staging,
+            &tree.disk_path(n.parent),
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+        )?;
         let target = cstr(target)?;
         let name = cstr(&n.name.disk)?;
         // SAFETY: valid descriptor and C strings.
@@ -329,7 +446,12 @@ pub fn open_dir(path: &std::path::Path) -> io::Result<OwnedFd> {
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holds a NUL byte"))?;
     // SAFETY: valid C string.
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -370,6 +492,7 @@ mod tests {
             encrypted: false,
             encrypted_names: false,
             solid: true,
+            compressed_file: false,
             volumes: 1,
             made_on_dos: false,
             comment: None,
@@ -431,9 +554,39 @@ mod tests {
         assert_eq!(m.mtime(), 1_000_000_000);
         assert_eq!(std::fs::read(s.0.join("a/b/c.txt")).unwrap(), b"hello");
         let x = std::fs::metadata(s.0.join("a/ro/x")).unwrap();
-        assert_eq!(x.permissions().mode() & 0o777, 0o600, "owner keeps read and write");
+        assert_eq!(
+            x.permissions().mode() & 0o777,
+            0o600,
+            "owner keeps read and write"
+        );
         let ro = std::fs::metadata(s.0.join("a/ro")).unwrap();
         assert_eq!(ro.permissions().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn launchers_lose_their_execute_bits() {
+        let s = Scratch::new("launchers");
+        let failed = extract(
+            &s.0,
+            &[
+                e(0, "app.desktop", Kind::File, 0o755, None),
+                e(1, "run", Kind::File, 0o755, None),
+                e(2, "Open me.desktop", Kind::Symlink, 0o777, Some("run")),
+                e(3, "tool", Kind::File, 0o755, None),
+            ],
+        );
+        assert!(failed.is_empty(), "{failed:?}");
+        for (name, mode) in [("app.desktop", 0o644), ("run", 0o644), ("tool", 0o755)] {
+            assert_eq!(
+                std::fs::metadata(s.0.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -450,10 +603,22 @@ mod tests {
             ],
         );
         assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(std::fs::metadata(s.0.join("hard")).unwrap().ino(), std::fs::metadata(s.0.join("f")).unwrap().ino());
-        assert_eq!(std::fs::read_link(s.0.join("sub/rel")).unwrap(), Path::new("../f"));
-        assert!(std::fs::symlink_metadata(s.0.join("abs")).is_err(), "refused links are not made");
-        assert!(std::fs::symlink_metadata(s.0.join("fifo")).is_err(), "no FIFOs");
+        assert_eq!(
+            std::fs::metadata(s.0.join("hard")).unwrap().ino(),
+            std::fs::metadata(s.0.join("f")).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::read_link(s.0.join("sub/rel")).unwrap(),
+            Path::new("../f")
+        );
+        assert!(
+            std::fs::symlink_metadata(s.0.join("abs")).is_err(),
+            "refused links are not made"
+        );
+        assert!(
+            std::fs::symlink_metadata(s.0.join("fifo")).is_err(),
+            "no FIFOs"
+        );
     }
 
     #[test]
@@ -463,11 +628,17 @@ mod tests {
         let target = outside.0.to_str().unwrap().to_string();
         let failed = extract(
             &s.0,
-            &[e(0, "l", Kind::Symlink, 0o777, Some(&target)), e(1, "l/pwned", Kind::File, 0o644, None)],
+            &[
+                e(0, "l", Kind::Symlink, 0o777, Some(&target)),
+                e(1, "l/pwned", Kind::File, 0o644, None),
+            ],
         );
         assert!(failed.is_empty(), "{failed:?}");
         assert!(s.0.join("l/pwned").is_file(), "written in a real folder");
-        assert!(std::fs::read_dir(&outside.0).unwrap().next().is_none(), "nothing outside");
+        assert!(
+            std::fs::read_dir(&outside.0).unwrap().next().is_none(),
+            "nothing outside"
+        );
     }
 
     #[test]
@@ -496,7 +667,14 @@ mod tests {
             e(2, "x/y", Kind::File, 0o644, None),
         ];
         for (i, en) in entries.iter().enumerate() {
-            let Added::Node { id, moved, replaced } = tree.add(en) else { panic!() };
+            let Added::Node {
+                id,
+                moved,
+                replaced,
+            } = tree.add(en)
+            else {
+                panic!()
+            };
             if let Some(m) = moved {
                 w.moved(&tree, &m).unwrap();
             }

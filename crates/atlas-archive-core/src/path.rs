@@ -137,15 +137,18 @@ pub fn parse(
     let dir_hint = pieces.last().is_some_and(is_sep);
 
     let mut components = Vec::new();
+    let mut disk_len = 0;
     for (index, part) in pieces.split(is_sep).enumerate() {
         match part {
             [] | [Piece::Char('.')] => continue,
             [Piece::Char('.'), Piece::Char('.')] => return Err(PathError::Parent),
             _ => {}
         }
-        // "C:", "C:foo" and "C:\foo" are drive paths on Windows. Only the
-        // first component: a colon is an ordinary character on Linux.
+        // "C:", "C:foo" and "C:\foo" are drive paths in an archive made on
+        // Windows. Only there, and only first: a colon is an ordinary
+        // character on Linux.
         if index == 0
+            && dos_separators
             && matches!(part, [Piece::Char(d), Piece::Char(':'), ..] if d.is_ascii_alphabetic())
         {
             return Err(PathError::Drive);
@@ -155,6 +158,12 @@ pub fn parse(
         }
         let (display, unusual) = name::display(part);
         let (disk, renamed) = name::disk(part);
+        // Decoding can make a name longer (a CP437 byte is up to 3 bytes of
+        // UTF-8): the limit is checked again on what will be written.
+        disk_len += disk.len() + 1;
+        if disk_len > MAX_PATH_BYTES {
+            return Err(PathError::TooLong);
+        }
         components.push(Component {
             display,
             disk,
@@ -206,7 +215,8 @@ mod tests {
         assert_eq!(dos(b"a\\..\\..\\x"), Err(PathError::Parent));
         assert_eq!(dos(b"C:\\x"), Err(PathError::Drive));
         assert_eq!(dos(b"c:x"), Err(PathError::Drive));
-        assert_eq!(disk(b"C:/x"), Err(PathError::Drive));
+        assert_eq!(disk(b"C:/x").unwrap(), "C:/x");
+        assert_eq!(dos(b"C:/x"), Err(PathError::Drive));
         assert_eq!(disk(b"a\0b"), Err(PathError::Nul));
     }
 
@@ -265,6 +275,14 @@ mod tests {
         assert_eq!(disk(deep.as_bytes()).unwrap().split('/').count(), MAX_DEPTH);
         let deeper = "a/".repeat(MAX_DEPTH + 1);
         assert_eq!(disk(deeper.as_bytes()), Err(PathError::TooDeep));
+        // 20 folders of 85 CP437 bytes: 1,720 bytes stored, 5,120 on disk.
+        let wide: Vec<u8> = (0..20)
+            .flat_map(|_| [0xB0u8; 85].into_iter().chain([b'/']))
+            .collect();
+        assert_eq!(
+            parse(&wide, NameEncoding::Cp437, false),
+            Err(PathError::TooLong)
+        );
         let long = "a".repeat(MAX_PATH_BYTES + 1);
         assert_eq!(disk(long.as_bytes()), Err(PathError::TooLong));
         // A 300-byte component is shortened on disk, not refused.

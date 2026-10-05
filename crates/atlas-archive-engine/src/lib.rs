@@ -2,3 +2,5 @@
 //! extraction writer. It runs only in `atlas-archive-worker`, after the
 //! sandbox is in place (docs/DESIGN.md, "The sandbox").
 pub mod extract;
+pub mod job;
+pub mod libarchive;

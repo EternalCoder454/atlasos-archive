@@ -17,6 +17,7 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+use crate::limits::Exceeded;
 use zeroize::Zeroizing;
 
 /// The largest frame, in bytes (length prefix not counted).
@@ -64,7 +65,8 @@ impl From<ProtoError> for io::Error {
 
 // ---- frames ----
 
-/// Writes one frame.
+/// Writes one frame. Give it the pipe itself, never a `BufWriter`: a
+/// buffer would keep a copy of a password frame that nothing zeroes.
 pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_FRAME {
         return Err(ProtoError::TooLarge.into());
@@ -212,8 +214,15 @@ impl<'a> Dec<'a> {
             .map(str::to_owned)
             .map_err(|_| ProtoError::BadText)
     }
-    fn opt<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, ProtoError>) -> Result<Option<T>, ProtoError> {
-        if self.bool()? { f(self).map(Some) } else { Ok(None) }
+    fn opt<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ProtoError>,
+    ) -> Result<Option<T>, ProtoError> {
+        if self.bool()? {
+            f(self).map(Some)
+        } else {
+            Ok(None)
+        }
     }
     /// A list count, refused when even one byte per item would not fit.
     fn count(&mut self, min_item: usize) -> Result<usize, ProtoError> {
@@ -224,7 +233,11 @@ impl<'a> Dec<'a> {
         Ok(n)
     }
     fn end(&self) -> Result<(), ProtoError> {
-        if self.0.is_empty() { Ok(()) } else { Err(ProtoError::Trailing) }
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(ProtoError::Trailing)
+        }
     }
 }
 
@@ -242,8 +255,9 @@ pub enum Request {
         /// client detected or the user chose (`NameEncoding::from_label`).
         encoding: String,
         entries: Option<Vec<u32>>,
-        /// The limits' total size (free space taken into account).
-        total_bytes: u64,
+        /// The name for the one file in a compressed file that is no archive
+        /// (`notes.txt` for `notes.txt.gz`), which stores none.
+        raw_name: String,
     },
     /// Read every entry and check it, writing nothing.
     Test,
@@ -257,11 +271,15 @@ impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Request::List => f.write_str("List"),
-            Request::Extract { encoding, entries, total_bytes } => f
+            Request::Extract {
+                encoding,
+                entries,
+                raw_name,
+            } => f
                 .debug_struct("Extract")
                 .field("encoding", encoding)
                 .field("entries", &entries.as_ref().map(Vec::len))
-                .field("total_bytes", total_bytes)
+                .field("raw_name", raw_name)
                 .finish(),
             Request::Test => f.write_str("Test"),
             Request::Password(_) => f.write_str("Password(<redacted>)"),
@@ -278,7 +296,11 @@ impl Request {
             Request::List => {
                 e.u8(1);
             }
-            Request::Extract { encoding, entries, total_bytes } => {
+            Request::Extract {
+                encoding,
+                entries,
+                raw_name,
+            } => {
                 e.u8(2).text(encoding);
                 match entries {
                     Some(list) => {
@@ -291,7 +313,7 @@ impl Request {
                         e.u8(0);
                     }
                 }
-                e.u64(*total_bytes);
+                e.text(raw_name);
             }
             Request::Test => {
                 e.u8(3);
@@ -322,7 +344,11 @@ impl Request {
                     let n = d.count(4)?;
                     (0..n).map(|_| d.u32()).collect::<Result<Vec<_>, _>>()
                 })?;
-                Request::Extract { encoding, entries, total_bytes: d.u64()? }
+                Request::Extract {
+                    encoding,
+                    entries,
+                    raw_name: d.text()?,
+                }
             }
             3 => Request::Test,
             4 => {
@@ -410,19 +436,14 @@ pub struct Format {
     pub encrypted_names: bool,
     /// Entries are compressed together (7z, rar solid, tar.*).
     pub solid: bool,
+    /// A compressed file that is no archive (`notes.txt.gz`): one entry,
+    /// whose name the archive doesn't store.
+    pub compressed_file: bool,
     pub volumes: u32,
     /// The archive was made on DOS or Windows: `\` separates folders and
     /// names without a UTF-8 flag are in an OEM code page.
     pub made_on_dos: bool,
     pub comment: Option<String>,
-}
-
-/// A limit the worker reached (see `limits`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LimitHit {
-    pub kind: crate::limits::Kind,
-    pub limit: u64,
-    pub by_free_space: bool,
 }
 
 fn limit_tag(k: crate::limits::Kind) -> u8 {
@@ -433,6 +454,7 @@ fn limit_tag(k: crate::limits::Kind) -> u8 {
         K::Entries => 2,
         K::EntryRatio => 3,
         K::NestDepth => 4,
+        K::FreeSpace => 5,
     }
 }
 
@@ -444,6 +466,7 @@ fn limit_from_tag(t: u8) -> Result<crate::limits::Kind, ProtoError> {
         2 => K::Entries,
         3 => K::EntryRatio,
         4 => K::NestDepth,
+        5 => K::FreeSpace,
         t => return Err(ProtoError::BadTag(t)),
     })
 }
@@ -455,18 +478,32 @@ pub enum Reply {
     /// A batch of entries; as many as fit in a frame.
     Entries(Vec<Entry>),
     /// The listing is complete.
-    Listed { entries: u32 },
-    Progress { bytes: u64, items: u64 },
+    Listed {
+        entries: u32,
+    },
+    Progress {
+        bytes: u64,
+        items: u64,
+    },
     /// A password is needed (`wrong`: the last one didn't work).
-    NeedPassword { wrong: bool },
+    NeedPassword {
+        wrong: bool,
+    },
     /// A limit was reached; the worker waits for `Request::GoOn`.
-    Limit(LimitHit),
+    Limit(Exceeded),
     /// An entry was skipped, with the reason in plain words.
-    Skipped { index: u32, reason: String },
+    Skipped {
+        index: u32,
+        reason: String,
+    },
     /// The job finished. `written`: the top-level names it wrote in staging.
-    Done { written: Vec<Vec<u8>> },
+    Done {
+        written: Vec<Vec<u8>>,
+    },
     /// The job failed, with the reason in plain words.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 /// Bytes an entry takes at least (empty path, no options).
@@ -482,6 +519,7 @@ impl Reply {
                     .bool(f.encrypted)
                     .bool(f.encrypted_names)
                     .bool(f.solid)
+                    .bool(f.compressed_file)
                     .u32(f.volumes)
                     .bool(f.made_on_dos)
                     .opt_text(f.comment.as_deref());
@@ -511,7 +549,7 @@ impl Reply {
                 e.u8(5).bool(*wrong);
             }
             Reply::Limit(l) => {
-                e.u8(6).u8(limit_tag(l.kind)).u64(l.limit).bool(l.by_free_space);
+                e.u8(6).u8(limit_tag(l.kind)).u64(l.limit);
             }
             Reply::Skipped { index, reason } => {
                 e.u8(7).u32(*index).text(reason);
@@ -537,6 +575,7 @@ impl Reply {
                 encrypted: d.bool()?,
                 encrypted_names: d.bool()?,
                 solid: d.bool()?,
+                compressed_file: d.bool()?,
                 volumes: d.u32()?,
                 made_on_dos: d.bool()?,
                 comment: d.opt(Dec::text)?,
@@ -561,17 +600,24 @@ impl Reply {
                 Reply::Entries(list)
             }
             3 => Reply::Listed { entries: d.u32()? },
-            4 => Reply::Progress { bytes: d.u64()?, items: d.u64()? },
+            4 => Reply::Progress {
+                bytes: d.u64()?,
+                items: d.u64()?,
+            },
             5 => Reply::NeedPassword { wrong: d.bool()? },
-            6 => Reply::Limit(LimitHit {
+            6 => Reply::Limit(Exceeded {
                 kind: limit_from_tag(d.u8()?)?,
                 limit: d.u64()?,
-                by_free_space: d.bool()?,
             }),
-            7 => Reply::Skipped { index: d.u32()?, reason: d.text()? },
+            7 => Reply::Skipped {
+                index: d.u32()?,
+                reason: d.text()?,
+            },
             8 => {
                 let n = d.count(4)?;
-                let written = (0..n).map(|_| d.bytes().map(<[u8]>::to_vec)).collect::<Result<_, _>>()?;
+                let written = (0..n)
+                    .map(|_| d.bytes().map(<[u8]>::to_vec))
+                    .collect::<Result<_, _>>()?;
                 Reply::Done { written }
             }
             9 => Reply::Failed { reason: d.text()? },
@@ -608,6 +654,7 @@ mod tests {
                 encrypted: true,
                 encrypted_names: false,
                 solid: false,
+                compressed_file: false,
                 volumes: 1,
                 made_on_dos: true,
                 comment: Some("hi".into()),
@@ -615,11 +662,26 @@ mod tests {
             Reply::Entries((0..5).map(entry).collect()),
             Reply::Entries(vec![]),
             Reply::Listed { entries: 5 },
-            Reply::Progress { bytes: u64::MAX, items: 7 },
+            Reply::Progress {
+                bytes: u64::MAX,
+                items: 7,
+            },
             Reply::NeedPassword { wrong: true },
-            Reply::Limit(LimitHit { kind: crate::limits::Kind::Ratio, limit: 100, by_free_space: false }),
-            Reply::Skipped { index: 9, reason: "The item has no name.".into() },
-            Reply::Done { written: vec![b"a".to_vec(), b"\xFF".to_vec()] },
+            Reply::Limit(Exceeded {
+                kind: crate::limits::Kind::Ratio,
+                limit: 100,
+            }),
+            Reply::Limit(Exceeded {
+                kind: crate::limits::Kind::FreeSpace,
+                limit: u64::MAX,
+            }),
+            Reply::Skipped {
+                index: 9,
+                reason: "The item has no name.".into(),
+            },
+            Reply::Done {
+                written: vec![b"a".to_vec(), b"\xFF".to_vec()],
+            },
             Reply::Failed { reason: "x".into() },
         ]
     }
@@ -635,8 +697,16 @@ mod tests {
     fn requests_round_trip() {
         for r in [
             Request::List,
-            Request::Extract { encoding: "Shift_JIS".into(), entries: Some(vec![1, 2, 3]), total_bytes: 9 },
-            Request::Extract { encoding: "UTF-8".into(), entries: None, total_bytes: 0 },
+            Request::Extract {
+                encoding: "Shift_JIS".into(),
+                entries: Some(vec![1, 2, 3]),
+                raw_name: "notes.txt".into(),
+            },
+            Request::Extract {
+                encoding: "UTF-8".into(),
+                entries: None,
+                raw_name: String::new(),
+            },
             Request::Test,
             Request::Password(Zeroizing::new(b"hunter2".to_vec())),
             Request::Password(Zeroizing::new(vec![])),
@@ -673,14 +743,20 @@ mod tests {
         assert_eq!(Reply::decode(&[200]), Err(ProtoError::BadTag(200)));
         // A count of 4 billion entries in a tiny frame: refused before any
         // allocation.
-        assert_eq!(Reply::decode(&[2, 0xFF, 0xFF, 0xFF, 0xFF]), Err(ProtoError::Truncated));
+        assert_eq!(
+            Reply::decode(&[2, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Err(ProtoError::Truncated)
+        );
         // A string longer than MAX_STRING.
         let mut f = vec![9];
         f.extend_from_slice(&((MAX_STRING as u32) + 1).to_le_bytes());
         f.resize(f.len() + MAX_STRING + 1, b'a');
         assert_eq!(Reply::decode(&f), Err(ProtoError::TooLarge));
         // Invalid UTF-8 in text.
-        assert_eq!(Reply::decode(&[9, 1, 0, 0, 0, 0xFF]), Err(ProtoError::BadText));
+        assert_eq!(
+            Reply::decode(&[9, 1, 0, 0, 0, 0xFF]),
+            Err(ProtoError::BadText)
+        );
         // A bool that is neither 0 nor 1.
         assert_eq!(Reply::decode(&[5, 2]), Err(ProtoError::BadTag(2)));
         // An unknown entry kind.
@@ -711,9 +787,13 @@ mod tests {
 
     #[test]
     fn long_strings_are_cut_when_sent() {
-        let r = Reply::Failed { reason: "é".repeat(MAX_STRING) };
+        let r = Reply::Failed {
+            reason: "é".repeat(MAX_STRING),
+        };
         match Reply::decode(&r.encode()).unwrap() {
-            Reply::Failed { reason } => assert!(reason.len() <= MAX_STRING && reason.chars().all(|c| c == 'é')),
+            Reply::Failed { reason } => {
+                assert!(reason.len() <= MAX_STRING && reason.chars().all(|c| c == 'é'))
+            }
             _ => unreachable!(),
         }
     }
