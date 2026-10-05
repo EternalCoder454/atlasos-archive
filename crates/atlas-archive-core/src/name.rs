@@ -229,7 +229,14 @@ fn tag_flag(pieces: &[Piece], i: usize) -> usize {
     }
     let tags = pieces[i + 1..]
         .iter()
-        .take_while(|p| matches!(p, Piece::Char('\u{E0020}'..='\u{E007E}')))
+        // Subdivision codes are lowercase letters and digits: nothing else
+        // can hide in a flag.
+        .take_while(|p| {
+            matches!(
+                p,
+                Piece::Char('\u{E0030}'..='\u{E0039}' | '\u{E0061}'..='\u{E007A}')
+            )
+        })
         .count();
     let ends = pieces.get(i + 1 + tags) == Some(&Piece::Char('\u{E007F}'));
     if (2..=7).contains(&tags) && ends {
@@ -490,6 +497,10 @@ mod tests {
         assert!(show(&hidden).0.contains("<U+E0068>"));
         assert!(show("🏴\u{E0067}\u{E0062}.png").1, "no cancel tag");
         assert!(show("x\u{E0067}\u{E0062}\u{E007F}").1, "no flag");
+        assert!(
+            show("🏴\u{E0048}\u{E0049}\u{E0021}\u{E007F}").1,
+            "tags outside a-z and 0-9 hide text"
+        );
     }
 
     #[test]

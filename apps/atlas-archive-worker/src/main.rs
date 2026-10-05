@@ -9,6 +9,7 @@
 //! the worker died, and the client says so.
 
 mod sandbox;
+mod seccomp;
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -110,6 +111,14 @@ fn run(conn: &mut impl Conn, archive: Option<OwnedFd>, staging: Option<OwnedFd>)
     };
     if kind_of(&archive) != Some(libc::S_IFREG) {
         return fail(conn, "The archive isn't a regular file.");
+    }
+    // Read-only, so not even a compromised parser can change the user's
+    // archive.
+    // SAFETY: F_GETFL takes no pointer.
+    if unsafe { libc::fcntl(archive.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE
+        != libc::O_RDONLY
+    {
+        return fail(conn, "The archive wasn't opened read-only.");
     }
     match request {
         Request::List => job::list(conn, archive.as_fd()),

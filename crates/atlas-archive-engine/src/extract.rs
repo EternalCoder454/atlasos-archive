@@ -329,6 +329,13 @@ impl Writer {
                 check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
             });
             if let Err(e) = r {
+                // Every name of it: the hard links made above share the
+                // mode that couldn't be fixed.
+                for (link, n) in tree.nodes.iter().enumerate() {
+                    if n.kind == Kind::Hardlink && n.hardlink == Some(id) {
+                        self.unlink(tree, link as u32)?;
+                    }
+                }
                 self.unlink(tree, id)?;
                 self.files.remove(&id);
                 self.failed(id, e);
@@ -624,7 +631,14 @@ mod tests {
     fn a_launcher_that_cannot_be_stripped_is_removed() {
         let s = Scratch::new("failclosed");
         let outside = Scratch::new("failclosed-outside");
-        let tree = Tree::build(fmt(), &[e(0, "x.desktop", Kind::File, 0o755, None)], None);
+        let tree = Tree::build(
+            fmt(),
+            &[
+                e(0, "x.desktop", Kind::File, 0o755, None),
+                e(1, "y", Kind::Hardlink, 0o755, Some("x.desktop")),
+            ],
+            None,
+        );
         let mut w = Writer::new(open_dir(&s.0).unwrap(), 0o022);
         let mut out = w.file(&tree, 1, Some(5)).unwrap();
         out.write_all(b"hello").unwrap();
@@ -638,6 +652,10 @@ mod tests {
         let failed = w.finish(&tree, None).unwrap();
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(std::fs::symlink_metadata(s.0.join("x.desktop")).is_err());
+        assert!(
+            std::fs::symlink_metadata(s.0.join("y")).is_err(),
+            "its other names go too"
+        );
         let m = std::fs::metadata(&victim).unwrap();
         assert_eq!(m.permissions().mode() & 0o777, 0o755, "never followed");
     }

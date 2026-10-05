@@ -5,13 +5,17 @@ use std::ffi::c_uint;
 use std::os::fd::{BorrowedFd, RawFd};
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 /// The newest Landlock ABI this code was written and tested against; older
 /// kernels get what they support (best effort), newer ones no more.
 const ABI_TESTED: ABI = ABI::V9;
+/// What the worker won't run without: the file system rights, TCP and the
+/// scopes (no signals or abstract sockets outside). Newer rights (unix
+/// socket paths) are best effort; the seccomp filter denies sockets anyway.
+const ABI_REQUIRED: ABI = ABI::V6;
 
 /// Address space: the largest 7z dictionary is 1.5 GiB.
 const MAX_ADDRESS_SPACE: u64 = 4 << 30;
@@ -56,8 +60,9 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> Result<(), String> 
 }
 
 /// Locks the process down: no new privileges, no core dumps, resource
-/// limits, the C.UTF-8 locale, and Landlock (read `/usr`; write only below
-/// `staging`; no network, no signals or abstract sockets outside).
+/// limits, the C.UTF-8 locale, Landlock (read `/usr`; write only below
+/// `staging`; run nothing; no network, no signals or abstract sockets
+/// outside), then the system call filter (`seccomp`).
 pub fn enter(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     // SAFETY: plain prctl calls with integer arguments.
     unsafe {
@@ -77,7 +82,8 @@ pub fn enter(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     if unsafe { libc::setlocale(libc::LC_ALL, c"C.UTF-8".as_ptr()) }.is_null() {
         return Err("The C.UTF-8 locale is missing.".into());
     }
-    landlock(staging)
+    landlock(staging)?;
+    crate::seccomp::install()
 }
 
 fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
@@ -96,12 +102,30 @@ fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
         | AccessFs::RemoveDir
         | AccessFs::Refer;
     let usr = PathFd::new("/usr").map_err(|e| format!("Couldn't set up the sandbox: {e}"))?;
+    // A test build may run on a kernel without Landlock; a real one refuses
+    // a kernel short of the required rights.
+    let required = if cfg!(feature = "unsandboxed") {
+        CompatLevel::BestEffort
+    } else {
+        CompatLevel::HardRequirement
+    };
     let mut ruleset = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))
+        .set_compatibility(required)
+        .handle_access(AccessFs::from_all(ABI_REQUIRED))
+        .and_then(|r| r.handle_access(AccessNet::from_all(ABI_REQUIRED)))
+        .and_then(|r| r.scope(Scope::from_all(ABI_REQUIRED)))
+        .map(|r| r.set_compatibility(CompatLevel::BestEffort))
+        .and_then(|r| r.handle_access(AccessFs::from_all(abi)))
         .and_then(|r| r.handle_access(AccessNet::from_all(abi)))
         .and_then(|r| r.scope(Scope::from_all(abi)))
         .and_then(|r| r.create())
-        .and_then(|r| r.add_rule(PathBeneath::new(usr, AccessFs::from_read(abi))))
+        // Reading, never running: the worker starts no program.
+        .and_then(|r| {
+            r.add_rule(PathBeneath::new(
+                usr,
+                AccessFs::from_read(abi) & !AccessFs::Execute,
+            ))
+        })
         .map_err(fail)?;
     if let Some(dir) = staging {
         ruleset = ruleset
@@ -111,10 +135,8 @@ fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     let status = ruleset.restrict_self().map_err(fail)?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => Ok(()),
-        RulesetStatus::PartiallyEnforced => {
-            eprintln!("atlas-archive-worker: this kernel supports only part of the sandbox; using that part");
-            Ok(())
-        }
+        // Everything required is in force (or creating the ruleset failed).
+        RulesetStatus::PartiallyEnforced => Ok(()),
         RulesetStatus::NotEnforced if cfg!(feature = "unsandboxed") => {
             eprintln!("atlas-archive-worker: running WITHOUT a sandbox (test build)");
             Ok(())
@@ -191,6 +213,44 @@ mod tests {
             1
         );
         assert!(std::net::TcpStream::connect("127.0.0.1:9").is_err());
+        // The system call filter: no sockets of any family, no processes,
+        // no extended attributes; threads still work.
+        let eperm =
+            |r: i64| r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        // SAFETY: plain calls; a descriptor that comes back is leaked.
+        unsafe {
+            assert!(
+                eperm(libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0).into()),
+                "UDP"
+            );
+            assert!(
+                eperm(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0).into()),
+                "unix"
+            );
+            assert!(
+                eperm(libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, 0).into()),
+                "netlink"
+            );
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::_exit(0);
+            }
+            assert!(eperm(pid.into()), "fork");
+        }
+        assert!(
+            std::process::Command::new("/usr/bin/true")
+                .status()
+                .is_err(),
+            "run a program"
+        );
+        assert_eq!(std::thread::spawn(|| 7).join().unwrap(), 7, "threads");
+        let ok =
+            std::ffi::CString::new(dir.join("staging/ok").into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: C strings and a buffer of the given length.
+        let r =
+            unsafe { libc::setxattr(ok.as_ptr(), c"user.x".as_ptr(), b"1".as_ptr().cast(), 1, 0) };
+        assert!(eperm(r.into()), "xattr");
     }
 
     #[test]

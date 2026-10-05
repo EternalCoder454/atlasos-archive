@@ -93,12 +93,29 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    nothing else open.
 2. Before it reads a byte, the worker sets `PR_SET_NO_NEW_PRIVS` and
    `PR_SET_DUMPABLE 0` and applies a Landlock ruleset: it may read its
-   archive descriptors and `/usr` (for `7z`), and write only below the staging
-   folder. Network is denied (Landlock ABI 4), as are signals and abstract
-   sockets outside it (ABI 6). Limits: `RLIMIT_AS` 4 GiB (the largest 7z
-   dictionary is 1.5 GiB), `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256. On a kernel
-   without Landlock the worker refuses to run unless the build was made for
-   tests.
+   archive descriptors and `/usr` (never execute), and write only below the
+   staging folder (files, folders and symlinks; never devices, FIFOs or
+   sockets). TCP is denied (ABI 4), as are signals and abstract sockets
+   outside it (ABI 6); the worker refuses to run on a kernel short of ABI 6,
+   and newer rights (unix socket paths, ABI 9) are best effort. Then a
+   seccomp filter denies what Landlock doesn't rule: `socket` and
+   `socketpair` of every family (so no UDP, netlink or unix sockets at all),
+   starting processes (`fork`, `vfork`, `clone` without `CLONE_THREAD`,
+   `clone3`, `execve`, `execveat`; threads still work), namespaces,
+   `ptrace` and `process_vm_*`, extended attributes and ACLs (`*setxattr*`),
+   io_uring, BPF, perf, keyrings, `userfaultfd`, mounts, modules and the
+   other administrative calls; a call from another architecture's table
+   kills it. So nothing a compromised parser starts can outlive the worker
+   and keep writing to staging while the client audits it. Limits:
+   `RLIMIT_AS` 4 GiB (the largest 7z dictionary is 1.5 GiB),
+   `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256. On a kernel without Landlock the
+   worker refuses to run unless the build was made for tests. The client
+   starts it in its own process group with `PR_SET_PDEATHSIG(SIGKILL)` and
+   kills the group. The `7z` and `unrar` jobs, which must start a program,
+   get their own profile when those drivers land: the tool runs in a new
+   PID namespace (inside a user namespace) whose init is the worker, so
+   killing the worker kills every process the tool started, and the worker
+   reaps them all before it audits.
 3. Requests and replies are length-prefixed binary frames (`core::proto`),
    capped at 1 MiB each, 64 MiB per listing. The client treats every reply as
    untrusted: it re-checks paths, names, counts and sizes. A compromised
@@ -166,9 +183,11 @@ The writer (`engine::extract`) works below one descriptor, the staging folder:
 Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
 
 - **Extract to `<name>/`** (and Extract All): staging itself becomes the
-  folder. If the archive holds one top-level folder, that folder is moved
-  out instead, so `photos.zip` holding `photos/` never gives
-  `photos/photos/`, under the same `Tree::lone_top` rule as Extract here
+  folder. If the archive holds one top-level folder with that same name,
+  that folder is moved out instead, so `photos.zip` holding `photos/` never
+  gives `photos/photos/` (a lone folder with another name stays inside, so
+  the result is always `<name>`), under the same `Tree::lone_top` rule as
+  Extract here
   (a folder holding `l -> ../.ssh/x` stays inside the new folder). A name in
   use becomes `name (2)`.
 - **Extract here** (smart, as Explorer, macOS and PeaZip do): an archive
@@ -189,15 +208,26 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   space on <device> for <archive>", and staging is removed.
 - **The staging audit** (`core::audit`, one walker used in two places):
   walks staging by descriptor (`openat2` as above, never following links,
-  depth-first with the node, depth and path-length caps of the tree) and
-  enforces the extraction rules on what is actually there, whoever wrote
-  it: anything but regular files, folders and symlinks is removed; files
-  with more than one link are removed unless both names are in the tree
-  (hard links the writer made); setuid, setgid and sticky bits are dropped;
-  launcher files lose their execute bits; every symlink is re-checked with
-  `link::check_symlink` against the walked tree and removed when it fails;
-  every name must already be its own disk form (`path::parse` of it gives
-  it back unchanged), else the entry is removed. Removals are reported as
+  breadth first, one descriptor open at a time, with the node, depth and
+  path-length caps of the tree; past one, the audit fails and staging is
+  deleted). Staging itself is set to 0700 first (the move out gives the
+  folder its final mode). The audit describes what is there as archive
+  entries and builds a `Tree` from them, so the same rules decide: anything but regular files, folders
+  and symlinks is removed; a file with more links than names in staging (a
+  hard link to a file outside) is removed by every name, before any mode is
+  touched; the others become hard link entries of their first name; every
+  symlink is checked as an archive's would be and removed when it fails;
+  a name that isn't its own disk form is renamed to it
+  (`renameat2(RENAME_NOREPLACE)`, through a temporary name first so no
+  order of clashing names can fail; paths already in disk form keep their
+  names, clashes get `name (2)`); setuid, setgid and sticky bits go, the
+  umask applies, every extended attribute but the SELinux label goes
+  (ACLs included), and a file loses its execute bits when any of its names
+  is a launcher or a launcher-named link resolves to it (resolved by the
+  kernel below staging, after the renames). Modes and attributes are fixed
+  through an `O_PATH` handle checked (device, inode, type) to be what the
+  walk found. The tree it returns is built again from what is left, so it
+  holds only items on disk under their names. Removals are reported as
   skipped entries.
 - **After a libarchive extraction** the client runs the audit itself, once
   the worker has exited: it kills (`SIGKILL`) and reaps (`waitpid`) the
