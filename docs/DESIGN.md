@@ -146,7 +146,8 @@ The writer (`engine::extract`) works below one descriptor, the staging folder:
   wrote (looked up by its sanitised path); others become skipped entries.
 - Device nodes, FIFOs and sockets are never created. setuid, setgid and
   sticky bits are dropped; permissions are `mode & 0777 & ~umask`, with the
-  owner's read (and write, for files) kept. Owners, ACLs and xattrs are not
+  owner's read and write kept (and search, for folders), so nothing extracted
+  is locked away from its owner. Owners, ACLs and xattrs are not
   restored. Files are written 0600 and get their final mode and times
   (`futimens`) when complete; folders get theirs last, deepest first.
 - Each entry's bytes are counted as they are written. More than its declared

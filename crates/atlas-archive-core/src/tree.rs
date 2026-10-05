@@ -99,15 +99,63 @@ pub struct Tree {
     /// Some name holds controls, bidi characters or undecodable bytes.
     pub unusual_names: bool,
     by_name: HashMap<(u32, Box<str>), u32>,
+    /// Raw path of each non-folder node, to tell a duplicate from a clash.
+    raw_of: HashMap<u32, Box<[u8]>>,
+    links: Vec<PendingLink>,
+}
+
+/// What `Tree::add` did with an entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Added {
+    /// Its path was refused; it is in `skipped`.
+    Skipped,
+    Node {
+        id: u32,
+        /// A node already placed had to give up its name to a folder: it is
+        /// now `name (2)`. `from` is its old disk path, for a writer that has
+        /// written it already.
+        moved: Option<Moved>,
+        /// The same path was stored before (this archive index); this entry
+        /// replaces it. A writer removes what it wrote for the earlier one.
+        replaced: Option<u32>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Moved {
+    pub node: u32,
+    pub from: String,
+}
+
+/// A link entry's target, resolved once every path is known.
+#[derive(Clone, Debug)]
+struct PendingLink {
+    node: u32,
+    index: u32,
+    target: Vec<u8>,
+    encoding: NameEncoding,
 }
 
 impl Tree {
-    /// Builds the tree. `encoding`: the user's choice, or `None` to detect
-    /// it from the names not marked UTF-8.
+    /// Builds the tree from a whole listing. `encoding`: the user's choice,
+    /// or `None` to detect it from the names not marked UTF-8.
     pub fn build(format: Format, entries: &[Entry], encoding: Option<NameEncoding>) -> Tree {
         let encoding = encoding.unwrap_or_else(|| {
             name::detect(entries.iter().filter(|e| !e.utf8).map(|e| e.path.as_slice()), format.made_on_dos)
         });
+        let mut t = Tree::new(format, encoding);
+        t.by_name.reserve(entries.len());
+        for e in entries {
+            t.add(e);
+        }
+        t.finish();
+        t
+    }
+
+    /// An empty tree, for building one entry at a time as a streamed archive
+    /// is read (`add`, then `finish`). The encoding can't be detected then:
+    /// it is the one chosen when the archive was listed, or UTF-8.
+    pub fn new(format: Format, encoding: NameEncoding) -> Tree {
         let root = Node {
             parent: ROOT,
             name: Component { display: String::new(), disk: String::new(), unusual: false, renamed: false },
@@ -123,7 +171,7 @@ impl Tree {
             refused: None,
             children: Vec::new(),
         };
-        let mut t = Tree {
+        Tree {
             format,
             encoding,
             nodes: vec![root],
@@ -131,108 +179,124 @@ impl Tree {
             files: 0,
             folders: 0,
             unusual_names: false,
-            by_name: HashMap::with_capacity(entries.len()),
-        };
-        // The node each archive index became, for hard links.
-        let mut node_of: HashMap<u32, u32> = HashMap::with_capacity(entries.len());
-        // Raw path of each non-folder node, to tell a duplicate from a clash.
-        let mut raw_of: HashMap<u32, &[u8]> = HashMap::new();
-
-        for e in entries {
-            let enc = if e.utf8 { NameEncoding::Utf8 } else { encoding };
-            let p = match path::parse(&e.path, enc, t.format.made_on_dos) {
-                Ok(p) => p,
-                Err(err) => {
-                    t.skip(e, enc, err.to_string());
-                    continue;
-                }
-            };
-            let (last, dirs) = p.components.split_last().expect("at least one component");
-            let mut at = ROOT;
-            for c in dirs {
-                at = t.folder(at, c, None);
-            }
-            if e.kind == Kind::Dir {
-                let id = t.folder(at, last, Some(e));
-                node_of.insert(e.index, id);
-                continue;
-            }
-            if let Some(&old) = t.by_name.get(&(at, last.disk.as_str().into())) {
-                let same = t.nodes[old as usize].kind != Kind::Dir && raw_of.get(&old) == Some(&e.path.as_slice());
-                if same {
-                    // Stored twice: the later one wins.
-                    let old_index = t.nodes[old as usize].entry.expect("listed");
-                    t.skipped.push(Skip {
-                        index: old_index,
-                        path: p.display_path(),
-                        reason: "A later item in the archive has the same name.".into(),
-                    });
-                    node_of.remove(&old_index);
-                    t.set_entry(old, e);
-                    node_of.insert(e.index, old);
-                    continue;
-                }
-            }
-            let mut name = last.clone();
-            t.free_name(at, &mut name);
-            let id = t.add(at, name, e.kind);
-            t.set_entry(id, e);
-            raw_of.insert(id, &e.path);
-            node_of.insert(e.index, id);
+            by_name: HashMap::new(),
+            raw_of: HashMap::new(),
+            links: Vec::new(),
         }
+    }
 
-        // Links, now that every path is known.
-        for e in entries {
-            let Some(&id) = node_of.get(&e.index) else { continue };
-            let enc = if e.utf8 { NameEncoding::Utf8 } else { encoding };
-            let refused = match e.kind {
+    /// Places one entry. Links are placed but checked only by `finish`.
+    pub fn add(&mut self, e: &Entry) -> Added {
+        let enc = if e.utf8 { NameEncoding::Utf8 } else { self.encoding };
+        let p = match path::parse(&e.path, enc, self.format.made_on_dos) {
+            Ok(p) => p,
+            Err(err) => {
+                self.skip(e, enc, err.to_string());
+                return Added::Skipped;
+            }
+        };
+        let (last, dirs) = p.components.split_last().expect("at least one component");
+        let mut at = ROOT;
+        let mut moved = None;
+        for c in dirs {
+            let (id, m) = self.folder(at, c, None);
+            at = id;
+            moved = moved.or(m);
+        }
+        if e.kind == Kind::Dir {
+            let (id, m) = self.folder(at, last, Some(e));
+            return Added::Node { id, moved: moved.or(m), replaced: None };
+        }
+        if let Some(&old) = self.by_name.get(&(at, last.disk.as_str().into()))
+            && self.nodes[old as usize].kind != Kind::Dir
+            && self.raw_of.get(&old).is_some_and(|r| **r == *e.path)
+        {
+            // Stored twice: the later one wins.
+            let old_index = self.nodes[old as usize].entry.expect("listed");
+            self.skipped.push(Skip {
+                index: old_index,
+                path: p.display_path(),
+                reason: "A later item in the archive has the same name.".into(),
+            });
+            self.links.retain(|l| l.node != old);
+            self.set_entry(old, e);
+            self.pend_link(old, e, enc);
+            return Added::Node { id: old, moved, replaced: Some(old_index) };
+        }
+        let mut name = last.clone();
+        self.free_name(at, &mut name);
+        let id = self.push(at, name, e.kind);
+        self.set_entry(id, e);
+        self.raw_of.insert(id, e.path.clone().into_boxed_slice());
+        self.pend_link(id, e, enc);
+        Added::Node { id, moved, replaced: None }
+    }
+
+    fn pend_link(&mut self, node: u32, e: &Entry, encoding: NameEncoding) {
+        if matches!(e.kind, Kind::Symlink | Kind::Hardlink) {
+            let target = e.link.clone().unwrap_or_default();
+            self.links.push(PendingLink { node, index: e.index, target, encoding });
+        }
+    }
+
+    /// Checks links against the whole tree, refuses devices, and adds up
+    /// folder sizes and counts. Call once, after the last `add`.
+    pub fn finish(&mut self) {
+        let links = std::mem::take(&mut self.links);
+        for l in &links {
+            let id = l.node;
+            let refused = match self.nodes[id as usize].kind {
                 Kind::Symlink => {
-                    let target = e.link.as_deref().unwrap_or_default();
-                    let at = t.entry_path(id);
-                    match link::check_symlink(&at, target, enc, t.format.made_on_dos, |p| t.is_symlink(p)) {
+                    let at = self.entry_path(id);
+                    match link::check_symlink(&at, &l.target, l.encoding, self.format.made_on_dos, |p| {
+                        self.is_symlink(p)
+                    }) {
                         Ok(s) => {
-                            t.nodes[id as usize].symlink = Some(s);
+                            self.nodes[id as usize].symlink = Some(s);
                             None
                         }
                         Err(err) => Some(Refused::Link(err)),
                     }
                 }
-                Kind::Hardlink => {
-                    let target = link::check_hardlink(e.link.as_deref().unwrap_or_default(), enc, t.format.made_on_dos)
+                _ => {
+                    let target = link::check_hardlink(&l.target, l.encoding, self.format.made_on_dos)
                         .ok()
-                        .and_then(|p| t.find(p.components.iter().map(|c| c.disk.as_str())));
+                        .and_then(|p| self.find(p.components.iter().map(|c| c.disk.as_str())));
                     match target {
                         Some(to)
-                            if t.nodes[to as usize].kind == Kind::File
-                                && t.nodes[to as usize].entry.is_some_and(|i| i < e.index) =>
+                            if self.nodes[to as usize].kind == Kind::File
+                                && self.nodes[to as usize].entry.is_some_and(|i| i < l.index) =>
                         {
-                            t.nodes[id as usize].hardlink = Some(to);
-                            t.nodes[id as usize].size = t.nodes[to as usize].size;
+                            self.nodes[id as usize].hardlink = Some(to);
+                            self.nodes[id as usize].size = self.nodes[to as usize].size;
                             None
                         }
                         _ => Some(Refused::HardlinkTarget),
                     }
                 }
-                Kind::Special => Some(Refused::Special),
-                Kind::File | Kind::Dir => None,
             };
-            t.nodes[id as usize].refused = refused;
+            self.nodes[id as usize].refused = refused;
+        }
+        for n in &mut self.nodes[1..] {
+            if n.kind == Kind::Special {
+                n.refused = Some(Refused::Special);
+            }
         }
 
         // Folder sizes: a child's id is always above its folder's.
-        for id in (1..t.nodes.len()).rev() {
-            let (size, parent) = (t.nodes[id].size, t.nodes[id].parent as usize);
-            t.nodes[parent].size = t.nodes[parent].size.saturating_add(size);
+        for id in (1..self.nodes.len()).rev() {
+            let (size, parent) = (self.nodes[id].size, self.nodes[id].parent as usize);
+            self.nodes[parent].size = self.nodes[parent].size.saturating_add(size);
         }
-        for n in &t.nodes[1..] {
+        for n in &self.nodes[1..] {
             if n.kind == Kind::Dir {
-                t.folders += 1;
+                self.folders += 1;
             } else {
-                t.files += 1;
+                self.files += 1;
             }
-            t.unusual_names |= n.name.unusual;
+            self.unusual_names |= n.name.unusual;
         }
-        t
+        self.raw_of = HashMap::new();
     }
 
     fn skip(&mut self, e: &Entry, enc: NameEncoding, reason: String) {
@@ -242,7 +306,7 @@ impl Tree {
         self.skipped.push(Skip { index: e.index, path: name::display(&pieces).0, reason });
     }
 
-    fn add(&mut self, parent: u32, name: Component, kind: Kind) -> u32 {
+    fn push(&mut self, parent: u32, name: Component, kind: Kind) -> u32 {
         let id = self.nodes.len() as u32;
         self.by_name.insert((parent, name.disk.as_str().into()), id);
         self.nodes.push(Node {
@@ -276,26 +340,29 @@ impl Tree {
     }
 
     /// The folder `c` in `parent`, made if missing. A non-folder holding the
-    /// name moves to `name (2)`.
-    fn folder(&mut self, parent: u32, c: &Component, entry: Option<&Entry>) -> u32 {
+    /// name moves to `name (2)`, and is returned as moved.
+    fn folder(&mut self, parent: u32, c: &Component, entry: Option<&Entry>) -> (u32, Option<Moved>) {
         let key = (parent, Box::<str>::from(c.disk.as_str()));
+        let mut moved = None;
         let id = match self.by_name.get(&key) {
             Some(&id) if self.nodes[id as usize].kind == Kind::Dir => id,
             Some(&other) => {
+                let from = self.disk_path(other);
                 // Numbered while the name is still taken, then moved.
-                let mut moved = self.nodes[other as usize].name.clone();
-                self.free_name(parent, &mut moved);
+                let mut name = self.nodes[other as usize].name.clone();
+                self.free_name(parent, &mut name);
                 self.by_name.remove(&key);
-                self.by_name.insert((parent, moved.disk.as_str().into()), other);
-                self.nodes[other as usize].name = moved;
-                self.add(parent, c.clone(), Kind::Dir)
+                self.by_name.insert((parent, name.disk.as_str().into()), other);
+                self.nodes[other as usize].name = name;
+                moved = Some(Moved { node: other, from });
+                self.push(parent, c.clone(), Kind::Dir)
             }
-            None => self.add(parent, c.clone(), Kind::Dir),
+            None => self.push(parent, c.clone(), Kind::Dir),
         };
         if let Some(e) = entry {
             self.set_entry(id, e);
         }
-        id
+        (id, moved)
     }
 
     /// Numbers `name` until no sibling holds its disk form.
@@ -522,6 +589,42 @@ mod tests {
         f.made_on_dos = true;
         let t = Tree::build(f, &[e(0, "a\\b.txt", Kind::File)], None);
         assert_eq!(paths(&t), ["a", "a/b.txt"]);
+    }
+
+    #[test]
+    fn one_pass_reports_moves_and_replacements() {
+        let mut t = Tree::new(fmt(), NameEncoding::Utf8);
+        let Added::Node { id: x, .. } = t.add(&e(0, "x", Kind::File)) else { panic!() };
+        // A folder needs "x": the file moves, and the writer is told.
+        let Added::Node { moved, .. } = t.add(&e(1, "x/y", Kind::File)) else { panic!() };
+        assert_eq!(moved, Some(Moved { node: x, from: "x".into() }));
+        assert_eq!(t.disk_path(x), "x (2)");
+        // The same path again replaces it.
+        let Added::Node { id, replaced, .. } = t.add(&e(2, "x/y", Kind::File)) else { panic!() };
+        assert_eq!(replaced, Some(1));
+        assert_eq!(t.disk_path(id), "x/y");
+        assert_eq!(t.add(&e(3, "../z", Kind::File)), Added::Skipped);
+        t.finish();
+        assert_eq!((t.files, t.folders), (2, 1));
+        assert_eq!(t.skipped.len(), 2);
+    }
+
+    #[test]
+    fn a_replaced_link_is_checked_as_its_last_version() {
+        let t = Tree::build(
+            fmt(),
+            &[link(0, "l", Kind::Symlink, "ok"), link(1, "l", Kind::Symlink, "../../escape")],
+            None,
+        );
+        assert_eq!(t.nodes[t.find(["l"]).unwrap() as usize].refused, Some(Refused::Link(LinkError::Escapes)));
+        let t = Tree::build(
+            fmt(),
+            &[link(0, "l", Kind::Symlink, "/abs"), link(1, "l", Kind::Symlink, "ok")],
+            None,
+        );
+        let n = &t.nodes[t.find(["l"]).unwrap() as usize];
+        assert_eq!(n.refused, None);
+        assert_eq!(n.symlink.as_ref().unwrap().disk, "ok");
     }
 
     #[test]
