@@ -571,10 +571,7 @@ impl Worker {
                 Final::NeedPassword(_) if attempt == MAX_PASSWORD_TRIES => break,
                 Final::NeedPassword(wrong) => match cb.password(wrong) {
                     Some(p) if p.len() > MAX_PASSWORD => {
-                        return Err(fail(
-                            "That password is too long.",
-                            "over the length limit",
-                        ));
+                        return Err(fail("That password is too long.", "over the length limit"));
                     }
                     Some(p) => password = Some(p),
                     None => return Err(Error::PasswordRequired),
