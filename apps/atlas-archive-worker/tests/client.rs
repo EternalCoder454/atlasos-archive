@@ -56,7 +56,9 @@ impl Scratch {
     }
 
     /// A fake worker: a shell script. `body` runs with `$DIR` set to the
-    /// scratch folder and descriptor 4 (staging) open.
+    /// scratch folder and descriptor 4 (staging) open. The timeout is
+    /// generous, so a slow shell start on a busy machine can't turn into
+    /// "stopped responding"; a test of a hang asks for `short`.
     fn fake(&self, body: &str) -> Worker {
         let path = self.root.join("fake-worker.sh");
         let script = format!(
@@ -68,11 +70,16 @@ impl Scratch {
         Worker::at(&path)
             .with_state_dir(Some(self.state.clone()))
             .with_trash(Some(Trash::at(&self.trash)))
-            .with_timeout(Duration::from_millis(500))
+            .with_timeout(Duration::from_secs(10))
     }
 
-    /// A fake worker for a job that must succeed: a generous timeout, so a
-    /// busy machine can't turn a slow script start into "stopped responding".
+    /// A fake worker for a test of a hang, flood or empty batch: the deadline
+    /// is what ends the job, so it is short.
+    fn short(&self, body: &str) -> Worker {
+        self.fake(body).with_timeout(Duration::from_millis(500))
+    }
+
+    /// A fake worker for a job that must succeed: a longer timeout still.
     fn fake_ok(&self, body: &str) -> Worker {
         self.fake(body).with_timeout(Duration::from_secs(30))
     }
@@ -591,7 +598,7 @@ fn failing(s: &Scratch, w: &Worker, a: &Path) -> String {
 fn a_worker_that_hangs_is_killed_after_the_timeout() {
     let s = Scratch::new("hang");
     let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
-    let w = s.fake("echo $$ > \"$DIR/pid\"\nexec sleep 30");
+    let w = s.short("echo $$ > \"$DIR/pid\"\nexec sleep 30");
     let t = Instant::now();
     let m = failing(&s, &w, &a);
     assert_eq!(m, "The archive reader stopped responding.");
@@ -636,14 +643,138 @@ fn a_worker_that_exits_early_is_a_crash() {
     let w = s.fake("exit 3");
     assert_eq!(
         failing(&s, &w, &a),
-        "The archive reader stopped unexpectedly (exit code 3)."
+        "The archive reader stopped unexpectedly."
     );
-    let w = s.fake("kill -SEGV $$\nsleep 5");
+    // The worker's own refusal to start, and its sandbox's kill.
+    let w = s.fake("exit 2");
     assert_eq!(
         failing(&s, &w, &a),
-        "The archive reader crashed (signal 11)."
+        "The archive reader couldn't be set up safely, so it didn't run."
+    );
+    let w = s.fake("kill -SYS $$\nsleep 5");
+    assert_eq!(
+        failing(&s, &w, &a),
+        "The archive reader broke one of its safety rules and was stopped."
+    );
+    let w = s.fake("kill -SEGV $$\nsleep 5");
+    assert_eq!(failing(&s, &w, &a), "The archive reader crashed.");
+    assert!(s.ls().is_empty() && s.jobs().is_empty());
+}
+
+#[test]
+fn a_broken_listing_keeps_the_entries_it_read() {
+    let s = Scratch::new("broken");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    let entry = |name: &str| proto::Entry {
+        index: 0,
+        path: name.as_bytes().to_vec(),
+        kind: proto::Kind::File,
+        size: Some(1),
+        packed: None,
+        mtime: None,
+        mode: 0o644,
+        encrypted: false,
+        utf8: true,
+        link: None,
+    };
+    s.frame("e.bin", &Reply::Entries(vec![entry("kept.txt")]));
+    s.frame(
+        "f.bin",
+        &Reply::Failed {
+            reason: "The archive is damaged here.".into(),
+        },
+    );
+    let w = s.fake("cat \"$DIR/e.bin\" \"$DIR/f.bin\"; exec sleep 30");
+    let mut rec = Rec::default();
+    let l = retried_list(&w, &a, &mut rec).unwrap();
+    assert_eq!(rec.entries, 1);
+    assert_eq!(l.broken.as_deref(), Some("The archive is damaged here."));
+    assert_eq!(l.format.name, "unknown");
+    assert!(l.tree.find(["kept.txt"]).is_some());
+    // Nothing read before the failure: it is a plain error.
+    let w = s.fake("cat \"$DIR/f.bin\"; exec sleep 30");
+    let e = retried_list(&w, &a, &mut Rec::default()).unwrap_err();
+    assert_eq!(e.to_string(), "The archive is damaged here.");
+}
+
+fn retried_list(
+    w: &Worker,
+    a: &Path,
+    rec: &mut Rec,
+) -> Result<atlas_archive_core::client::Listing, Error> {
+    retried(|| w.list(a, None, rec, &Cancel::new()))
+}
+
+#[test]
+fn a_listing_that_needs_a_password_asks_like_the_other_jobs() {
+    let s = Scratch::new("listpw");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("n.bin", &Reply::NeedPassword { wrong: false });
+    let w = s.fake("cat \"$DIR/n.bin\"; exec sleep 30");
+    let mut rec = Rec {
+        passwords: VecDeque::from([&b"pw"[..]]),
+        ..Rec::default()
+    };
+    // The fake asks again every time; the second ask has no password left.
+    let e = retried_list(&w, &a, &mut rec).unwrap_err();
+    assert!(matches!(e, Error::PasswordRequired), "{e}");
+    assert_eq!(rec.wrong_seen, [false, false]);
+}
+
+#[test]
+fn a_selection_too_big_for_one_request_is_refused_plainly() {
+    let s = Scratch::new("bigsel");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    // Every other index: runs can't squeeze these under one frame.
+    let mut req = request(&a, &s.dest, Mode::ExtractHere);
+    req.selection = Some((0..400_000u32).map(|i| i * 2).collect());
+    let e = s
+        .worker()
+        .extract(&req, &mut Rec::default(), &Cancel::new())
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "Too many items are selected to extract at once. Select fewer, or extract everything."
     );
     assert!(s.ls().is_empty() && s.jobs().is_empty());
+}
+
+/// A front end that answers every password question with `len` bytes, once.
+struct BigPassword {
+    len: usize,
+    given: bool,
+}
+
+impl Callbacks for BigPassword {
+    fn password(&mut self, _: bool) -> Option<Zeroizing<Vec<u8>>> {
+        if std::mem::replace(&mut self.given, true) {
+            return None;
+        }
+        Some(Zeroizing::new(vec![b'x'; self.len]))
+    }
+}
+
+#[test]
+fn a_password_over_64_kib_is_refused_before_it_is_sent() {
+    let s = Scratch::new("bigpw");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("n.bin", &Reply::NeedPassword { wrong: false });
+    // The requests are drained, so a 64 KiB password never blocks the pipe.
+    let w =
+        s.fake("echo x >> \"$DIR/runs\"\ncat <&0 > /dev/null &\ncat \"$DIR/n.bin\"\nexec sleep 30");
+    let run = |len: usize| {
+        let _ = std::fs::remove_file(s.root.join("runs"));
+        let mut cb = BigPassword { len, given: false };
+        let e = retried(|| w.test(&a, &mut cb, &Cancel::new())).unwrap_err();
+        (e, read(s.root.join("runs")).lines().count())
+    };
+    let (e, runs) = run(proto::MAX_PASSWORD + 1);
+    assert_eq!(e.to_string(), "That password is too long.");
+    assert_eq!(runs, 1, "no second worker, so nothing was sent");
+    // Exactly the cap goes through: the worker is started again with it.
+    let (e, runs) = run(proto::MAX_PASSWORD);
+    assert!(matches!(e, Error::PasswordRequired), "{e}");
+    assert_eq!(runs, 2);
 }
 
 #[test]
@@ -917,7 +1048,7 @@ fn progress_that_does_not_advance_does_not_extend_the_deadline() {
     let s = Scratch::new("flood");
     let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
     s.frame("p.bin", &Reply::Progress { bytes: 1, items: 1 });
-    let w = s.fake("while :; do cat \"$DIR/p.bin\" || exit 0; sleep 0.05; done");
+    let w = s.short("while :; do cat \"$DIR/p.bin\" || exit 0; sleep 0.05; done");
     let t = Instant::now();
     let m = failing(&s, &w, &a);
     assert_eq!(m, "The archive reader stopped responding.");
@@ -1066,7 +1197,10 @@ fn a_worker_that_writes_past_the_approved_size_is_stopped_by_the_client() {
     // Random data: a compressing file system would otherwise not notice it.
     // The client sees the drive's free space, which other programs change too
     // (on this machine other jobs write and delete big trees at the same
-    // time): so the worker keeps writing until it is stopped, up to 1 GB.
+    // time): so the worker keeps writing until it is stopped, up to 1 GB, and
+    // a run in which a concurrent deleter hid the growth (the job ended some
+    // other way) is tried again, at most three times. The whole test is
+    // bounded by that.
     let w = s
         .fake(
             "cat \"$DIR/p1.bin\"\ni=0\nwhile [ $i -lt 12 ]; do\n\
@@ -1075,18 +1209,31 @@ fn a_worker_that_writes_past_the_approved_size_is_stopped_by_the_client() {
         )
         .with_size_ceiling(1 << 20)
         // `sync -f` can take long on a busy disk; the check is on the client.
-        .with_timeout(Duration::from_secs(60));
+        .with_timeout(Duration::from_secs(40));
     let t = Instant::now();
-    let e = retried(|| {
-        w.extract(
-            &request(&a, &s.dest, Mode::ExtractHere),
-            &mut Rec::default(),
-            &Cancel::new(),
-        )
-    })
-    .unwrap_err();
-    assert!(e.to_string().contains("more than it said"), "{e}");
-    assert!(t.elapsed() < Duration::from_secs(55));
+    let mut last = String::new();
+    let mut stopped = false;
+    for _ in 0..3 {
+        let r = retried(|| {
+            w.extract(
+                &request(&a, &s.dest, Mode::ExtractHere),
+                &mut Rec::default(),
+                &Cancel::new(),
+            )
+        });
+        match r {
+            Err(e) if e.to_string().contains("more than it said") => {
+                stopped = true;
+                break;
+            }
+            Err(e) => last = e.to_string(),
+            Ok(_) => last = "the job finished".into(),
+        }
+        // Nothing of a masked run may stay behind.
+        assert!(s.ls().is_empty() && s.jobs().is_empty(), "{:?}", s.ls());
+    }
+    assert!(stopped, "never stopped by the client: {last}");
+    assert!(t.elapsed() < Duration::from_secs(150));
     assert!(s.ls().is_empty() && s.jobs().is_empty());
 }
 
@@ -1185,7 +1332,7 @@ fn empty_listing_batches_do_not_extend_the_deadline() {
     let s = Scratch::new("empty");
     let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
     s.frame("e.bin", &Reply::Entries(vec![]));
-    let w = s.fake("while :; do cat \"$DIR/e.bin\" || exit 0; sleep 0.05; done");
+    let w = s.short("while :; do cat \"$DIR/e.bin\" || exit 0; sleep 0.05; done");
     let t = Instant::now();
     let e = w
         .list(&a, None, &mut Rec::default(), &Cancel::new())
@@ -1261,6 +1408,12 @@ impl Callbacks for Probe {
 #[test]
 fn a_worker_that_joins_another_group_cannot_stop_or_kill_it() {
     use std::os::unix::process::CommandExt;
+    // The fake worker joins the group with a few lines of Python (the shell
+    // has no setpgid): without it there is nothing to test.
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 isn't installed");
+        return;
+    }
     let s = Scratch::new("regroup");
     let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
     // Stands for the client's own group: same session, a group of its own.

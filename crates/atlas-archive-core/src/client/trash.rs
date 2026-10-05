@@ -76,7 +76,14 @@ impl Trash {
         let mut errors = Vec::new();
 
         match self.home_trash(item.st_dev) {
-            Ok(Some((t, fd))) => return self.put(dir, name, &t, &fd, &abs, None),
+            Ok(Some((t, fd))) => match self.put(dir, name, &t, &fd, &abs, None) {
+                Ok(done) => return Ok(done),
+                // The home Trash is on a bind mount of this drive (the same
+                // device number, a different mount): the drive's own Trash
+                // is next.
+                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => errors.push(e),
+                Err(e) => return Err(e),
+            },
             Ok(None) => {}
             Err(e) => errors.push(e),
         }
@@ -90,7 +97,10 @@ impl Trash {
             .collect::<Vec<_>>()
             .join("; ");
         log::warn!("No Trash works for {}: {why}", sys::log_path(&abs));
-        Err(io::Error::other(why))
+        // The last one's own error, so its cause (a full drive) can be told.
+        Err(errors
+            .pop()
+            .unwrap_or_else(|| io::Error::other("no Trash works")))
     }
 
     /// The home Trash, when it exists (or can be made) on the device `dev`.

@@ -35,7 +35,9 @@ pub use trash::Trash;
 use crate::audit::{self, Removed};
 use crate::limits::{Exceeded, Kind, Limits, reserve_for};
 use crate::name::NameEncoding;
-use crate::proto::{Entry, Format, MAX_LISTING, Reply, Request};
+use crate::proto::{
+    Entry, Format, MAX_FRAME, MAX_LISTING, MAX_PASSWORD, MAX_SELECTED, Reply, Request,
+};
 use crate::tree::{MAX_NODES, MAX_SKIPPED, Tree};
 use spawn::{Running, Stop};
 use staging::Staging;
@@ -62,6 +64,9 @@ const MAX_SKIP_MORE_CALLBACKS: u64 = 1_000;
 const WATCH_EVERY: Duration = Duration::from_millis(250);
 /// Progress is passed on at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(50);
+/// A selection that doesn't fit in the request.
+const TOO_MANY_SELECTED: &str =
+    "Too many items are selected to extract at once. Select fewer, or extract everything.";
 /// The longest reason kept from a reply, in characters.
 const MAX_REASON: usize = 1000;
 
@@ -104,8 +109,9 @@ fn fail(words: impl Into<String>, detail: impl fmt::Display) -> Error {
 /// items, nested too deep, a name too long) are `audit::AuditMessage`s: fixed
 /// sentences made for the user, with no OS error behind them. Those are shown,
 /// cleaned, because the archive's names and the worker's reasons are in some
-/// of them. Any other error (an OS error, whatever its text looks like) gets
-/// the generic sentence; its detail goes to the log.
+/// of them. Any other error is an OS error (whatever its text looks like): its
+/// cause is told in plain words when the table knows it, and its detail goes
+/// to the log.
 fn audit_error(e: &io::Error) -> Error {
     let own = e
         .get_ref()
@@ -113,22 +119,38 @@ fn audit_error(e: &io::Error) -> Error {
     let words = if let Some(own) = own {
         let shown = clean(&own.to_string(), MAX_REASON);
         format!("The extracted files couldn't be checked, so nothing was kept. {shown}")
+    } else if let Some(why) = cause(e) {
+        format!("The extracted files couldn't be checked, so nothing was kept, because {why}.")
     } else {
         "The extracted files couldn't be checked, so nothing was kept.".to_string()
     };
     fail(words, format!("audit: {e}"))
 }
 
+/// What an OS error means in plain words ("the drive is full"), for a
+/// sentence "... because <cause>."; `None` when it is no one the table knows
+/// or carries no code.
+fn cause(e: &io::Error) -> Option<&'static str> {
+    Some(match e.raw_os_error()? {
+        libc::ENOSPC | libc::EDQUOT => "the drive is full",
+        libc::EROFS => "the folder is read-only",
+        libc::EACCES | libc::EPERM => "Atlas Archive isn't allowed to write there",
+        libc::ENOENT => "the folder isn't there any more",
+        libc::ENOTDIR => "a folder on the way is a file now",
+        libc::ENAMETOOLONG => "a name is too long for this drive",
+        libc::EIO => "the drive reported an error",
+        libc::ESTALE => "the folder is no longer available on the network",
+        libc::ETIMEDOUT => "the drive took too long to answer",
+        libc::EMFILE | libc::ENFILE => "too many files are open",
+        libc::ENOMEM => "the computer ran out of memory",
+        libc::EXDEV => "the folder is on another drive than expected",
+        _ => return None,
+    })
+}
+
 /// A failed system call in plain words, "<what couldn't be done> because...".
 fn io_words(what: &str, e: &io::Error) -> Error {
-    let why = match e.raw_os_error() {
-        Some(libc::ENOSPC | libc::EDQUOT) => "the drive is full",
-        Some(libc::EROFS) => "the folder is read-only",
-        Some(libc::EACCES | libc::EPERM) => "Atlas Archive isn't allowed to write there",
-        Some(libc::ENOENT) => "the folder isn't there any more",
-        Some(libc::ENAMETOOLONG) => "a name is too long for this drive",
-        _ => "of an unexpected error",
-    };
+    let why = cause(e).unwrap_or("of an unexpected error");
     fail(format!("Couldn't {what} because {why}."), e)
 }
 
@@ -188,6 +210,25 @@ pub trait Callbacks {
 pub struct Listing {
     pub format: Format,
     pub tree: Tree,
+    /// The archive broke part way: `tree` holds the entries read before that
+    /// and this says why (a sentence for the user). `None` for a whole
+    /// listing. When the worker never got to name the format, `format` is
+    /// the placeholder `unknown`.
+    pub broken: Option<String>,
+}
+
+/// The format of a listing that broke before the worker named it.
+fn unknown_format() -> Format {
+    Format {
+        name: "unknown".into(),
+        encrypted: false,
+        encrypted_names: false,
+        solid: false,
+        compressed_file: false,
+        volumes: 1,
+        made_on_dos: false,
+        comment: None,
+    }
 }
 
 /// Where to put an extraction.
@@ -240,6 +281,11 @@ pub struct Extracted {
     pub skipped: Vec<SkippedEntry>,
     /// Skipped past the ones listed.
     pub skipped_more: u64,
+    /// The files were moved into place, but the move couldn't be confirmed
+    /// (a file system whose inode numbers change): a sentence for the user,
+    /// which names the hidden folder to look in if `path` is wrong. Nothing
+    /// was deleted. Front ends show it with the result.
+    pub unconfirmed: Option<String>,
 }
 
 /// The worker, and the per-user places a job touches. Values are for tests
@@ -326,12 +372,23 @@ impl Worker {
             cb,
             &mut col,
         )?;
-        let format = col
-            .format
-            .take()
-            .ok_or_else(|| fail("The archive reader sent something unexpected.", "no format"))?;
+        let format = match (col.format.take(), &col.broken) {
+            (Some(f), _) => f,
+            // The entries came and the archive broke before the format did.
+            (None, Some(_)) => unknown_format(),
+            (None, None) => {
+                return Err(fail(
+                    "The archive reader sent something unexpected.",
+                    "no format",
+                ));
+            }
+        };
         let tree = Tree::build(format.clone(), &col.entries, encoding);
-        Ok(Listing { format, tree })
+        Ok(Listing {
+            format,
+            tree,
+            broken: col.broken.take(),
+        })
     }
 
     /// Reads every entry and checks it, writing nothing. Same thread rules as `list`.
@@ -370,10 +427,15 @@ impl Worker {
             return Err(Error::Cancelled);
         }
         let dest = sys::open_dir(req.dest_dir).map_err(|e| {
-            fail(
-                "The folder to extract into couldn't be opened.",
-                format!("{}: {e}", sys::log_path(req.dest_dir)),
-            )
+            let words = match e.raw_os_error() {
+                Some(libc::ENOENT) => "The folder to extract into isn't there.",
+                Some(libc::EACCES | libc::EPERM) => {
+                    "Atlas Archive isn't allowed to open the folder to extract into."
+                }
+                Some(libc::ENOTDIR) => "The place to extract into isn't a folder.",
+                _ => "The folder to extract into couldn't be opened.",
+            };
+            fail(words, format!("{}: {e}", sys::log_path(req.dest_dir)))
         })?;
         let dest_st =
             sys::fstat(sys::bfd(&dest)).map_err(|e| io_words("look at the folder", &e))?;
@@ -394,14 +456,23 @@ impl Worker {
             .file_name()
             .map(|n| n.as_bytes().to_vec())
             .unwrap_or_else(|| b"archive".to_vec());
-        let mut staging = Staging::create(dest, &dest_abs, &file_name, self.state_dir.as_deref())
-            .map_err(|e| io_words("make a folder to extract into", &e))?;
-
         let request = Request::Extract {
             encoding: req.encoding.label().to_string(),
             entries: req.selection.clone(),
             raw_name: req.raw_name.clone(),
         };
+        // Before anything is made: a selection too scattered for one frame
+        // is the user's to narrow, not the reader's fault.
+        if req
+            .selection
+            .as_ref()
+            .is_some_and(|l| crate::proto::selection_len(l) > MAX_SELECTED)
+            || request.encode().len() > MAX_FRAME
+        {
+            return Err(fail(TOO_MANY_SELECTED, "the request is over one frame"));
+        }
+        let mut staging = Staging::create(dest, &dest_abs, &file_name, self.state_dir.as_deref())
+            .map_err(|e| io_words("make a folder to extract into", &e))?;
         let mut col = Collected::default();
         if let Err(e) = self.run_job(
             Op::Extract,
@@ -420,10 +491,20 @@ impl Worker {
         }
         // The worker is dead and reaped: staging can't change under us.
         if cancel.is_cancelled() {
+            log::info!("The extraction was cancelled before the audit.");
             return Err(Error::Cancelled);
         }
         let umask = sys::read_umask();
-        let audit = audit::audit(staging.fd(), umask).map_err(|e| audit_error(&e))?;
+        // The audit of a million items takes a while: it looks at the cancel
+        // as it goes, and again when it is done (staging goes when dropped).
+        let audited = audit::audit_with(staging.fd(), umask, staging.modes_kept(), &|| {
+            cancel.is_cancelled()
+        });
+        if cancel.is_cancelled() {
+            log::info!("The extraction was cancelled during the audit.");
+            return Err(Error::Cancelled);
+        }
+        let audit = audited.map_err(|e| audit_error(&e))?;
         cross_check(&col.written, &audit.top_level());
 
         let default = default_name(&file_name);
@@ -437,6 +518,7 @@ impl Worker {
                 umask,
                 trash: self.trash.as_ref(),
                 clash_all: req.clash_all,
+                cancel,
             },
             cb,
         )?;
@@ -448,6 +530,7 @@ impl Worker {
             removed_more: audit.removed_more,
             skipped: col.skipped,
             skipped_more: col.skipped_more,
+            unconfirmed: placed.unconfirmed,
         })
     }
 
@@ -487,6 +570,12 @@ impl Worker {
             match self.attempt(&a, cancel, cb, col)? {
                 Final::NeedPassword(_) if attempt == MAX_PASSWORD_TRIES => break,
                 Final::NeedPassword(wrong) => match cb.password(wrong) {
+                    Some(p) if p.len() > MAX_PASSWORD => {
+                        return Err(fail(
+                            "That password is too long.",
+                            "over the length limit",
+                        ));
+                    }
                     Some(p) => password = Some(p),
                     None => return Err(Error::PasswordRequired),
                 },
@@ -550,12 +639,35 @@ impl Worker {
                 "the archive reader didn't end after SIGKILL",
             ));
         }
+        let what = || {
+            let kind = col.format.as_ref().map(|f| f.name.clone()).or_else(|| {
+                a.archive
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            });
+            format!(
+                "{} of a {} archive",
+                a.op.name(),
+                kind.as_deref().unwrap_or("?")
+            )
+        };
         match driven {
             Ok(f) => Ok(f),
-            Err(Halt::Failed(reason)) => Err(Error::Failed(reason)),
-            Err(Halt::Refused(e)) => Err(Error::LimitRefused(e)),
+            // The reasons are the worker's or the client's own words; the
+            // log gets them with what was being done.
+            Err(Halt::Failed(reason)) => {
+                log::warn!("The {} stopped: {reason}", what());
+                Err(Error::Failed(reason))
+            }
+            Err(Halt::Refused(e)) => {
+                log::warn!("The {} was refused at a limit: {e:?}", what());
+                Err(Error::LimitRefused(e))
+            }
             Err(Halt::Bad(why)) => Err(fail("The archive reader sent something unexpected.", why)),
-            Err(Halt::Stop(Stop::Cancelled)) => Err(Error::Cancelled),
+            Err(Halt::Stop(Stop::Cancelled)) => {
+                log::info!("The {} was cancelled.", what());
+                Err(Error::Cancelled)
+            }
             Err(Halt::Stop(Stop::Timeout)) => Err(fail(
                 "The archive reader stopped responding.",
                 format!("no reply for {:?}", self.timeout),
@@ -578,6 +690,16 @@ enum Op {
     List,
     Test,
     Extract,
+}
+
+impl Op {
+    fn name(self) -> &'static str {
+        match self {
+            Op::List => "listing",
+            Op::Test => "test",
+            Op::Extract => "extraction",
+        }
+    }
 }
 
 struct Attempt<'a> {
@@ -624,6 +746,9 @@ struct Collected {
     skipped_more: u64,
     /// The worker couldn't be reaped: its drive doesn't answer.
     hung: bool,
+    /// A listing the archive broke part way: why (the entries are in
+    /// `entries`).
+    broken: Option<String>,
 }
 
 /// A reply's text with a length cap and without controls, bidi overrides and
@@ -658,9 +783,9 @@ struct SpaceWatch<'a> {
 }
 
 impl<'a> SpaceWatch<'a> {
-    fn new(fd: BorrowedFd<'a>) -> Option<SpaceWatch<'a>> {
+    fn new(fd: BorrowedFd<'a>) -> Result<SpaceWatch<'a>, io::Error> {
         match sys::free_bytes(fd) {
-            Ok(free) => Some(SpaceWatch {
+            Ok(free) => Ok(SpaceWatch {
                 fd,
                 start_free: free,
                 floor: reserve_for(free),
@@ -670,7 +795,7 @@ impl<'a> SpaceWatch<'a> {
             }),
             Err(e) => {
                 log::warn!("The free space can't be watched, so the job is refused: {e}");
-                None
+                Err(e)
             }
         }
     }
@@ -695,6 +820,12 @@ impl<'a> SpaceWatch<'a> {
                     self.failures
                 );
                 if self.failures >= MAX_READ_FAILURES && first.elapsed() >= READ_FAILURE_SPAN {
+                    log::warn!(
+                        "The job was stopped: the free space couldn't be read {} times in {:?} (it started with {} free).",
+                        self.failures,
+                        first.elapsed(),
+                        self.start_free
+                    );
                     return Err("Atlas Archive can no longer tell how much space is free on this drive, so the job was stopped.".into());
                 }
                 return Ok(());
@@ -703,11 +834,22 @@ impl<'a> SpaceWatch<'a> {
         self.failures = 0;
         self.first_failure = None;
         if free < self.floor {
+            log::warn!(
+                "The job was stopped: {free} bytes free is under the reserve of {} (it started with {} free; approved {approved:?}).",
+                self.floor,
+                self.start_free
+            );
             return Err("There isn't enough space on this drive, so the job was stopped.".into());
         }
         if let Some(a) = approved {
             let used = self.start_free.saturating_sub(free);
-            if used > a.saturating_add((a / 8).max(16 * 1024 * 1024)) {
+            let allowed = a.saturating_add((a / 8).max(16 * 1024 * 1024));
+            if used > allowed {
+                log::warn!(
+                    "The job was stopped: {used} bytes used on the drive is over the {a} approved plus its margin ({allowed} allowed; it started with {} free, now {free}, reserve {}). Other programs' writes count too.",
+                    self.start_free,
+                    self.floor
+                );
                 return Err(
                     "The archive unpacked to much more than it said it would, so the job was stopped."
                         .into(),
@@ -732,19 +874,29 @@ fn drive(
         .map(|s| SpaceWatch::new(s.fd()));
     // Fail closed: no figures, no extraction (and the worker is not asked).
     let mut watch = match watch {
-        Some(None) => {
-            return Err(Halt::Failed(
+        Some(Err(e)) => {
+            return Err(Halt::Failed(if e.kind() == io::ErrorKind::Unsupported {
                 "This drive doesn't report its free space, so Atlas Archive can't extract here safely."
-                    .into(),
-            ));
+                    .into()
+            } else {
+                let why = cause(&e).unwrap_or("of an unexpected error");
+                format!(
+                    "Atlas Archive couldn't check the free space on this drive because {why}, so it can't extract here safely."
+                )
+            }));
         }
-        Some(w) => w,
+        Some(Ok(w)) => Some(w),
         None => None,
     };
     if let Some(p) = a.password {
         running.send(&Request::Password(p.clone()).encode(), cancel)?;
     }
-    running.send(&a.request.encode(), cancel)?;
+    let request = a.request.encode();
+    // Not the reader's doing: `extract` checks too, before it starts one.
+    if request.len() > MAX_FRAME {
+        return Err(Halt::Failed(TOO_MANY_SELECTED.into()));
+    }
+    running.send(&request, cancel)?;
 
     let timeout = running.timeout();
     // The clock restarts only when the job advances: more bytes or items
@@ -827,7 +979,11 @@ fn drive(
                     deadline = Instant::now() + timeout;
                 }
                 seen = (bytes, items);
-                if let Some(w) = watch.as_mut() {
+                // The loop's own check is every WATCH_EVERY; a Progress frame
+                // adds none of its own (on a network drive each is a round trip).
+                if let Some(w) = watch.as_mut()
+                    && w.due()
+                {
                     w.check(ceiling).map_err(Halt::Failed)?;
                 }
                 let now = Instant::now();
@@ -835,6 +991,11 @@ fn drive(
                     last_progress = Some(now);
                     cb.progress(bytes, items);
                 }
+            }
+            // Only a listing's very first header asks, before any entry: one
+            // that comes later broke the front end's view of the list.
+            Reply::NeedPassword { .. } if a.op == Op::List && !col.entries.is_empty() => {
+                return Err(Halt::Bad("a password was asked for after entries"));
             }
             Reply::NeedPassword { wrong } => return Ok(Final::NeedPassword(wrong)),
             // A test meters bytes like an extraction, so a bomb asks there too.
@@ -921,11 +1082,22 @@ fn drive(
                     return Err(Halt::Refused(e));
                 }
                 let reason = clean(&reason, MAX_REASON);
-                return Err(Halt::Failed(if reason.is_empty() {
-                    "The archive reader failed.".into()
+                let reason = if reason.is_empty() {
+                    "The archive reader failed.".to_string()
                 } else {
                     reason
-                }));
+                };
+                // A listing that broke after some entries keeps them: the
+                // front end shows what was readable, and where it broke.
+                if a.op == Op::List && !col.entries.is_empty() {
+                    log::warn!(
+                        "The listing broke after {} entries: {reason}",
+                        col.entries.len()
+                    );
+                    col.broken = Some(reason);
+                    return Ok(Final::Finished);
+                }
+                return Err(Halt::Failed(reason));
             }
             _ => return Err(Halt::Bad("a reply that doesn't belong to this job")),
         }
@@ -970,8 +1142,14 @@ mod tests {
         // Capital letter, kind Other, no OS code: the old heuristic's match.
         let lookalike = audit_error(&io::Error::other("Permission denied by /secret/path"));
         assert_eq!(words(&lookalike), generic);
-        let os = audit_error(&io::Error::from_raw_os_error(libc::EACCES));
-        assert_eq!(words(&os), generic);
+        // An OS error the table knows is told in words; one it doesn't isn't.
+        let os = audit_error(&io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(
+            words(&os),
+            "The extracted files couldn't be checked, so nothing was kept, because the drive reported an error."
+        );
+        let odd = audit_error(&io::Error::from_raw_os_error(libc::EBADF));
+        assert_eq!(words(&odd), generic);
         let plain = audit_error(&io::Error::new(io::ErrorKind::InvalidData, "Bad"));
         assert_eq!(words(&plain), generic);
     }

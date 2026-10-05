@@ -57,6 +57,12 @@ pub fn staging_name(archive: &[u8], hex: &str) -> String {
     format!(".{base}{TAG}{hex}")
 }
 
+/// The staging name that doesn't depend on the archive's name, for a drive
+/// that refuses the archive's (FAT, exFAT and NTFS reject `: ? * " < > |`).
+pub fn plain_staging_name(hex: &str) -> String {
+    format!(".archive{TAG}{hex}")
+}
+
 /// Whether `name` is one `staging_name` could have made: `^\..*\.atlas-partial-[0-9a-f]{16}$`,
 /// one component.
 fn is_staging_name(name: &str) -> bool {
@@ -379,9 +385,17 @@ pub struct Staging {
     /// A delete ran out of time: the folder and record stay for the next
     /// start and nothing retries it (`clear` has only `&self`).
     stuck: AtomicBool,
+    /// The file system kept the folder's 0700 mode when it was made (what
+    /// `Record::modes` says): where it didn't, mode changes may be refused.
+    modes_kept: bool,
 }
 
 impl Staging {
+    /// Whether the drive keeps modes (measured when the folder was made).
+    pub fn modes_kept(&self) -> bool {
+        self.modes_kept
+    }
+
     /// Makes the folder in `dest` and records the job below `state_dir`. A
     /// record that can't be written is logged, not fatal: the job still runs,
     /// only a crash would then leave the hidden folder behind for good.
@@ -416,8 +430,15 @@ impl Staging {
         }
         let boot = sys::boot_id();
         let mut tries = 0;
+        // The archive's name goes into the staging name, unless the drive
+        // refuses it (EINVAL below: FAT, exFAT, NTFS), and then it doesn't.
+        let mut plain = false;
         let name = loop {
-            let name = staging_name(archive_name, &sys::random_hex()?);
+            let hex = sys::random_hex()?;
+            let mut name = staging_name(archive_name, &hex);
+            if plain {
+                name = plain_staging_name(&hex);
+            }
             if let Some(r) = &record {
                 let rec = Record {
                     pid: std::process::id(),
@@ -437,6 +458,11 @@ impl Staging {
             match sys::mkdirat(bfd(&dest), name.as_bytes(), 0o700) {
                 Ok(()) => break name,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+                // Untested: provoking this EINVAL needs a FAT mount.
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) && !plain => {
+                    log::debug!("The drive refused the staging name, trying a plain one: {e}");
+                    plain = true;
+                }
                 Err(e) => {
                     if let Some(r) = &record {
                         let _ = r.remove();
@@ -487,6 +513,7 @@ impl Staging {
                     record,
                     gone: false,
                     stuck: AtomicBool::new(false),
+                    modes_kept: kept,
                 })
             }
             Err(e) => {
@@ -635,12 +662,19 @@ fn alive(rec: &Record, mtime: SystemTime) -> bool {
         // The job couldn't read its own start time: a process that began
         // after the record was written is a later one with the number.
         Ok(start) => !started_after(start, mtime),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        // Without /proc (not mounted) no process can be told from another:
+        // alive, so a folder in use is never taken.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && proc_mounted() => false,
         Err(e) => {
             log::warn!("Process {} couldn't be looked up: {e}", rec.pid);
             true
         }
     }
+}
+
+/// Whether /proc answers: our own entry is always there when it does.
+fn proc_mounted() -> bool {
+    sys::proc_start(std::process::id()).is_ok()
 }
 
 /// Whether a process that started `start` clock ticks after boot began after `mtime`.
@@ -762,14 +796,68 @@ const STAMP: &str = "sweep.stamp";
 /// The least time between two sweeps started by `clean_stale_if_due`.
 const SWEEP_EVERY: Duration = Duration::from_secs(10 * 60);
 
-/// Whether a sweep is due, and if so claims it by writing the stamp (atomic,
-/// 0600, never through a link: the stamp is replaced by rename and read with
-/// `lstat`). Two starts at once: the one whose temporary file is taken backs off.
-fn claim_sweep(state_dir: &Path) -> io::Result<bool> {
+/// The file whose `flock` says a sweep is running. Like the stamp it is
+/// neither `.job` nor `.tmp`, so the sweep leaves it alone.
+const LOCK: &str = "sweep.lock";
+
+/// A sweep's claim: the `flock` on `LOCK`, held until this is dropped (and
+/// released by the kernel if the process dies). `None` inside when the lock
+/// file couldn't be had: the sweep then runs unlocked, as often as the stamp
+/// allows.
+struct SweepClaim(#[allow(dead_code)] Option<OwnedFd>);
+
+/// Takes the sweep lock: `Ok(None)` when another start holds it.
+fn lock_sweep(dir: BorrowedFd<'_>) -> io::Result<Option<OwnedFd>> {
+    let c = sys::cstr(LOCK.as_bytes())?;
+    let fd = sys::retry(|| {
+        // SAFETY: a valid descriptor and C string; a new descriptor we own.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: a new descriptor returned by a successful call.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    })?;
+    let st = sys::fstat(bfd(&fd))?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_uid != sys::getuid() {
+        return Err(io::Error::other("the sweep lock isn't a file of yours"));
+    }
+    // The mode is ours to set; a file system that keeps none is fine.
+    let _ = sys::fchmod_soft(bfd(&fd), 0o600);
+    match sys::retry(|| {
+        sys::check(unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) })
+    }) {
+        Ok(()) => Ok(Some(fd)),
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a sweep is due, and if so claims it: the `flock` on `LOCK` (two
+/// starts at once: the one that can't take it backs off) held for the whole
+/// sweep, and the stamp written (atomic, 0600, never through a link: the stamp
+/// is replaced by rename and read with `lstat`).
+fn claim_sweep(state_dir: &Path) -> io::Result<Option<SweepClaim>> {
     let dir = match open_jobs_dir(state_dir, false) {
         Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
+    };
+    let lock = match lock_sweep(bfd(&dir)) {
+        Ok(Some(fd)) => Some(fd),
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            log::warn!("The sweep lock couldn't be taken: {e}");
+            None
+        }
     };
     if let Ok(st) = sys::lstatat(bfd(&dir), STAMP.as_bytes())
         && st.st_mode & libc::S_IFMT == libc::S_IFREG
@@ -781,7 +869,7 @@ fn claim_sweep(state_dir: &Path) -> io::Result<bool> {
             .duration_since(then)
             .is_ok_and(|age| age < SWEEP_EVERY)
         {
-            return Ok(false);
+            return Ok(None);
         }
     }
     let stamp = RecordFile {
@@ -789,23 +877,21 @@ fn claim_sweep(state_dir: &Path) -> io::Result<bool> {
         file: STAMP.to_string(),
     };
     match stamp.write(b"") {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Ok(()) => {}
         // The sweep still runs: without a stamp it is only more frequent.
-        Err(e) => {
-            log::warn!("The sweep stamp couldn't be written: {e}");
-            Ok(true)
-        }
+        Err(e) => log::warn!("The sweep stamp couldn't be written: {e}"),
     }
+    Ok(Some(SweepClaim(lock)))
 }
 
 /// `clean_stale`, but only when none began in the last ten minutes. Blocks as
 /// long as `clean_stale` does: call it off the UI thread, or use
 /// `clean_stale_in_background`. `None` when it wasn't due.
 pub fn clean_stale_if_due(state_dir: &Path) -> io::Result<Option<Cleaned>> {
-    if !claim_sweep(state_dir)? {
+    // Held until the sweep ends.
+    let Some(_claim) = claim_sweep(state_dir)? else {
         return Ok(None);
-    }
+    };
     clean_stale(state_dir).map(Some)
 }
 
@@ -1141,6 +1227,11 @@ fn purge(root: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<()> {
         top.progressed = false;
         top.first = None;
         for n in names {
+            // A batch of slow deletes (a network mount) must not run past
+            // the budget: the next round's check ends it.
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
             match remove_leaf(cur, &n) {
                 Leaf::Gone => top.progressed = true,
                 Leaf::Err(e) => {
@@ -1226,6 +1317,16 @@ mod tests {
         assert!(!n.contains('\u{1}') && !n.contains('/'), "{n}");
         assert!(n.starts_with(".a_b"), "{n}");
         assert!(is_staging_name(&n));
+    }
+
+    #[test]
+    fn a_name_the_drive_may_refuse_has_a_plain_fallback() {
+        let hex = "0123456789abcdef";
+        let plain = plain_staging_name(hex);
+        assert_eq!(plain, ".archive.atlas-partial-0123456789abcdef");
+        assert!(is_staging_name(&plain));
+        // The archive's name stays in the first name, whatever it holds.
+        assert!(staging_name(b"a:b.zip", hex).contains("a:b.zip"));
     }
 
     #[test]
@@ -1718,10 +1819,10 @@ mod tests {
         let base = scratch("stamp");
         let state = base.join("state");
         // No jobs folder, nothing to sweep.
-        assert!(!claim_sweep(&state).unwrap());
+        assert!(claim_sweep(&state).unwrap().is_none());
         drop(open_jobs_dir(&state, true).unwrap());
-        assert!(claim_sweep(&state).unwrap());
-        assert!(!claim_sweep(&state).unwrap(), "too soon");
+        assert!(claim_sweep(&state).unwrap().is_some());
+        assert!(claim_sweep(&state).unwrap().is_none(), "too soon");
         let stamp = jobs_dir(&state).join(STAMP);
         let mode = std::fs::metadata(&stamp).unwrap();
         assert_eq!(
@@ -1729,13 +1830,28 @@ mod tests {
             0o600
         );
         back_date(&stamp, 1);
-        assert!(claim_sweep(&state).unwrap(), "ten minutes passed");
+        // A sweep that is still running holds its claim: no second one starts,
+        // even with the stamp old.
+        let held = claim_sweep(&state).unwrap().expect("ten minutes passed");
+        back_date(&stamp, 1);
+        assert!(claim_sweep(&state).unwrap().is_none(), "the lock is held");
+        drop(held);
+        assert!(
+            claim_sweep(&state).unwrap().is_some(),
+            "the lock was let go"
+        );
+        let lock = std::fs::metadata(jobs_dir(&state).join(LOCK)).unwrap();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&lock.permissions()) & 0o777,
+            0o600
+        );
+        back_date(&stamp, 1);
         // A link in its place is replaced, and what it pointed at is not touched.
         let target = base.join("target");
         std::fs::write(&target, b"keep").unwrap();
         std::fs::remove_file(&stamp).unwrap();
         std::os::unix::fs::symlink(&target, &stamp).unwrap();
-        assert!(claim_sweep(&state).unwrap());
+        assert!(claim_sweep(&state).unwrap().is_some());
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
         assert!(!std::fs::symlink_metadata(&stamp).unwrap().is_symlink());
         let c = clean_stale_if_due(&state).unwrap();

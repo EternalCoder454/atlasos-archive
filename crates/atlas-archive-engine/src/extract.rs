@@ -8,13 +8,15 @@
 //!
 //! Order: folders and files as the archive streams them (folders made 0700),
 //! then hard links, then symbolic links, then folder modes and times, deepest
-//! first. Files are created 0600 and get their mode and time when complete.
+//! first. Files are created 0600 and get their mode and time when complete
+//! (a cpio hard link's first name, empty until the data of the last name
+//! comes, when it is complete).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 use atlas_archive_core::proto::Kind;
 use atlas_archive_core::tree::{Moved, ROOT, Tree};
@@ -90,6 +92,25 @@ fn timespec(mtime: Option<i64>) -> [libc::timespec; 2] {
     [omit, m]
 }
 
+/// Errors that stop the whole job rather than one entry: the drive is full,
+/// read-only or failing, so every later entry would fail the same way.
+pub fn is_fatal(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSPC | libc::EDQUOT | libc::EROFS | libc::EIO)
+    )
+}
+
+/// What a drive says when it can't keep modes or times (FAT, some network and
+/// FUSE file systems). The entry is still there, without them.
+/// (`EOPNOTSUPP` is the same number as `ENOTSUP` on Linux.)
+fn mode_unsupported(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EPERM | libc::ENOTSUP | libc::EINVAL)
+    )
+}
+
 /// The process umask, read once while the worker is single-threaded.
 pub fn read_umask() -> u32 {
     // SAFETY: umask has no failure; the old value is put straight back.
@@ -127,7 +148,13 @@ pub struct Writer {
     made: HashSet<u32>,
     /// Regular files written completely (node ids): hard link targets.
     files: HashSet<u32>,
+    /// Files complete but for their mode and time, which wait for data that
+    /// comes later (writing it would change the time): given at the end if
+    /// no data came.
+    meta_pending: HashSet<u32>,
     failed: Vec<EntryFailed>,
+    /// Said once that the drive keeps no modes or times.
+    mode_logged: bool,
 }
 
 impl Writer {
@@ -138,7 +165,28 @@ impl Writer {
             dirs: Vec::new(),
             made: HashSet::new(),
             files: HashSet::new(),
+            meta_pending: HashSet::new(),
             failed: Vec::new(),
+            mode_logged: false,
+        }
+    }
+
+    /// `fchmod` and `futimens` results: a drive that can't keep modes or
+    /// times is no reason to stop; anything else (a full or failing drive)
+    /// is. Logged once per job, without a path.
+    fn lenient(&mut self, r: io::Result<()>) -> io::Result<()> {
+        match r {
+            Err(e) if mode_unsupported(&e) => {
+                if !self.mode_logged {
+                    self.mode_logged = true;
+                    crate::log_line!(
+                        "the drive keeps no modes or times (errno {}); going on without",
+                        e.raw_os_error().unwrap_or(0)
+                    );
+                }
+                Ok(())
+            }
+            r => r,
         }
     }
 
@@ -198,15 +246,92 @@ impl Writer {
         })
     }
 
-    /// Completes a file: mode and time. Only then is it a hard link target.
+    /// Completes a file: mode and time, then the close, whose error counts
+    /// (network and FUSE drives report a full disk or a failed write there),
+    /// then the size check. Only a complete file is a hard link target. On
+    /// `Err` the file is closed and still on disk: the caller removes it.
     pub fn finish_file(&mut self, tree: &Tree, out: FileOut) -> io::Result<()> {
+        self.complete(tree, out, false)
+    }
+
+    /// As `finish_file`, but the mode and time are left for later: more data
+    /// is to come into this file (`reopen`), which would change the time. If
+    /// none does, `finish` gives them.
+    pub fn finish_file_for_data_to_come(&mut self, tree: &Tree, out: FileOut) -> io::Result<()> {
+        self.complete(tree, out, true)
+    }
+
+    fn complete(&mut self, tree: &Tree, out: FileOut, defer_meta: bool) -> io::Result<()> {
         let node = &tree.nodes[out.id as usize];
-        let fd = out.file.as_raw_fd();
-        // SAFETY: valid descriptor; times array of two.
-        check(unsafe { libc::fchmod(fd, file_mode(node.mode, self.umask)) })?;
-        check(unsafe { libc::futimens(fd, timespec(node.mtime).as_ptr()) })?;
-        self.files.insert(out.id);
+        let FileOut {
+            file,
+            id,
+            written,
+            declared,
+        } = out;
+        let fd = file.as_raw_fd();
+        let meta = if defer_meta {
+            Ok(())
+        } else {
+            self.meta_pending.remove(&id);
+            self.set_meta(fd, node.mode, node.mtime)
+        };
+        let closed = close_checked(file);
+        // A full or failing drive outranks anything else that went wrong.
+        match (meta, closed) {
+            (_, Err(e)) if is_fatal(&e) => return Err(e),
+            (Err(e), _) | (_, Err(e)) => return Err(e),
+            _ => {}
+        }
+        if declared.is_some_and(|d| written != d) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the item holds less data than the archive says it does",
+            ));
+        }
+        if defer_meta {
+            self.meta_pending.insert(id);
+        }
+        self.files.insert(id);
         Ok(())
+    }
+
+    /// A file's final mode and time, on its descriptor.
+    fn set_meta(&mut self, fd: i32, mode: u32, mtime: Option<i64>) -> io::Result<()> {
+        // SAFETY: valid descriptor; times array of two.
+        let r = check(unsafe { libc::fchmod(fd, file_mode(mode, self.umask)) });
+        self.lenient(r)?;
+        let r = check(unsafe { libc::futimens(fd, timespec(mtime).as_ptr()) });
+        self.lenient(r)
+    }
+
+    /// Whether node `id` is a regular file written completely.
+    pub fn is_written(&self, id: u32) -> bool {
+        self.files.contains(&id)
+    }
+
+    /// Whether node `id` is a complete file still waiting for the data that
+    /// comes with a later name of it (`finish_file_for_data_to_come`).
+    pub fn is_pending(&self, id: u32) -> bool {
+        self.meta_pending.contains(&id)
+    }
+
+    /// Opens the finished, empty file `id` again, to write the data that came
+    /// with another name of it (cpio keeps the data of a set of hard links
+    /// with the last). `declared`: as for `file`.
+    pub fn reopen(&mut self, tree: &Tree, id: u32, declared: Option<u64>) -> io::Result<FileOut> {
+        let fd = openat2(
+            &self.staging,
+            &tree.disk_path(id),
+            libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW,
+            0,
+        )?;
+        Ok(FileOut {
+            file: File::from(fd),
+            id,
+            written: 0,
+            declared,
+        })
     }
 
     /// Follows a node the tree moved to make room for a folder: renames what
@@ -237,6 +362,7 @@ impl Writer {
     /// Removes what was written for an entry the archive stores again.
     pub fn replace(&mut self, tree: &Tree, id: u32) -> io::Result<()> {
         self.files.remove(&id);
+        self.meta_pending.remove(&id);
         self.unlink(tree, id)
     }
 
@@ -264,15 +390,41 @@ impl Writer {
 
     /// Makes hard links, then symbolic links, then gives folders their modes
     /// and times. Links are made only for entries in `selected` (every one
-    /// when `None`). Returns the entries that failed.
+    /// when `None`). Returns the entries that failed; an error that says the
+    /// drive is full, read-only or failing (`is_fatal`) is returned at once.
+    /// `step` is called after each item made, so the caller can report
+    /// progress: there can be a million of them.
     pub fn finish(
         &mut self,
         tree: &Tree,
         selected: Option<&HashSet<u32>>,
+        step: &mut dyn FnMut() -> io::Result<()>,
     ) -> io::Result<Vec<EntryFailed>> {
         let chosen = |n: &atlas_archive_core::tree::Node| {
             selected.is_none_or(|set| n.entry.is_some_and(|i| set.contains(&i)))
         };
+        // Files that were to get more data and never did.
+        let mut pending: Vec<u32> = std::mem::take(&mut self.meta_pending).into_iter().collect();
+        pending.sort_unstable();
+        for id in pending {
+            if !self.files.contains(&id) {
+                continue;
+            }
+            let node = &tree.nodes[id as usize];
+            let r = openat2(
+                &self.staging,
+                &tree.disk_path(id),
+                libc::O_RDONLY | libc::O_NOFOLLOW,
+                0,
+            )
+            .and_then(|fd| self.set_meta(fd.as_raw_fd(), node.mode, node.mtime));
+            if let Err(e) = r {
+                if is_fatal(&e) {
+                    return Err(e);
+                }
+                self.failed(id, e);
+            }
+        }
         for (id, n) in tree.nodes.iter().enumerate() {
             let id = id as u32;
             if n.refused.is_some() || !chosen(n) {
@@ -289,8 +441,12 @@ impl Writer {
                 _ => continue,
             };
             if let Err(e) = r {
+                if is_fatal(&e) {
+                    return Err(e);
+                }
                 self.failed(id, e);
             }
+            step()?;
         }
         for (id, n) in tree.nodes.iter().enumerate() {
             let id = id as u32;
@@ -299,8 +455,12 @@ impl Writer {
             }
             let Some(target) = &n.symlink else { continue };
             if let Err(e) = self.symlink(tree, id, &target.disk) {
+                if is_fatal(&e) {
+                    return Err(e);
+                }
                 self.failed(id, e);
             }
+            step()?;
         }
         // Launchers never run: their files lose the execute bits, whatever
         // name reached them (folders are still writable here). Every file
@@ -313,6 +473,9 @@ impl Writer {
         }));
         launchers.sort_unstable();
         launchers.dedup();
+        // Every name of a file, by the node holding its data: built when a
+        // strip first fails (rare), then reused.
+        let mut names: Option<HashMap<u32, Vec<u32>>> = None;
         for id in launchers {
             if !self.files.contains(&id) {
                 continue;
@@ -326,20 +489,35 @@ impl Writer {
             .and_then(|fd| {
                 let mode = file_mode(tree.nodes[id as usize].mode, self.umask) & !0o111;
                 // SAFETY: valid descriptor.
-                check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
+                let r = check(unsafe { libc::fchmod(fd.as_raw_fd(), mode) });
+                match r {
+                    // A drive that keeps no modes (FAT, exFAT) shows every
+                    // file as executable or none: if none is, it is as safe
+                    // as stripped.
+                    Err(e) if mode_unsupported(&e) && !has_execute_bit(&fd)? => Ok(()),
+                    r => r,
+                }
             });
             if let Err(e) = r {
                 // Every name of it: the hard links made above share the
                 // mode that couldn't be fixed.
-                for (link, n) in tree.nodes.iter().enumerate() {
-                    if n.kind == Kind::Hardlink && n.hardlink == Some(id) {
-                        self.unlink(tree, link as u32)?;
+                let names = names.get_or_insert_with(|| {
+                    let mut m: HashMap<u32, Vec<u32>> = HashMap::new();
+                    for (link, n) in tree.nodes.iter().enumerate() {
+                        if let (Kind::Hardlink, Some(to)) = (n.kind, n.hardlink) {
+                            m.entry(to).or_default().push(link as u32);
+                        }
                     }
+                    m
+                });
+                for &link in names.get(&id).map_or(&[][..], Vec::as_slice) {
+                    self.unlink(tree, link)?;
                 }
                 self.unlink(tree, id)?;
                 self.files.remove(&id);
                 self.failed(id, e);
             }
+            step()?;
         }
         // Deepest first: a folder made read-only must not stop its children.
         let mut dirs = std::mem::take(&mut self.dirs);
@@ -353,8 +531,22 @@ impl Writer {
                 0,
             )?;
             // SAFETY: valid descriptor; times array of two.
-            check(unsafe { libc::fchmod(fd.as_raw_fd(), dir_mode(n.mode, self.umask)) })?;
-            check(unsafe { libc::futimens(fd.as_raw_fd(), timespec(n.mtime).as_ptr()) })?;
+            let r = self
+                .lenient(check(unsafe {
+                    libc::fchmod(fd.as_raw_fd(), dir_mode(n.mode, self.umask))
+                }))
+                .and_then(|()| {
+                    self.lenient(check(unsafe {
+                        libc::futimens(fd.as_raw_fd(), timespec(n.mtime).as_ptr())
+                    }))
+                });
+            if let Err(e) = r {
+                if is_fatal(&e) {
+                    return Err(e);
+                }
+                self.failed(d, e);
+            }
+            step()?;
         }
         Ok(std::mem::take(&mut self.failed))
     }
@@ -425,6 +617,31 @@ impl Writer {
         let name = cstr(&n.name.disk)?;
         // SAFETY: valid descriptor and C strings.
         check(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) })
+    }
+}
+
+/// Whether the file on `fd` has any execute permission bit.
+fn has_execute_bit(fd: &OwnedFd) -> io::Result<bool> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: valid descriptor and stat buffer; initialised on success.
+    check(unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) })?;
+    let st = unsafe { st.assume_init() };
+    Ok(st.st_mode & 0o111 != 0)
+}
+
+/// Closes `file` and reports the error, which `drop` would lose.
+fn close_checked(file: File) -> io::Result<()> {
+    let fd = file.into_raw_fd();
+    // SAFETY: the descriptor is ours and closed once; Linux releases it even
+    // when close fails, so it is never retried.
+    if unsafe { libc::close(fd) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EINTR) {
+        Ok(())
+    } else {
+        Err(e)
     }
 }
 
@@ -572,7 +789,59 @@ mod tests {
                 _ => {}
             }
         }
-        w.finish(&tree, None).unwrap()
+        w.finish(&tree, None, &mut || Ok(())).unwrap()
+    }
+
+    #[test]
+    fn drives_without_modes_are_tolerated_and_full_ones_are_not() {
+        for errno in [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL] {
+            assert!(mode_unsupported(&io::Error::from_raw_os_error(errno)));
+            assert!(!is_fatal(&io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EIO] {
+            assert!(!mode_unsupported(&io::Error::from_raw_os_error(errno)));
+            assert!(is_fatal(&io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!mode_unsupported(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        let s = Scratch::new("lenient");
+        let mut w = Writer::new(open_dir(&s.0).unwrap(), 0o022);
+        assert!(
+            w.lenient(Err(io::Error::from_raw_os_error(libc::EPERM)))
+                .is_ok()
+        );
+        assert!(w.mode_logged);
+        assert_eq!(
+            w.lenient(Err(io::Error::from_raw_os_error(libc::ENOSPC)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSPC)
+        );
+    }
+
+    #[test]
+    fn a_short_file_is_an_error_and_not_a_link_target() {
+        let s = Scratch::new("short");
+        let tree = Tree::build(
+            fmt(),
+            &[
+                e(0, "f", Kind::File, 0o644, None),
+                e(1, "g", Kind::File, 0o644, None),
+            ],
+            None,
+        );
+        let mut w = Writer::new(open_dir(&s.0).unwrap(), 0o022);
+        let mut out = w.file(&tree, 1, Some(5)).unwrap();
+        out.write_all(b"hel").unwrap();
+        let err = w.finish_file(&tree, out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!is_fatal(&err));
+        assert!(!w.files.contains(&1));
+        let mut out = w.file(&tree, 2, Some(5)).unwrap();
+        out.write_all(b"hello").unwrap();
+        w.finish_file(&tree, out).unwrap();
+        assert!(w.files.contains(&2));
     }
 
     #[test]
@@ -649,7 +918,7 @@ mod tests {
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_file(s.0.join("x.desktop")).unwrap();
         std::os::unix::fs::symlink(&victim, s.0.join("x.desktop")).unwrap();
-        let failed = w.finish(&tree, None).unwrap();
+        let failed = w.finish(&tree, None, &mut || Ok(())).unwrap();
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert!(std::fs::symlink_metadata(s.0.join("x.desktop")).is_err());
         assert!(
@@ -675,7 +944,11 @@ mod tests {
         out.write_all(b"hello").unwrap();
         w.finish_file(&tree, out).unwrap();
         let selected: HashSet<u32> = [0, 2].into();
-        assert!(w.finish(&tree, Some(&selected)).unwrap().is_empty());
+        assert!(
+            w.finish(&tree, Some(&selected), &mut || Ok(()))
+                .unwrap()
+                .is_empty()
+        );
         assert!(s.0.join("f").is_file());
         assert!(std::fs::symlink_metadata(s.0.join("sym")).is_ok());
         assert!(std::fs::symlink_metadata(s.0.join("hard")).is_err());
@@ -782,7 +1055,7 @@ mod tests {
             w.finish_file(&tree, out).unwrap();
         }
         tree.finish();
-        assert!(w.finish(&tree, None).unwrap().is_empty());
+        assert!(w.finish(&tree, None, &mut || Ok(())).unwrap().is_empty());
         assert_eq!(std::fs::read(s.0.join("x (2)")).unwrap(), b"v0");
         assert_eq!(std::fs::read(s.0.join("x/y")).unwrap(), b"v2");
     }

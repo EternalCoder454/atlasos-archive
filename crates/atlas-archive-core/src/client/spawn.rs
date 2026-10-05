@@ -210,6 +210,8 @@ pub struct Running {
     input: Option<OwnedFd>,
     output: OwnedFd,
     buf: Vec<u8>,
+    /// One read buffer for the whole job, not one per read.
+    chunk: Vec<u8>,
     start: usize,
     timeout: Duration,
 }
@@ -316,6 +318,12 @@ pub fn spawn(
         .stderr(Stdio::piped())
         // Its own group, so a kill reaches 7z and unrar too.
         .process_group(0);
+    // The user's own time zone, for the local times DOS-era entries store; it
+    // is the user's environment, not archive input, but is still bounded.
+    let tz = std::env::var("TZ").ok().filter(|t| tz_is_usable(t));
+    if let Some(tz) = &tz {
+        cmd.env("TZ", tz);
+    }
     // SAFETY: the closure makes only async-signal-safe calls (signal,
     // sigprocmask, prctl, dup2, close, fcntl, syscall) and touches no memory
     // it didn't get before the fork.
@@ -405,6 +413,7 @@ pub fn spawn(
         input: None,
         output,
         buf: Vec::new(),
+        chunk: vec![0u8; 64 * 1024],
         start: 0,
         timeout,
     };
@@ -674,7 +683,11 @@ impl Running {
     /// their end, say what happened. Never raises SIGPIPE.
     pub fn send(&mut self, payload: &[u8], cancel: &Cancel) -> Result<(), Stop> {
         if payload.len() > MAX_FRAME {
-            return Err(Stop::Proto(ProtoError::TooLarge));
+            // Our own request, not the worker's reply: never blamed on it.
+            return Err(Stop::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the request is over one frame",
+            )));
         }
         let mut frame = Zeroizing::new(Vec::with_capacity(4 + payload.len()));
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -744,13 +757,12 @@ impl Running {
                 self.buf.drain(..self.start);
                 self.start = 0;
             }
-            let mut chunk = [0u8; 64 * 1024];
             // SAFETY: reads into a live buffer of the length passed.
             let n = unsafe {
                 libc::read(
                     self.output.as_raw_fd(),
-                    chunk.as_mut_ptr().cast(),
-                    chunk.len(),
+                    self.chunk.as_mut_ptr().cast(),
+                    self.chunk.len(),
                 )
             };
             if n == 0 {
@@ -768,7 +780,7 @@ impl Running {
                     _ => return Err(Stop::Io(e)),
                 }
             }
-            self.buf.extend_from_slice(&chunk[..n as usize]);
+            self.buf.extend_from_slice(&self.chunk[..n as usize]);
         }
     }
 
@@ -920,6 +932,21 @@ impl Drop for Running {
     }
 }
 
+/// A `TZ` worth passing on: a zoneinfo name or a POSIX TZ string, at most 256
+/// bytes. One leading ':' is fine; a path (a leading '/'), a '..' component
+/// and any character outside `[A-Za-z0-9_+-/,.:<>]` are not: the worker would
+/// read whatever file it names.
+fn tz_is_usable(tz: &str) -> bool {
+    let name = tz.strip_prefix(':').unwrap_or(tz);
+    !name.is_empty()
+        && tz.len() <= 256
+        && !name.starts_with('/')
+        && !name.split('/').any(|c| c == "..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_+-/,.:<>".contains(&b))
+}
+
 /// What to tell the user when the worker ended without a final reply.
 pub fn died(status: &io::Result<ExitStatus>) -> String {
     match status {
@@ -928,12 +955,41 @@ pub fn died(status: &io::Result<ExitStatus>) -> String {
             (Some(libc::SIGKILL), _) | (None, Some(0)) => {
                 "The archive reader stopped unexpectedly.".into()
             }
-            (Some(sig), _) => format!("The archive reader crashed (signal {sig})."),
-            (None, Some(code)) => {
-                format!("The archive reader stopped unexpectedly (exit code {code}).")
+            // The code or signal goes to the log (the caller has the status).
+            (Some(libc::SIGSYS), _) => {
+                "The archive reader broke one of its safety rules and was stopped.".into()
             }
+            (Some(_), _) => "The archive reader crashed.".into(),
+            // The worker's own refusal to start (its sandbox or pipes).
+            (None, Some(2)) => {
+                "The archive reader couldn't be set up safely, so it didn't run.".into()
+            }
+            (None, Some(_)) => "The archive reader stopped unexpectedly.".into(),
             (None, None) => "The archive reader stopped unexpectedly.".into(),
         },
         Err(_) => "The archive reader stopped unexpectedly.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_sane_time_zone_is_passed_on() {
+        assert!(tz_is_usable("Europe/Berlin"));
+        assert!(tz_is_usable("EST5EDT,M3.2.0,M11.1.0"));
+        assert!(!tz_is_usable(""));
+        assert!(!tz_is_usable(&"x".repeat(257)));
+        assert!(tz_is_usable(&"x".repeat(256)));
+        assert!(!tz_is_usable("a\0b"));
+        assert!(tz_is_usable(":Europe/Berlin"));
+        assert!(tz_is_usable("<+03>-3"));
+        assert!(!tz_is_usable("/etc/passwd"));
+        assert!(!tz_is_usable(":/etc/passwd"));
+        assert!(!tz_is_usable("../../etc/passwd"));
+        assert!(!tz_is_usable("Europe/../../x"));
+        assert!(!tz_is_usable("a b"));
+        assert!(!tz_is_usable("a\nb"));
     }
 }

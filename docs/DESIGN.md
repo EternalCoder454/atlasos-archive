@@ -89,8 +89,9 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
 
 1. The client opens the archive (and each volume) read-only and creates the
    staging folder, then starts the worker with those descriptors, a pipe for
-   requests and one for replies, an empty environment (plus `LANG`), and
-   nothing else open.
+   requests and one for replies, an empty environment (plus `LANG`, and the
+   user's `TZ` when it is set, UTF-8 and at most 256 bytes, for the local
+   times DOS-era entries store), and nothing else open.
 2. Before it reads a byte, the worker sets `PR_SET_NO_NEW_PRIVS` and
    `PR_SET_DUMPABLE 0` and applies a Landlock ruleset: it may read its
    archive descriptors and `/usr` (never execute), and write only below the
@@ -117,8 +118,12 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    or 2: the client gives it pipes. So nothing a compromised parser starts can outlive the worker
    and keep writing to staging while the client audits it. Limits:
    `RLIMIT_AS` 4 GiB (the largest 7z dictionary is 1.5 GiB),
-   `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256. On a kernel without Landlock the
-   worker refuses to run unless the build was made for tests. The client
+   `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256. `tzset()` runs before Landlock, so
+   local-time conversions (zip DOS times, iso9660, cab) can read
+   `/etc/localtime`. On a kernel without Landlock, or with one older than ABI
+   6, the worker refuses to run unless the build was made for tests, and
+   says so in plain words ("This system's kernel doesn't offer the sandbox
+   Atlas Archive needs"); the library's own error goes to the log. The client
    starts it in its own process group with `PR_SET_PDEATHSIG(SIGKILL)` and
    signals the worker itself through its pidfd (flags 0, which can't be
    redirected) and its group with `kill(-pid)`, both every time and only while
@@ -139,7 +144,12 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    killing the worker kills every process the tool started, and the worker
    reaps them all before it audits.
 3. Requests and replies are length-prefixed binary frames (`core::proto`),
-   capped at 1 MiB each, 64 MiB per listing. The client treats every reply as
+   capped at 1 MiB each, 256 MiB and 1,000,000 entries per listing. An Extract
+   request names its entries as sorted `[start, len]` runs (at most 1,000,000
+   indices); a selection too scattered for one frame is refused before
+   anything starts ("Too many items are selected to extract at once…"), never
+   blamed on the reader. A listing that asks for a password (encrypted
+   headers) is asked like any job, before any entry. The client treats every reply as
    untrusted: it re-checks paths, names, counts and sizes. A compromised
    worker can put anything inside staging (Landlock stops it only from
    writing elsewhere), so the client also audits staging before moving
@@ -155,6 +165,23 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    most, and each one asked is tried. A listing batch with no entries
    doesn't count as the job advancing. Progress of one byte at a time does,
    so a hostile worker can creep along slowly; the user's Cancel ends it.
+   The worker therefore sends `Progress` on a 100 ms clock from every loop
+   that can take long: every entry (data or not), each read of data it
+   throws away (entries skipped behind a compression filter are read and
+   discarded in steps, never skipped in one blocking call; where skipping is
+   a seek it stays one), and each link or folder made when the extraction
+   finishes. Progress's items advance with every one of those. `Progress`
+   means: `bytes`, the entry data handled so far, written to files or read and
+   thrown away (so it can pass the size of the entries selected, and the
+   client clamps it); `items`, the entries handled so far, each counted once:
+   files when read, folders and links as the end of the pass makes them,
+   all of them by the final `Progress`. Both only grow. libarchive isn't
+   thread-safe, so there is no heartbeat thread. The worker reads no request
+   except the answer to an open limit question: any other request, before
+   or during one, fails the job as out of turn.
+   The worker logs to descriptor 2, one line per failure and per entry that
+   couldn't be written (the first 50): format, bytes read, entry number and
+   an error code; never a path, a name or a password.
    While a limit question is open, the client stops the worker and its
    group (`SIGSTOP`) and continues them (`SIGCONT`) before sending the
    answer; Cancel kills them as usual. If the stop can't be sent, the client
@@ -175,7 +202,11 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    asked ("This drive doesn't report its free space, so Atlas Archive can't
    extract here safely."), and the worker itself reports no figure there
    too. A read that fails during a job is logged and tolerated; the third in
-   a row, at least 2 s after the first, stops the job. A pause (`SIGSTOP`)
+   a row, at least 2 s after the first, stops the job. The "approved size" is
+   measured on the whole drive, so another program's writes during the job
+   count as used: that is what the margin is for, and a busy drive can stop
+   a job early. Every stop is logged with the figures (free at start, free
+   now, reserve, used, approved). A pause (`SIGSTOP`)
    is confirmed through the pidfd (`waitid`, which reports a stop only once
    every thread has stopped; else the leader's state in `/proc` while the
    child is unreaped), up to 3 s, before the space check, or the job fails.
@@ -210,9 +241,31 @@ Every entry path is untrusted. In `core::path`:
 
 The writer (`engine::extract`) works below one descriptor, the staging folder:
 
+- A file is closed explicitly and the close's error counts (network and FUSE
+  drives report a full disk there); a file shorter than the size the archive
+  states is a failed entry (removed, reported, never a hard link target).
+  `ENOSPC`, `EDQUOT`, `EROFS` and `EIO` from any step, including folders,
+  links and the close, fail the whole job; a drive that can't keep modes or
+  times (`EPERM`, `ENOTSUP`, `EINVAL` from `fchmod` or `futimens`) doesn't:
+  the item stays without them.
+- In cpio (newc) the data of a set of hard links comes with the last name,
+  which libarchive reports as a link to the first: the data is written into
+  the first name's file (found as the tree will resolve the link), so every
+  name has the contents. The first name keeps its mode and time until that
+  data is in (writing would change the time); if none comes, they are given
+  at the end. If the file can't be opened again for the data, it is removed
+  and reported, and the last name isn't linked to it. Only a first name
+  still waiting for data is opened again (never one that is complete: a
+  hostile archive with data on both names keeps the first's); and if the
+  name that carries the data is refused, the first name is removed and
+  reported ("its data wasn't found in the archive").
 - Staging is `.<archive name>.atlas-partial-<random>`, created 0700 with
   `mkdirat` inside the destination, opened `O_DIRECTORY|O_NOFOLLOW`, and
-  used only if it is ours and empty.
+  used only if it is ours and empty. On a drive that rejects the archive's
+  name in it (FAT, exFAT and NTFS refuse `: ? * " < > |`, answering
+  `EINVAL`), the name is `.archive.atlas-partial-<random>` instead, tried
+  once. The sweep takes an `flock` on `jobs/sweep.lock` (0600) and holds it
+  while it runs, so two starts never sweep at once.
 - Every open is `openat2(staging, path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
   | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`; files with `O_CREAT|O_EXCL|
   O_NOFOLLOW|O_CLOEXEC`. A symlink made earlier in the same archive can
@@ -255,15 +308,20 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   `<archive name>` folder. The lone item is moved out only when the tree
   says it is safe (`Tree::lone_top`): a folder whose symlinks all stay inside
   it, or a file whose name doesn't start with `.` (so `.bashrc` or `.config/`
-  never land loose in the user's folder). On a name clash the job asks, with Explorer's
+  never land loose in the user's folder). With several top-level items, the
+  `<archive name>` folder is ours: if one of that name is there it is
+  numbered `name (2)` without asking, since nothing of the user's is replaced.
+  On a name clash the job asks, with Explorer's
   choices: Replace, Skip, Keep Both (default), "Do this for all conflicts".
   Replace moves the old item to the trash (XDG trash spec, same file system),
   never deletes it; if the move out then fails, the old item is put back
   from the trash, and if that fails too, staging is kept and the message
   says where both are. Before and after the move out, the name in the
   destination is checked (device, inode, type) to be staging's descriptor.
-  A mismatch after the move deletes nothing (some FUSE and network file
-  systems change inode numbers); the user is told both places.
+  A mismatch after the move deletes nothing and the job still succeeds, with
+  the placed path and a sentence (`Extracted::unconfirmed`) naming the hidden
+  folder to look in. This is the case where some FUSE and network file
+  systems change inode numbers.
   A destination folder others can write to is refused unless it is sticky
   ("Choose a folder of your own"); so is one a group other than the
   user's own can write to, and one whose access list lets another user or
@@ -378,6 +436,35 @@ on a smaller drive. `Reply::Limit` for the free space or the nesting depth
 is a failure, never a question: the client offers no "go on" and never
 sends `GoOn(true)` for them (the worker would not ask).
 
+Entries that aren't wanted (not selected, links, anything not written) are
+skipped with a seek (`archive_read_data_skip`) where the format stores its data
+as it is (tar, cpio, ar, iso9660, zip, with no compression filter) and the
+entry's size is stated (a zip with no central directory streams, and skipping
+would inflate), and for any entry whose declared size is known and at most
+32 MiB: one skip call then decodes about that much, well inside the client's
+30 s deadline. The encrypted flag is the archive's word and changes nothing:
+without the password a read fails fast and the entry is damaged (below). A
+skip that isn't a plain seek is metered: the bytes the decoder produced
+(`archive_filter_bytes(a, 0)` before and after) or the declared size, if more,
+count as discarded. Every other entry (declared larger, or no size) has
+its data read and thrown away, because one call to skip it could decode
+without end and can't be counted or interrupted. Those bytes count: total
+size and ratio are over written plus discarded bytes (not the free space,
+nothing is written), so a bomb in entries nobody chose asks like any other,
+and the same `Reply::Limit` answer applies. A listing has nobody to ask, so it
+has a hard bound instead: it stops with a plain `Failed` once it has read and
+thrown away more than 1 TiB, or more than 5,000 times the archive's size past
+4 GiB; the entries already sent stay (`Entries*` then `Failed`).
+
+Once the user approves a total size or ratio question, discarded bytes are bounded
+only by Cancel.
+
+A read error while throwing away an entry's data doesn't stop the job when
+libarchive can go on (`ARCHIVE_WARN` or `ARCHIVE_FAILED`, not
+`ARCHIVE_FATAL`): the listing carries on, an extraction or test reports the
+entry as skipped only if it was selected (else it is only logged), and the
+next header fails if the stream is broken.
+
 The worker measures the archive's ratio against bytes read from the file
 (`archive_filter_bytes(-1)`). libarchive gives no per-entry packed size, so
 the one-entry ratio applies only where a backend knows it (the zip crate,
@@ -461,7 +548,9 @@ refused with `net.eterneon.atlas.Archive1.Error.InvalidArgs`) and an
 dialogs stack on the caller's window), `show_progress` (b, default true;
 Explorer passes false and shows the job in its own queue). Unknown keys are
 ignored. A call returns as soon as the job is queued; at most 16 jobs wait at
-once.
+once, and past that a call fails with
+`net.eterneon.atlas.Archive1.Error.TooManyJobs` (Explorer says "Archive is
+busy, try again when a job finishes" and doesn't retry by itself).
 
 | Method | Does |
 |---|---|
@@ -491,6 +580,18 @@ Job objects, `/net/eterneon/atlas/archive/job/<n>`, interface
 
 Job objects disappear 60 s after they finish.
 
+How Explorer uses it (agreed with the Explorer session, 2026-10-05): it
+always passes `activation_token` and `parent_window` and `show_progress`
+false, and drives Pause, Resume and Cancel through the Job interface;
+"Extract To…" is `ExtractAll` (our dialog, no picker of its own); drops of
+`application/x-atlas-archive-entries` on a local folder, tab, breadcrumb
+segment or sidebar place call `ExtractEntries(archive, ids, folder, {})`
+with the entry ids kept opaque, `text/uri-list` being the fallback for
+other targets. A later `List(s archive, s inner_path)` for Quick Look on an
+archive (a top-level listing capped at 200 entries plus a total count) is
+wanted but low priority; changing a signature here means telling Explorer
+first.
+
 ### CLI: `atlas-archive-cli`
 
 `atlas-archive-cli COMMAND [OPTIONS] [--] ARCHIVE [ENTRY…]`, with the
@@ -500,8 +601,9 @@ use `display` or the index, never join `path` onto a folder). Options come
 before the archive, git-style: the first word that isn't an option, or
 `--`, ends them, so a file named `--allow-large` is never an option.
 Explorer and the launcher pass `--` before paths. Passwords come from the
-terminal or `--password-fd N` (at most 30 s of waiting, then exit 3),
-never an argument. Limits are enforced unless `--allow-large`. `extract`
+terminal or `--password-fd N` (at most 30 s of waiting, then exit 3; a
+descriptor that ends with no line is exit 3 too, "No password was sent on
+descriptor N."), never an argument. Limits are enforced unless `--allow-large`. `extract`
 takes `--to DIR`, `--here`, `--name N` (one name, checked before any work)
 and `--on-clash replace|skip|keep-both`; ENTRY is matched component by
 component against the shown names (then the disk names; a name matching two
@@ -512,7 +614,24 @@ and log line is one line (only `info`'s archive comment keeps its line
 breaks). `test` fails (exit 1) when any item couldn't be read. A first
 Ctrl-C, Ctrl-\, SIGTERM or SIGHUP cancels; a second, or one with no job
 running, restores the terminal and exits at once; Ctrl-Z is blocked while
-the CLI runs. It sets its core limit to 0 and is not dumpable (it may hold
+the CLI runs. Once an extraction has put the files in place, its job counts
+as running until the result line is written: a first signal then is ignored
+and the run exits 0 (a second still exits at once). A Ctrl-C at a name-clash
+or limit question cancels the job (exit 130, nothing placed). Writing to
+stderr is best effort everywhere, so a closed or full stderr never changes
+the exit code; after a successful extraction a failed write to stdout is a
+warning on stderr naming the folder, and still exit 0. A panic in the main
+thread ends the run with exit 1 and one fixed sentence; one in the signal
+thread ends it with 130 (nothing could cancel it otherwise); one in any
+other thread (such as the stale-staging sweep) only ends that thread. A listing that breaks part way (`list`, `info`) prints every
+entry read, then the reason on stderr, and exits 1; `--json` carries it as
+`"broken"` in the summary (null when whole), and `extract` of such an archive
+fails before writing anything. An extraction whose move couldn't be proven
+(`unconfirmed`) prints a warning on stderr after the result line, keeps exit
+0, and adds `"unconfirmed"` to the JSON summary. `-v`
+logs each phase: the command and options, opening, the format and entry
+count, the destination, how the password was supplied (never the value), and
+the elapsed time. It sets its core limit to 0 and is not dumpable (it may hold
 a password). Stale staging is cleaned only by `extract`. The hidden
 `--worker PATH` exists only in builds with the `dev-worker` feature (the
 tests). Exit codes: 0 done, 1 failed, 2 bad usage, 3 needs a password (or
@@ -592,7 +711,7 @@ Atlas.Ui throughout (`AtlasWindow`, `AtlasHeaderBar`, `AtlasBreadcrumb`,
 | Failure | Behaviour |
 |---|---|
 | Wrong password | Asked again in place with "That password didn't work"; never a crash or a stuck "Loading" |
-| Corrupt or truncated archive | Listing shows what was readable and says where it broke; extraction keeps complete entries only if the user chooses "Keep What Was Extracted" |
+| Corrupt or truncated archive | Listing shows what was readable and says where it broke (the worker sends the entries read, then `Failed`); extraction keeps complete entries only if the user chooses "Keep What Was Extracted" |
 | Missing volume | "Part 3 of 5 (photos.7z.003) is missing", with Locate… |
 | Disk full, read-only destination, permission denied | Stops, removes staging, says which and where |
 | Worker crash, kill, timeout, garbage | Job failed with a plain message; logged with the format and offset, never the password |

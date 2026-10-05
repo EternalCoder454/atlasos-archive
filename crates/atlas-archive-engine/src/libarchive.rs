@@ -24,12 +24,23 @@ type archive_entry = c_void;
 const ARCHIVE_EOF: c_int = 1;
 const ARCHIVE_OK: c_int = 0;
 const ARCHIVE_WARN: c_int = -20;
+const ARCHIVE_FATAL: c_int = -30;
 
 const AE_IFMT: u32 = 0o170000;
 const AE_IFREG: u32 = 0o100000;
 const AE_IFLNK: u32 = 0o120000;
 const AE_IFDIR: u32 = 0o040000;
 
+/// `ARCHIVE_FORMAT_CPIO`.
+const ARCHIVE_FORMAT_CPIO: c_int = 0x10000;
+/// `ARCHIVE_FORMAT_TAR`.
+const ARCHIVE_FORMAT_TAR: c_int = 0x30000;
+/// `ARCHIVE_FORMAT_ISO9660`.
+const ARCHIVE_FORMAT_ISO9660: c_int = 0x40000;
+/// `ARCHIVE_FORMAT_ZIP`.
+const ARCHIVE_FORMAT_ZIP: c_int = 0x50000;
+/// `ARCHIVE_FORMAT_AR`.
+const ARCHIVE_FORMAT_AR: c_int = 0x70000;
 /// `ARCHIVE_FORMAT_RAW`: the raw "format" (a compressed file, not an archive).
 const ARCHIVE_FORMAT_RAW: c_int = 0x90000;
 /// `ARCHIVE_FORMAT_BASE_MASK`.
@@ -68,6 +79,7 @@ unsafe extern "C" {
     fn archive_read_data_skip(a: *mut archive) -> c_int;
     fn archive_read_free(a: *mut archive) -> c_int;
     fn archive_error_string(a: *mut archive) -> *const c_char;
+    fn archive_errno(a: *mut archive) -> c_int;
     fn archive_format(a: *mut archive) -> c_int;
     fn archive_format_name(a: *mut archive) -> *const c_char;
     fn archive_filter_count(a: *mut archive) -> c_int;
@@ -86,6 +98,7 @@ unsafe extern "C" {
     fn archive_entry_mtime(e: *mut archive_entry) -> libc::time_t;
     fn archive_entry_perm(e: *mut archive_entry) -> u32;
     fn archive_entry_is_encrypted(e: *mut archive_entry) -> c_int;
+    fn archive_entry_nlink(e: *mut archive_entry) -> u32;
 }
 
 /// A libarchive failure, with its message.
@@ -100,12 +113,19 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl Error {
-    /// libarchive wants a password, or a different one ("Passphrase
-    /// required for this entry", "Incorrect passphrase").
-    pub fn is_password(&self) -> bool {
-        self.0.contains("assphrase")
-    }
+/// libarchive's own words for "a password is needed" (3.8.7: found with
+/// `strings libarchive.so.13`; the zip phrases are tested against real
+/// archives; 7z has none, this libarchive refuses encrypted 7z outright; the rar and rar5 ones are not: those archives can't be made
+/// without the proprietary tool). Matched at the start of its message only:
+/// other messages can carry entry names, which are archive text.
+fn is_password_message(msg: &str) -> bool {
+    [
+        "Passphrase required",
+        "Incorrect passphrase",
+        "Too many incorrect passphrases",
+    ]
+    .iter()
+    .any(|p| msg.starts_with(p))
 }
 
 /// One archive being read, front to back.
@@ -116,6 +136,11 @@ pub struct Reader<'fd> {
     a: *mut archive,
     entry: *mut archive_entry,
     index: u32,
+    warnings: u32,
+    /// The last error libarchive gave was one of its password messages.
+    password_error: bool,
+    /// What the last read or skip returned, if it failed (`can_go_on`).
+    status: c_int,
     _fd: PhantomData<BorrowedFd<'fd>>,
 }
 
@@ -157,10 +182,13 @@ impl<'fd> Reader<'fd> {
             if a.is_null() {
                 return Err(Error("Out of memory.".into()));
             }
-            let r = Reader {
+            let mut r = Reader {
                 a,
                 entry: std::ptr::null_mut(),
                 index: 0,
+                warnings: 0,
+                password_error: false,
+                status: ARCHIVE_OK,
                 _fd: PhantomData,
             };
             // Only filters libarchive decodes itself: one built without its
@@ -202,25 +230,104 @@ impl<'fd> Reader<'fd> {
         }
     }
 
-    fn error(&self, fallback: &str) -> Error {
+    fn error(&mut self, fallback: &str) -> Error {
         // SAFETY: valid handle.
         let msg = cstr_bytes(unsafe { archive_error_string(self.a) })
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .filter(|s| !s.is_empty());
+        self.password_error = msg.as_deref().is_some_and(is_password_message);
         Error(match msg {
             Some(m) => format!("{fallback}: {m}."),
             None => format!("{fallback}."),
         })
     }
 
+    /// Whether the error this reader just returned says a password
+    /// is needed or wrong: libarchive's own phrase for it, and the archive
+    /// not known to be free of encrypted entries (an unencrypted archive
+    /// can't ask, whatever its names say).
+    pub fn wants_password(&self) -> bool {
+        self.password_error && self.has_encrypted_entries() != Some(false)
+    }
+
+    /// After a failed read or skip: libarchive can still go on to the next
+    /// entry (`ARCHIVE_WARN` or `ARCHIVE_FAILED`: one entry is damaged), as
+    /// opposed to `ARCHIVE_FATAL`, where the stream is unusable.
+    pub fn can_go_on(&self) -> bool {
+        self.status > ARCHIVE_FATAL
+    }
+
+    /// libarchive's error number for the last failed call: a class for the
+    /// log, where the message could hold archive text.
+    pub fn errno(&self) -> i32 {
+        // SAFETY: valid handle.
+        unsafe { archive_errno(self.a) }
+    }
+
+    /// The current entry is a regular file in a cpio archive that has other
+    /// names (hard links). cpio stores no link records: each name is a file,
+    /// and the data of a set of links is with the last of them (newc), the
+    /// others being empty.
+    pub fn cpio_linked(&self) -> bool {
+        if self.entry.is_null() {
+            return false;
+        }
+        // SAFETY: valid handle; `entry` is the current header's.
+        unsafe {
+            archive_format(self.a) & ARCHIVE_FORMAT_BASE_MASK == ARCHIVE_FORMAT_CPIO
+                && archive_entry_filetype(self.entry) & AE_IFMT == AE_IFREG
+                && archive_entry_nlink(self.entry) >= 2
+        }
+    }
+
+    /// The archive is in cpio format (any name of a link set can carry data).
+    pub fn is_cpio(&self) -> bool {
+        // SAFETY: valid handle.
+        unsafe { archive_format(self.a) & ARCHIVE_FORMAT_BASE_MASK == ARCHIVE_FORMAT_CPIO }
+    }
+
+    /// Skipping an entry's data is a seek, not a decompression: the formats
+    /// that store their entries as they are (tar, cpio, ar, iso9660, zip read
+    /// from a file) with no compression filter in the way. Everything else
+    /// (solid 7z, rar, cab, anything behind a filter) decodes all of the data
+    /// in one call that can't report progress or be counted: it is read and
+    /// thrown away instead.
+    pub fn skip_is_cheap(&self) -> bool {
+        // SAFETY: valid handle.
+        unsafe {
+            matches!(
+                archive_format(self.a) & ARCHIVE_FORMAT_BASE_MASK,
+                ARCHIVE_FORMAT_TAR
+                    | ARCHIVE_FORMAT_CPIO
+                    | ARCHIVE_FORMAT_AR
+                    | ARCHIVE_FORMAT_ISO9660
+                    | ARCHIVE_FORMAT_ZIP
+            ) && archive_filter_count(self.a) <= 1
+        }
+    }
+
     /// The next entry's header, or `None` at the end.
     pub fn next_header(&mut self) -> Result<Option<Entry>, Error> {
+        self.password_error = false;
         let mut e = std::ptr::null_mut();
         // SAFETY: valid handle; `e` is owned by libarchive until the next call.
         let r = unsafe { archive_read_next_header(self.a, &mut e) };
         match r {
             ARCHIVE_EOF => return Ok(None),
-            ARCHIVE_OK | ARCHIVE_WARN => {}
+            ARCHIVE_OK => {}
+            ARCHIVE_WARN => {
+                // Read on, but leave a trace (a few lines, not one per entry).
+                if self.warnings < 20 {
+                    self.warnings += 1;
+                    crate::log_line!(
+                        "libarchive warning: format={} bytes={} entry={} errno={}",
+                        self.format_name(),
+                        self.bytes_read(),
+                        self.index,
+                        self.errno()
+                    );
+                }
+            }
             _ => return Err(self.error("The archive is damaged")),
         }
         self.entry = e;
@@ -270,6 +377,7 @@ impl<'fd> Reader<'fd> {
         // SAFETY: valid handle and buffer.
         let n = unsafe { archive_read_data(self.a, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
+            self.status = n as c_int;
             return Err(self.error("An item couldn't be read"));
         }
         Ok(n as usize)
@@ -278,7 +386,9 @@ impl<'fd> Reader<'fd> {
     /// Skips the current entry's data.
     pub fn skip(&mut self) -> Result<(), Error> {
         // SAFETY: valid handle.
-        if unsafe { archive_read_data_skip(self.a) } < ARCHIVE_WARN {
+        let r = unsafe { archive_read_data_skip(self.a) };
+        if r < ARCHIVE_WARN {
+            self.status = r;
             return Err(self.error("The archive is damaged"));
         }
         Ok(())
@@ -288,6 +398,13 @@ impl<'fd> Reader<'fd> {
     pub fn bytes_read(&self) -> u64 {
         // SAFETY: valid handle; -1 is the last filter, the file itself.
         unsafe { archive_filter_bytes(self.a, -1) }.max(0) as u64
+    }
+
+    /// Bytes the first filter has produced so far: what the format reader has
+    /// consumed, so what a `skip()` decoded shows in the difference.
+    pub fn decoded_bytes(&self) -> u64 {
+        // SAFETY: valid handle; filter 0 is the one the format reads from.
+        unsafe { archive_filter_bytes(self.a, 0) }.max(0) as u64
     }
 
     fn is_raw(&self) -> bool {
@@ -526,6 +643,51 @@ mod tests {
                 let _ = r.next_header();
                 assert!(r.is_plain_file());
             }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_libarchives_own_phrases_ask_for_a_password() {
+        for m in [
+            "Passphrase required for this entry",
+            "Incorrect passphrase",
+            "Too many incorrect passphrases",
+        ] {
+            assert!(is_password_message(m), "{m}");
+        }
+        for m in [
+            "Can't translate pathname 'password' to UTF-8",
+            "Damaged tar archive: my passphrase.txt",
+            "Truncated Zip encrypted body: only 3 bytes available",
+            "",
+        ] {
+            assert!(!is_password_message(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn skipping_is_a_seek_only_where_the_data_is_stored_as_is() {
+        let d = scratch("cheap");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/a"), b"a").unwrap();
+        for (name, flag, cheap) in [("a.tar", "-cf", true), ("a.tar.gz", "-czf", false)] {
+            let out = d.join(name);
+            assert!(
+                Command::new("tar")
+                    .arg(flag)
+                    .arg(&out)
+                    .arg("-C")
+                    .arg(d.join("src"))
+                    .arg("a")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let f = std::fs::File::open(&out).unwrap();
+            let mut r = Reader::open(f.as_fd()).unwrap();
+            r.next_header().unwrap().unwrap();
+            assert_eq!(r.skip_is_cheap(), cheap, "{name}");
         }
         let _ = std::fs::remove_dir_all(&d);
     }

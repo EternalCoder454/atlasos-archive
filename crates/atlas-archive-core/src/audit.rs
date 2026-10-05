@@ -220,9 +220,30 @@ fn proc_path(fd: BorrowedFd<'_>) -> CString {
     CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("no NUL")
 }
 
-fn chmod_fd(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
+/// `chmod` by the handle. On a file system that keeps no modes (`modes_kept`
+/// false: FAT, CIFS, SSHFS and other FUSE mounts, which answer EPERM, ENOTSUP
+/// or EINVAL; ENOTSUP is EOPNOTSUPP on Linux) a refusal is no error: there is no mode to fix. Where modes are
+/// kept, any failure is one.
+fn chmod_fd(fd: BorrowedFd<'_>, mode: u32, modes_kept: bool) -> io::Result<()> {
     // SAFETY: a C string.
-    check(unsafe { libc::chmod(proc_path(fd).as_ptr(), mode) })
+    let r = check(unsafe { libc::chmod(proc_path(fd).as_ptr(), mode) });
+    match r {
+        Err(e)
+            if !modes_kept
+                && matches!(
+                    e.raw_os_error(),
+                    Some(libc::EPERM | libc::ENOTSUP | libc::EINVAL)
+                ) =>
+        {
+            Ok(())
+        }
+        r => r,
+    }
+}
+
+/// The audit was cancelled (`stop` said so): not a failure of the files.
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "the audit was cancelled")
 }
 
 /// Removes every extended attribute but the SELinux label: ACLs would
@@ -387,12 +408,20 @@ fn hardlinks_fit(
 
 /// Every item below staging, breadth first, with their names; one folder
 /// open at a time.
-fn walk(staging: BorrowedFd<'_>, links_left: &mut usize) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
+fn walk(
+    staging: BorrowedFd<'_>,
+    links_left: &mut usize,
+    modes_kept: bool,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<(Vec<Found>, Vec<Vec<u8>>)> {
     let mut found: Vec<Found> = Vec::new();
     let mut names: Vec<Vec<u8>> = Vec::new();
     let mut path_total = 0usize;
     let mut queue: VecDeque<Option<usize>> = VecDeque::from([None]);
     while let Some(dir) = queue.pop_front() {
+        if stop() {
+            return Err(stopped());
+        }
         let (dir_path, depth) = match dir {
             None => (Vec::new(), 0),
             Some(i) => (path_of(&found, &names, i), found[i].depth + 1),
@@ -420,7 +449,7 @@ fn walk(staging: BorrowedFd<'_>, links_left: &mut usize) -> io::Result<(Vec<Foun
                     // Ours, but locked: the owner gets in again.
                     let child = open_item(fd.as_fd(), &name)?;
                     same(child.as_fd(), &st)?;
-                    chmod_fd(child.as_fd(), (st.st_mode & 0o777) | 0o700)?;
+                    chmod_fd(child.as_fd(), (st.st_mode & 0o777) | 0o700, modes_kept)?;
                 }
                 queue.push_back(Some(found.len()));
             }
@@ -573,7 +602,19 @@ fn build_tree(
 /// Audits `staging` (see the module comment). An error leaves staging half
 /// fixed: the caller must then delete it, never move it out.
 pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
-    audit_fd(staging, umask).map_err(|e| {
+    audit_with(staging, umask, true, &|| false)
+}
+
+/// `audit`, asking `stop` between folders and every few hundred items: when
+/// it says yes the audit ends with an `ErrorKind::Interrupted` error (and
+/// staging is half fixed, as after any error).
+pub fn audit_with(
+    staging: BorrowedFd<'_>,
+    umask: u32,
+    modes_kept: bool,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Audit> {
+    audit_fd(staging, umask, modes_kept, stop).map_err(|e| {
         // A rename to a longer disk form (an invalid byte becomes U+FFFD)
         // can push a name or path past the kernel's limits.
         if e.raw_os_error() == Some(libc::ENAMETOOLONG) {
@@ -584,15 +625,30 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
     })
 }
 
-fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
+fn audit_fd(
+    staging: BorrowedFd<'_>,
+    umask: u32,
+    modes_kept: bool,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Audit> {
     // Staging itself: the owner's alone while it is checked (the move out
-    // gives the folder its final mode), with no ACL.
+    // gives the folder its final mode), with no ACL. `modes_kept` is what
+    // the staging folder's creation measured: where the file system keeps no
+    // modes, a refusal is no error here or in the mode fixes below.
     // SAFETY: a valid descriptor.
-    check(unsafe { libc::fchmod(staging.as_raw_fd(), 0o700) })?;
+    match check(unsafe { libc::fchmod(staging.as_raw_fd(), 0o700) }) {
+        Err(e)
+            if !modes_kept
+                && matches!(
+                    e.raw_os_error(),
+                    Some(libc::EPERM | libc::ENOTSUP | libc::EINVAL)
+                ) => {}
+        r => r?,
+    }
     strip_xattrs(staging)?;
 
     let mut links_left = MAX_LINK_TOTAL;
-    let (found, mut names) = walk(staging, &mut links_left)?;
+    let (found, mut names) = walk(staging, &mut links_left, modes_kept, stop)?;
     let mut removed = Vec::new();
     let mut removed_more = 0usize;
     let mut drop_it = vec![None::<String>; found.len()];
@@ -851,7 +907,10 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         .collect();
     fix.sort_by_key(|&i| found[i].parent);
     let mut folders = Folders::new();
-    for i in fix {
+    for (n, i) in fix.into_iter().enumerate() {
+        if n % 256 == 0 && stop() {
+            return Err(stopped());
+        }
         let f = &found[i];
         let dir = folders.get(staging, &found, &names, f.parent)?;
         let item = open_item(dir, &names[i])?;
@@ -866,7 +925,7 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
             (f.st.st_mode & 0o777 & !umask) | 0o700
         };
         if f.st.st_mode & 0o7777 != want {
-            chmod_fd(item.as_fd(), want)?;
+            chmod_fd(item.as_fd(), want, modes_kept)?;
         }
         strip_xattrs(item.as_fd())?;
     }

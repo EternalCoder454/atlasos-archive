@@ -22,6 +22,7 @@ use atlas_archive_core::name::NameEncoding;
 use atlas_archive_core::proto::{Reply, Request};
 use atlas_archive_engine::extract::read_umask;
 use atlas_archive_engine::job::{self, Conn, ExtractJob, Pipes};
+use atlas_archive_engine::log_line;
 use zeroize::Zeroizing;
 
 const REQUESTS: RawFd = 0;
@@ -60,15 +61,14 @@ fn kind_of(fd: &OwnedFd) -> Option<libc::mode_t> {
 
 fn main() -> ExitCode {
     if std::env::args_os().len() > 1 {
-        eprintln!(
-            "atlas-archive-worker: Atlas Archive starts this program itself; it takes no arguments."
-        );
+        // The log is fd 2 and may be anything: `log_line!` never panics.
+        log_line!("Atlas Archive starts this program itself; it takes no arguments.");
         return ExitCode::from(2);
     }
     // Before anything else: nothing inherited past the contract stays open.
     sandbox::close_others(STAGING + 1);
     let (Some(requests), Some(replies)) = (take(REQUESTS), take(REPLIES)) else {
-        eprintln!("atlas-archive-worker: no request or reply pipe");
+        log_line!("no request or reply pipe");
         return ExitCode::from(2);
     };
     let mut conn = Pipes {
@@ -80,12 +80,13 @@ fn main() -> ExitCode {
     // the log, so say so on the reply pipe, unless that is one itself.
     if [0, 1, 2].into_iter().any(is_tty) {
         let reason = "The worker was started with a terminal as one of its standard streams.";
-        eprintln!("atlas-archive-worker: {reason}");
+        // The reply first: the log may be the thing that is broken.
         if !is_tty(REPLIES) {
             let _ = conn.send(&Reply::Failed {
                 reason: reason.into(),
             });
         }
+        log_line!("{reason}");
         return ExitCode::from(2);
     }
     let archive = take(ARCHIVE);
@@ -93,8 +94,10 @@ fn main() -> ExitCode {
     // it can't apply.
     let staging = take(STAGING).filter(|s| kind_of(s) == Some(libc::S_IFDIR));
     if let Err(reason) = sandbox::enter(staging.as_ref().map(AsFd::as_fd)) {
-        eprintln!("atlas-archive-worker: {reason}");
-        let _ = conn.send(&Reply::Failed { reason });
+        let _ = conn.send(&Reply::Failed {
+            reason: reason.clone(),
+        });
+        log_line!("{reason}");
         return ExitCode::from(2);
     }
     match run(&mut conn, archive, staging) {
@@ -102,7 +105,7 @@ fn main() -> ExitCode {
         Err(e) => {
             // A broken pipe or a bad frame: the client has gone or is not
             // speaking the protocol. Never the content of a frame.
-            eprintln!("atlas-archive-worker: {e}");
+            log_line!("{e}");
             ExitCode::FAILURE
         }
     }
@@ -139,7 +142,11 @@ fn run(conn: &mut impl Conn, archive: Option<OwnedFd>, staging: Option<OwnedFd>)
         return fail(conn, "The archive wasn't opened read-only.");
     }
     match request {
-        Request::List => job::list(conn, archive.as_fd()),
+        Request::List => job::list_with(
+            conn,
+            archive.as_fd(),
+            password.as_deref().map(Vec::as_slice),
+        ),
         Request::Test => job::test(
             conn,
             archive.as_fd(),

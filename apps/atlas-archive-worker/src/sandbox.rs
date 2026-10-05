@@ -16,6 +16,8 @@ const ABI_TESTED: ABI = ABI::V9;
 /// scopes (no signals or abstract sockets outside). Newer rights (unix
 /// socket paths) are best effort; the seccomp filter denies sockets anyway.
 const ABI_REQUIRED: ABI = ABI::V6;
+/// `ABI_REQUIRED` as the number users and the kernel docs call it.
+const ABI_REQUIRED_NUMBER: u32 = 6;
 
 /// Address space: the largest 7z dictionary is 1.5 GiB.
 const MAX_ADDRESS_SPACE: u64 = 4 << 30;
@@ -41,6 +43,11 @@ pub fn close_others(from: RawFd) {
             unsafe { libc::close(fd) };
         }
     }
+}
+
+unsafe extern "C" {
+    /// glibc's; the libc crate doesn't bind it.
+    fn tzset();
 }
 
 fn os_error(what: &str) -> String {
@@ -82,6 +89,11 @@ pub fn enter(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     if unsafe { libc::setlocale(libc::LC_ALL, c"C.UTF-8".as_ptr()) }.is_null() {
         return Err("The C.UTF-8 locale is missing.".into());
     }
+    // glibc reads /etc/localtime on the first local-time conversion
+    // (libarchive's zip DOS times, iso9660 and cab dates); Landlock allows
+    // /usr only, so it is read now, while it can be.
+    // SAFETY: tzset takes no arguments; the worker is single-threaded here.
+    unsafe { tzset() };
     landlock(staging)?;
     crate::seccomp::install()
 }
@@ -89,6 +101,15 @@ pub fn enter(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
 fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     let abi = ABI_TESTED;
     let fail = |e: landlock::RulesetError| format!("Couldn't set up the sandbox: {e}");
+    // A kernel without Landlock, or with too old a Landlock, fails while the
+    // ruleset is made: say so in plain words and keep the crate's text for
+    // the log.
+    let unsupported = |e: landlock::RulesetError| {
+        atlas_archive_engine::log_line!("Landlock isn't available: {e}");
+        format!(
+            "This system's kernel doesn't offer the sandbox Atlas Archive needs (Landlock ABI {ABI_REQUIRED_NUMBER}), so it won't open archives."
+        )
+    };
     // What extraction does in staging; never devices, FIFOs, sockets or
     // running anything.
     let write = AccessFs::ReadFile
@@ -109,7 +130,7 @@ fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     } else {
         CompatLevel::HardRequirement
     };
-    let mut ruleset = Ruleset::default()
+    let ruleset = Ruleset::default()
         .set_compatibility(required)
         .handle_access(AccessFs::from_all(ABI_REQUIRED))
         .and_then(|r| r.handle_access(AccessNet::from_all(ABI_REQUIRED)))
@@ -119,13 +140,13 @@ fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
         .and_then(|r| r.handle_access(AccessNet::from_all(abi)))
         .and_then(|r| r.scope(Scope::from_all(abi)))
         .and_then(|r| r.create())
-        // Reading, never running: the worker starts no program.
-        .and_then(|r| {
-            r.add_rule(PathBeneath::new(
-                usr,
-                AccessFs::from_read(abi) & !AccessFs::Execute,
-            ))
-        })
+        .map_err(unsupported)?;
+    // Reading, never running: the worker starts no program.
+    let mut ruleset = ruleset
+        .add_rule(PathBeneath::new(
+            usr,
+            AccessFs::from_read(abi) & !AccessFs::Execute,
+        ))
         .map_err(fail)?;
     if let Some(dir) = staging {
         ruleset = ruleset
@@ -138,7 +159,7 @@ fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
         // Everything required is in force (or creating the ruleset failed).
         RulesetStatus::PartiallyEnforced => Ok(()),
         RulesetStatus::NotEnforced if cfg!(feature = "unsandboxed") => {
-            eprintln!("atlas-archive-worker: running WITHOUT a sandbox (test build)");
+            atlas_archive_engine::log_line!("running WITHOUT a sandbox (test build)");
             Ok(())
         }
         RulesetStatus::NotEnforced => Err(

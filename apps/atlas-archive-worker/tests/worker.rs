@@ -27,6 +27,12 @@ fn scratch(tag: &str) -> PathBuf {
     p
 }
 
+/// Held while a descriptor without close-on-exec exists in this process
+/// (openpty's, until marked) and around every spawn that leaves fd 3 or 4
+/// empty: a worker forked in between would take that stray descriptor for
+/// its archive or staging folder.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Puts each `(from, to)` in place in the child, without close-on-exec.
 /// Every source is first copied above 100, so one placement can't overwrite
 /// a source still to come (`from` may be another pair's `to`); the worker
@@ -54,6 +60,16 @@ fn place(pairs: &[(RawFd, RawFd)]) -> std::io::Result<()> {
 /// Runs one job: sends `requests`, answers no limit questions, and returns
 /// every reply and the exit code.
 fn run(archive: Option<&Path>, staging: Option<&Path>, requests: &[Request]) -> (Vec<Reply>, i32) {
+    run_with_env(archive, staging, requests, &[])
+}
+
+/// `run`, with these environment variables set in the worker.
+fn run_with_env(
+    archive: Option<&Path>,
+    staging: Option<&Path>,
+    requests: &[Request],
+    env: &[(&str, &str)],
+) -> (Vec<Reply>, i32) {
     let archive = archive.map(|p| File::open(p).unwrap());
     let staging = staging.map(|p| File::open(p).unwrap());
     let (a, s) = (
@@ -63,6 +79,7 @@ fn run(archive: Option<&Path>, staging: Option<&Path>, requests: &[Request]) -> 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_atlas-archive-worker"));
     cmd.env_clear()
         .env("LANG", "C.UTF-8")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Never the test's own stderr: that can be a terminal, which the
@@ -77,7 +94,10 @@ fn run(archive: Option<&Path>, staging: Option<&Path>, requests: &[Request]) -> 
             (None, None) => Ok(()),
         });
     }
-    let mut child = cmd.spawn().unwrap();
+    let mut child = {
+        let _spawn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        cmd.spawn().unwrap()
+    };
     // Drained, so a worker that logs a lot never blocks on it.
     let mut log = child.stderr.take().unwrap();
     let log = std::thread::spawn(move || {
@@ -198,7 +218,8 @@ fn missing_pieces_fail_in_words() {
     let (replies, code) = run(None, None, &[Request::List]);
     assert_eq!(code, 0);
     assert!(
-        matches!(replies.last(), Some(Reply::Failed { reason }) if reason.contains("No archive"))
+        matches!(replies.last(), Some(Reply::Failed { reason }) if reason.contains("No archive")),
+        "{replies:?}"
     );
     let (replies, _) = run(Some(&a), None, &[extract_request()]);
     assert!(
@@ -276,6 +297,7 @@ fn a_terminal_is_refused() {
     // A pty as the worker's stderr: it says so on the reply pipe and exits
     // with 2 before reading a request.
     let (mut master, mut slave) = (-1, -1);
+    let spawn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: valid out-pointers; null name, termios and window size.
     let r = unsafe {
         libc::openpty(
@@ -289,6 +311,15 @@ fn a_terminal_is_refused() {
     assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
     // SAFETY: two new descriptors, owned from here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // openpty doesn't set close-on-exec; other tests' workers must not get them.
+    for fd in [&master, &slave] {
+        // SAFETY: a descriptor owned here.
+        assert_eq!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    drop(spawn);
     let mut child = Command::new(env!("CARGO_BIN_EXE_atlas-archive-worker"))
         .env_clear()
         .stdin(Stdio::piped())
@@ -306,4 +337,123 @@ fn a_terminal_is_refused() {
     drop(child.stdin.take());
     assert_eq!(child.wait().unwrap().code(), Some(2));
     drop(master);
+}
+
+#[test]
+fn a_broken_archive_lists_what_was_readable_then_fails() {
+    let d = scratch("broken");
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    for n in ["a", "b", "c"] {
+        std::fs::write(d.join("src").join(n), n).unwrap();
+    }
+    let a = d.join("a.tar");
+    let ok = Command::new("tar")
+        .arg("-cf")
+        .arg(&a)
+        .args(["-C", "src", "a", "b", "c"])
+        .current_dir(&d)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    // Ruin the third header (each entry is a header block and a data block).
+    let mut bytes = std::fs::read(&a).unwrap();
+    bytes[2048..2148].fill(0xff);
+    std::fs::write(&a, &bytes).unwrap();
+    let (replies, code) = run(Some(&a), None, &[Request::List]);
+    assert_eq!(code, 0, "{replies:?}");
+    let listed: usize = replies
+        .iter()
+        .map(|r| match r {
+            Reply::Entries(e) => e.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(listed, 2, "{replies:?}");
+    assert!(
+        matches!(replies.last(), Some(Reply::Failed { .. })),
+        "{replies:?}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A zip with one empty file `f`, stored with the DOS time 2020-01-15 12:00:00
+/// and no time zone anywhere in it (the way most zip tools write them).
+fn dos_time_zip() -> Vec<u8> {
+    let (time, date) = (12u16 << 11, (40u16 << 9) | (1 << 5) | 15);
+    let mut z = Vec::new();
+    let u16s = |z: &mut Vec<u8>, v: &[u16]| v.iter().for_each(|x| z.extend(x.to_le_bytes()));
+    let u32s = |z: &mut Vec<u8>, v: &[u32]| v.iter().for_each(|x| z.extend(x.to_le_bytes()));
+    // Local header.
+    u32s(&mut z, &[0x0403_4b50]);
+    u16s(&mut z, &[10, 0, 0, time, date]);
+    u32s(&mut z, &[0, 0, 0]);
+    u16s(&mut z, &[1, 0]);
+    z.push(b'f');
+    // Central directory.
+    let cd = z.len() as u32;
+    u32s(&mut z, &[0x0201_4b50]);
+    u16s(&mut z, &[20, 10, 0, 0, time, date]);
+    u32s(&mut z, &[0, 0, 0]);
+    u16s(&mut z, &[1, 0, 0, 0, 0]);
+    u32s(&mut z, &[0, 0]);
+    z.push(b'f');
+    let cd_size = z.len() as u32 - cd;
+    u32s(&mut z, &[0x0605_4b50]);
+    u16s(&mut z, &[0, 0, 1, 1]);
+    u32s(&mut z, &[cd_size, cd]);
+    u16s(&mut z, &[0]);
+    z
+}
+
+#[test]
+fn dos_times_follow_the_time_zone_inside_the_sandbox() {
+    use std::os::unix::fs::MetadataExt;
+    // The worker reads the zone (tzset) before Landlock, which lets it read
+    // /usr only, so a zone is still found inside: with TZ set, the DOS time
+    // is local to it.
+    let d = scratch("tz");
+    let a = d.join("a.zip");
+    std::fs::write(&a, dos_time_zip()).unwrap();
+    for (tz, want) in [
+        ("UTC", 1_579_089_600),
+        ("America/New_York", 1_579_107_600),
+        ("Asia/Tokyo", 1_579_057_200),
+    ] {
+        let staging = d.join(format!("staging-{}", tz.replace('/', "-")));
+        std::fs::create_dir(&staging).unwrap();
+        let (replies, code) = run_with_env(
+            Some(&a),
+            Some(&staging),
+            &[extract_request()],
+            &[("TZ", tz)],
+        );
+        assert_eq!(code, 0, "{tz}: {replies:?}");
+        assert!(
+            matches!(replies.last(), Some(Reply::Done { .. })),
+            "{tz}: {replies:?}"
+        );
+        let m = std::fs::metadata(staging.join("f")).unwrap();
+        assert_eq!(m.mtime(), want, "{tz}");
+    }
+    // A zone file outside everything Landlock allows reading: only found if
+    // the worker loaded it before the sandbox went up (TZ=":/path").
+    let zone = d.join("zone-tokyo");
+    std::fs::copy("/usr/share/zoneinfo/Asia/Tokyo", &zone).unwrap();
+    let tz = format!(":{}", zone.display());
+    let staging = d.join("staging-file-zone");
+    std::fs::create_dir(&staging).unwrap();
+    let (replies, code) = run_with_env(
+        Some(&a),
+        Some(&staging),
+        &[extract_request()],
+        &[("TZ", tz.as_str())],
+    );
+    assert_eq!(code, 0, "{replies:?}");
+    assert!(
+        matches!(replies.last(), Some(Reply::Done { .. })),
+        "{replies:?}"
+    );
+    let m = std::fs::metadata(staging.join("f")).unwrap();
+    assert_eq!(m.mtime(), 1_579_057_200, "a zone file outside the sandbox");
+    let _ = std::fs::remove_dir_all(&d);
 }

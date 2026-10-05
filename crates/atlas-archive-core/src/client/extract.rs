@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use super::staging::Staging;
 use super::sys;
 use super::trash::Trash;
-use super::{Callbacks, Clash, Error, Mode, fail, io_words};
+use super::{Callbacks, Cancel, Clash, Error, Mode, cause, fail, io_words};
 use crate::audit::Audit;
 use crate::name::{self, MAX_COMPONENT_BYTES};
 use crate::proto::Kind;
@@ -78,6 +78,8 @@ pub struct Placed {
     pub left_out: bool,
     /// The answer given with "do this for all conflicts".
     pub clash_all: Option<Clash>,
+    /// The move went through but couldn't be confirmed (see `unconfirmed`).
+    pub unconfirmed: Option<String>,
 }
 
 /// What `move_out` needs besides the audit.
@@ -90,6 +92,8 @@ pub struct MoveOut<'a> {
     pub trash: Option<&'a Trash>,
     /// A standing answer for clashes from earlier archives.
     pub clash_all: Option<Clash>,
+    /// Checked after a clash question: a Ctrl-C at the prompt ends the job.
+    pub cancel: &'a Cancel,
 }
 
 /// Moves what is at the top of the audited `staging` out into the
@@ -117,6 +121,7 @@ pub fn move_out(
         path: job.dest_path.join(final_name),
         left_out: false,
         clash_all: job.clash_all,
+        unconfirmed: None,
     };
 
     match lone {
@@ -139,8 +144,11 @@ pub fn move_out(
         }
         // Everything else: staging itself becomes the folder.
         _ => {
-            let got = place_staging(staging, &name, job.umask)?;
-            Ok(placed(&got))
+            let (got, note) = place_staging(staging, &name, job.umask)?;
+            Ok(Placed {
+                unconfirmed: note,
+                ..placed(&got)
+            })
         }
     }
 }
@@ -207,7 +215,11 @@ fn move_item(
 /// new one after. A mismatch before the rename places nothing and empties
 /// staging by descriptor; one after it deletes nothing (`unconfirmed`). What this can't close: a process allowed to write the
 /// destination can still swap a name between the check and the rename.
-fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String, Error> {
+fn place_staging(
+    staging: &mut Staging,
+    name: &str,
+    umask: u32,
+) -> Result<(String, Option<String>), Error> {
     let ours = sys::fstat(staging.fd()).map_err(|e| move_failed(&e))?;
     if !super::staging::is_our_dir(&ours) {
         return Err(fail(
@@ -225,7 +237,14 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
         };
         match staging.name_is_ours() {
             Ok(true) => {}
-            Ok(false) => return Err(swapped(staging, "before the move", None)),
+            Ok(false) => {
+                // Gone, or another folder: only the first has a plain cause.
+                let gone = matches!(
+                    sys::lstatat(staging.dest(), staging.name().as_bytes()),
+                    Err(ref e) if e.kind() == io::ErrorKind::NotFound
+                );
+                return Err(swapped(staging, "before the move", None, gone));
+            }
             Err(e) => return Err(move_failed(&e)),
         }
         match sys::rename_noreplace(
@@ -237,7 +256,16 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
             Ok(()) => {
                 match sys::lstatat(staging.dest(), cand.as_bytes()) {
                     Ok(now) if sys::same_file(&now, &ours) => {}
-                    other => return Err(unconfirmed(staging, &cand, other.err())),
+                    // The files are in place by the rename; only the proof is
+                    // missing. The result names where, with the caveat.
+                    other => {
+                        let note = unconfirmed(staging, &cand, other.err());
+                        // Still ours by descriptor: not left at 0700 either.
+                        if let Err(e) = sys::fchmod_soft(staging.fd(), mode) {
+                            log::warn!("The extracted folder couldn't be given its mode: {e}");
+                        }
+                        return Ok((cand, Some(note)));
+                    }
                 }
                 staging.forget();
                 // In place: now it takes the user's mode, by descriptor. A
@@ -246,7 +274,7 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
                 if let Err(e) = sys::fchmod_soft(staging.fd(), mode) {
                     log::warn!("The extracted folder couldn't be given its mode: {e}");
                 }
-                return Ok(cand);
+                return Ok((cand, None));
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(move_failed(&e)),
@@ -260,35 +288,36 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
 /// The rename went through but the name doesn't provably lead to our folder
 /// (a different one is there, or a file system with unstable inode numbers
 /// answered differently). Nothing is deleted: what we can't prove is ours stays,
-/// and the user is told both places. The job's record goes, so no later start
-/// looks at either.
-fn unconfirmed(staging: &mut Staging, placed: &str, why: Option<io::Error>) -> Error {
+/// and the user is told both places (the sentence returned, for the result's
+/// `unconfirmed`). The job's record goes, so no later start looks at either.
+fn unconfirmed(staging: &mut Staging, placed: &str, why: Option<io::Error>) -> String {
     let hidden = staging.name().to_string();
     staging.forget();
     let (placed_text, hidden_text) = (name::display_text(placed), name::display_text(&hidden));
-    fail(
-        format!(
-            "The extracted files were moved to “{placed_text}”, but that couldn't be confirmed, so nothing was deleted. They should be in “{placed_text}”; if not, look for the hidden folder “{hidden_text}”, both in the destination folder."
-        ),
-        format!(
-            "after the move, {placed:?} wasn't proven to be the staging folder {hidden:?}: {}",
-            why.map_or_else(
-                || "a different file is there".to_string(),
-                |e| e.to_string()
-            )
-        ),
-    )
+    let words = format!(
+        "The extracted files were moved to “{placed_text}”, but that couldn't be confirmed, so nothing was deleted. They should be in “{placed_text}”; if not, look for the hidden folder “{hidden_text}”, both in the destination folder."
+    );
+    log::warn!(
+        "{words} (after the move, {placed:?} wasn't proven to be the staging folder {hidden:?}: {})",
+        why.map_or_else(
+            || "a different file is there".to_string(),
+            |e| e.to_string()
+        )
+    );
+    words
 }
 
 /// The staging folder's name led somewhere else: refuse, and empty what is
 /// ours by descriptor (the folder itself then goes when `staging` drops).
 /// `placed` is the name the move gave it when the swap showed up after the
 /// move: something else is at that name then, and it is left alone.
-fn swapped(staging: &Staging, when: &str, placed: Option<&str>) -> Error {
+fn swapped(staging: &Staging, when: &str, placed: Option<&str>, gone: bool) -> Error {
     if let Err(e) = staging.clear() {
         log::warn!("The staging folder couldn't be emptied: {e}");
     }
     let shown = match placed {
+        None if gone => "The extracted files couldn't be moved into place because the folder they were in isn't there any more, so nothing was kept."
+            .to_string(),
         None => "The extracted files couldn't be moved into place safely, so nothing was kept."
             .to_string(),
         Some(p) => format!(
@@ -312,6 +341,12 @@ fn resolve_clash(
         Some(a) => a,
         None => {
             let answer = cb.clash(&name::display_text(item));
+            if job.cancel.is_cancelled() {
+                // The answer is a guess made because the question was cut
+                // short: nothing is placed, and staging goes.
+                finish_staging(staging);
+                return Err(Error::Cancelled);
+            }
             if answer.all {
                 clash_all = Some(answer.action);
             }
@@ -322,6 +357,7 @@ fn resolve_clash(
         path: job.dest_path.join(got),
         left_out: false,
         clash_all,
+        unconfirmed: None,
     };
     match action {
         Clash::Skip => {
@@ -330,6 +366,7 @@ fn resolve_clash(
                 path: job.dest_path.to_path_buf(),
                 left_out: true,
                 clash_all,
+                unconfirmed: None,
             })
         }
         Clash::KeepBoth => {
@@ -356,11 +393,11 @@ fn resolve_clash(
         Clash::Replace => {
             let shown = name::display_text(item);
             let Some(trash) = job.trash else {
-                return Err(not_replaced(&shown, "there is no Trash to use"));
+                return Err(not_replaced(&shown, "there is no Trash to use", None));
             };
             let trashed = trash
                 .trash_item(staging.dest(), job.dest_path, item)
-                .map_err(|e| not_replaced(&shown, &e.to_string()))?;
+                .map_err(|e| not_replaced(&shown, &e.to_string(), cause(&e)))?;
             match sys::rename_noreplace(
                 staging.fd(),
                 item.as_bytes(),
@@ -395,9 +432,10 @@ fn resolve_clash(
     }
 }
 
-fn not_replaced(shown: &str, why: &str) -> Error {
+fn not_replaced(shown: &str, why: &str, cause: Option<&str>) -> Error {
+    let because = cause.map_or(String::new(), |c| format!(" because {c}"));
     fail(
-        format!("“{shown}” couldn't be moved to the Trash, so it was not replaced."),
+        format!("“{shown}” couldn't be moved to the Trash{because}, so it was not replaced."),
         format!("trash failed: {why}"),
     )
 }

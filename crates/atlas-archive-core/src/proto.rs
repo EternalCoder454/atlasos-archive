@@ -22,10 +22,23 @@ use zeroize::Zeroizing;
 
 /// The largest frame, in bytes (length prefix not counted).
 pub const MAX_FRAME: usize = 1024 * 1024;
-/// The most bytes of `Reply::Entries` frames one listing may send.
-pub const MAX_LISTING: u64 = 64 * 1024 * 1024;
+/// The most bytes (estimated: 64 per entry plus its path and link target)
+/// of `Reply::Entries` frames one listing may send: a million entries with
+/// long names. The worker stops the listing there and the client refuses
+/// more, so both use this one figure.
+pub const MAX_LISTING: u64 = 256 * 1024 * 1024;
 /// The longest text or byte string in a message.
 pub const MAX_STRING: usize = 64 * 1024;
+/// The most entry indices one Extract request may select (what the tree holds).
+pub const MAX_SELECTED: usize = 1_000_000;
+/// The longest password the client accepts, in bytes: far under `MAX_FRAME`,
+/// so a password always fits its request.
+pub const MAX_PASSWORD: usize = 64 * 1024;
+
+/// How many different indices `list` holds (what the request will select).
+pub fn selection_len(list: &[u32]) -> usize {
+    runs(list).iter().map(|&(_, len)| len as usize).sum()
+}
 
 /// Why a frame was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +301,21 @@ impl fmt::Debug for Request {
     }
 }
 
+/// Sorted, de-duplicated indices as `(start, len)` runs.
+fn runs(list: &[u32]) -> Vec<(u32, u32)> {
+    let mut sorted = list.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for i in sorted {
+        match out.last_mut() {
+            Some((start, len)) if *start + *len == i && *len < u32::MAX => *len += 1,
+            _ => out.push((i, 1)),
+        }
+    }
+    out
+}
+
 impl Request {
     /// The frame payload. `Zeroizing` because a password request holds one.
     pub fn encode(&self) -> Zeroizing<Vec<u8>> {
@@ -304,9 +332,12 @@ impl Request {
                 e.u8(2).text(encoding);
                 match entries {
                     Some(list) => {
-                        e.u8(1).u32(list.len() as u32);
-                        list.iter().for_each(|&i| {
-                            e.u32(i);
+                        // Sorted indices as [start, len] runs: a selection
+                        // of every entry is one run, not four bytes each.
+                        let runs = runs(list);
+                        e.u8(1).u32(runs.len() as u32);
+                        runs.iter().for_each(|&(start, len)| {
+                            e.u32(start).u32(len);
                         });
                     }
                     None => {
@@ -341,8 +372,21 @@ impl Request {
             2 => {
                 let encoding = d.text()?;
                 let entries = d.opt(|d| {
-                    let n = d.count(4)?;
-                    (0..n).map(|_| d.u32()).collect::<Result<Vec<_>, _>>()
+                    let n = d.count(8)?;
+                    let mut out: Vec<u32> = Vec::new();
+                    for _ in 0..n {
+                        let (start, len) = (d.u32()?, d.u32()? as usize);
+                        // Empty runs, runs past u32 and more indices than
+                        // an archive can hold are refused before any is made.
+                        if len == 0
+                            || out.len().saturating_add(len) > MAX_SELECTED
+                            || start.checked_add(len as u32 - 1).is_none()
+                        {
+                            return Err(ProtoError::TooLarge);
+                        }
+                        out.extend(start..=start + (len as u32 - 1));
+                    }
+                    Ok(out)
                 })?;
                 Request::Extract {
                     encoding,
@@ -701,6 +745,61 @@ mod tests {
         for r in replies() {
             assert_eq!(Reply::decode(&r.encode()).unwrap(), r);
         }
+    }
+
+    fn extract(entries: Option<Vec<u32>>) -> Request {
+        Request::Extract {
+            encoding: "UTF-8".into(),
+            entries,
+            raw_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn selections_travel_as_runs() {
+        // Unsorted and repeated indices come out sorted and once each.
+        let r = extract(Some(vec![9, 3, 4, 5, 3, 0]));
+        assert_eq!(
+            Request::decode(&r.encode()).unwrap(),
+            extract(Some(vec![0, 3, 4, 5, 9]))
+        );
+        // A selection of every entry is one run, far under a frame.
+        let all: Vec<u32> = (0..MAX_SELECTED as u32).collect();
+        let frame = extract(Some(all.clone())).encode();
+        assert!(frame.len() < 100);
+        assert_eq!(Request::decode(&frame).unwrap(), extract(Some(all)));
+        assert_eq!(
+            Request::decode(&extract(Some(vec![])).encode()).unwrap(),
+            extract(Some(vec![]))
+        );
+        // The ends of the index range.
+        let ends = extract(Some(vec![0, u32::MAX]));
+        assert_eq!(Request::decode(&ends.encode()).unwrap(), ends);
+    }
+
+    #[test]
+    fn bad_selections_are_refused() {
+        let frame = |runs: &[(u32, u32)]| {
+            let mut e = Enc::default();
+            e.u8(2).text("UTF-8").u8(1).u32(runs.len() as u32);
+            runs.iter().for_each(|&(s, l)| {
+                e.u32(s).u32(l);
+            });
+            e.text("");
+            e.0
+        };
+        assert!(Request::decode(&frame(&[(0, 1)])).is_ok());
+        // Empty, past u32, and more than an archive can hold.
+        assert!(Request::decode(&frame(&[(5, 0)])).is_err());
+        assert!(Request::decode(&frame(&[(u32::MAX, 2)])).is_err());
+        assert!(Request::decode(&frame(&[(0, u32::MAX)])).is_err());
+        assert!(Request::decode(&frame(&[(0, 600_000), (700_000, 600_000)])).is_err());
+    }
+
+    #[test]
+    fn selection_len_counts_each_index_once() {
+        assert_eq!(selection_len(&[5, 1, 2, 2, 3, 5]), 4);
+        assert_eq!(selection_len(&[]), 0);
     }
 
     #[test]

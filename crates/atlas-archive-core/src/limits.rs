@@ -141,6 +141,9 @@ pub struct Meter {
     limits: Limits,
     off: Vec<Kind>,
     written: u64,
+    /// Bytes read out of the archive and thrown away (entries not wanted):
+    /// they cost no disk, but they are as much a bomb as written ones.
+    discarded: u64,
     entries: u64,
     entry_written: u64,
 }
@@ -151,6 +154,7 @@ impl Meter {
             limits,
             off: Vec::new(),
             written: 0,
+            discarded: 0,
             entries: 0,
             entry_written: 0,
         }
@@ -246,10 +250,27 @@ impl Meter {
         {
             return Err(self.exceeded(Kind::EntryRatio, l.entry_ratio));
         }
-        if self.on(Kind::Ratio)
-            && self.written > l.ratio_after
-            && self.written / archive_read.max(1) >= l.ratio
-        {
+        self.check_flow(archive_read)
+    }
+
+    /// Counts `n` bytes read from the archive and thrown away, because their
+    /// entry isn't wanted. They count with the written bytes against the
+    /// total size and the ratio (not against the free space: nothing is
+    /// written), so a bomb in entries nobody selected asks like any other.
+    pub fn add_discarded(&mut self, n: u64, archive_read: u64) -> Result<(), Exceeded> {
+        self.discarded = self.discarded.saturating_add(n);
+        self.check_flow(archive_read)
+    }
+
+    /// The total size and ratio over everything read out of the archive,
+    /// written or discarded.
+    fn check_flow(&self, archive_read: u64) -> Result<(), Exceeded> {
+        let l = &self.limits;
+        let total = self.written.saturating_add(self.discarded);
+        if self.on(Kind::TotalSize) && total > l.total_bytes {
+            return Err(self.exceeded(Kind::TotalSize, l.total_bytes));
+        }
+        if self.on(Kind::Ratio) && total > l.ratio_after && total / archive_read.max(1) >= l.ratio {
             return Err(self.exceeded(Kind::Ratio, l.ratio));
         }
         Ok(())
@@ -426,6 +447,30 @@ mod tests {
         m.start_entry();
         assert!(m.add(10, 10, None).is_ok());
         assert_eq!(m.add(1, 11, None).unwrap_err().kind, Kind::TotalSize);
+    }
+
+    #[test]
+    fn discarded_bytes_count_with_the_written_ones() {
+        let mut m = Meter::new(Limits {
+            total_bytes: 10,
+            ..Limits::new(None)
+        });
+        m.start_entry();
+        assert!(m.add(4, 4, None).is_ok());
+        assert!(m.add_discarded(6, 10).is_ok());
+        assert_eq!(m.add_discarded(1, 11).unwrap_err().kind, Kind::TotalSize);
+        m.allow(Kind::TotalSize);
+        assert!(m.add_discarded(1000, 11).is_ok());
+        // The ratio too, and not the free space: nothing is written.
+        let mut m = Meter::new(Limits {
+            ratio_after: 100,
+            free_space: 1,
+            ..Limits::new(None)
+        });
+        assert!(m.add_discarded(100, 1).is_ok());
+        assert_eq!(m.add_discarded(1, 1).unwrap_err().kind, Kind::Ratio);
+        m.allow(Kind::Ratio);
+        assert!(m.add_discarded(1 << 20, 1).is_ok());
     }
 
     #[test]
