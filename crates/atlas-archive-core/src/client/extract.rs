@@ -204,8 +204,8 @@ fn move_item(
 /// leaves a folder the next start's record proof still accepts).
 /// The destination's setgid bit is kept. The folder is checked by identity
 /// (device, inode, type) under its old name before the rename and under the
-/// new one after; on a mismatch nothing is placed and staging is emptied by
-/// descriptor. What this can't close: a process allowed to write the
+/// new one after. A mismatch before the rename places nothing and empties
+/// staging by descriptor; one after it deletes nothing (`unconfirmed`). What this can't close: a process allowed to write the
 /// destination can still swap a name between the check and the rename.
 fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String, Error> {
     let ours = sys::fstat(staging.fd()).map_err(|e| move_failed(&e))?;
@@ -237,7 +237,7 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
             Ok(()) => {
                 match sys::lstatat(staging.dest(), cand.as_bytes()) {
                     Ok(now) if sys::same_file(&now, &ours) => {}
-                    _ => return Err(swapped(staging, "after the move", Some(&cand))),
+                    other => return Err(unconfirmed(staging, &cand, other.err())),
                 }
                 staging.forget();
                 // In place: now it takes the user's mode, by descriptor. A
@@ -255,6 +255,29 @@ fn place_staging(staging: &mut Staging, name: &str, umask: u32) -> Result<String
     Err(Error::Failed(
         "Too many items with this name are already in the folder.".into(),
     ))
+}
+
+/// The rename went through but the name doesn't provably lead to our folder
+/// (a different one is there, or a file system with unstable inode numbers
+/// answered differently). Nothing is deleted: what we can't prove is ours stays,
+/// and the user is told both places. The job's record goes, so no later start
+/// looks at either.
+fn unconfirmed(staging: &mut Staging, placed: &str, why: Option<io::Error>) -> Error {
+    let hidden = staging.name().to_string();
+    staging.forget();
+    let (placed_text, hidden_text) = (name::display_text(placed), name::display_text(&hidden));
+    fail(
+        format!(
+            "The extracted files were moved to “{placed_text}”, but that couldn't be confirmed, so nothing was deleted. They should be in “{placed_text}”; if not, look for the hidden folder “{hidden_text}”, both in the destination folder."
+        ),
+        format!(
+            "after the move, {placed:?} wasn't proven to be the staging folder {hidden:?}: {}",
+            why.map_or_else(
+                || "a different file is there".to_string(),
+                |e| e.to_string()
+            )
+        ),
+    )
 }
 
 /// The staging folder's name led somewhere else: refuse, and empty what is

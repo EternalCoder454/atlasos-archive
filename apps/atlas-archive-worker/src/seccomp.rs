@@ -9,7 +9,9 @@
 //! another process (only the caller's own, pid 0), no terminal injection
 //! (`TIOCSTI` and its kin), no btrfs subvolume creation (a new subvolume in
 //! staging is a tree the audit's `RENAME_NOREPLACE` and `unlinkat` can't
-//! handle).
+//! handle). Nor can it change its process group or session: the client
+//! signals the worker's group by number, and that must stay the group the
+//! client made.
 //!
 //! A deny list: everything else the parsers, the allocator and threads need
 //! stays allowed. Denied calls fail with EPERM (`clone3` with ENOSYS, so
@@ -160,6 +162,13 @@ fn denied() -> Vec<i64> {
         libc::SYS_mq_timedreceive,
         libc::SYS_mq_notify,
         libc::SYS_mq_getsetattr,
+        // Process groups and sessions: the client made the worker's group
+        // before the exec and signals it by number. A worker that joined
+        // another group (the client's own) would have the client's stop and
+        // kill signals land there. glibc's `setpgrp` is `setpgid(0, 0)`, and
+        // neither architecture has a `setpgrp` call of its own.
+        libc::SYS_setpgid,
+        libc::SYS_setsid,
         // Priorities: the caller's own are the system's to keep.
         libc::SYS_setpriority,
         libc::SYS_ioprio_set,
@@ -315,5 +324,43 @@ mod tests {
         }
         // The last instruction ends the program.
         assert_eq!(p.last().map(|f| f.code), Some(RET_K));
+    }
+
+    #[test]
+    fn the_worker_cannot_change_its_group_or_session() {
+        // In a child, so the filter is not put on the test process.
+        // SAFETY: the child makes only prctl, setpgid, setsid, write and _exit
+        // after the fork (the filter's own allocation is ordinary Rust, which
+        // is fine after a fork: glibc's allocator survives it).
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                let mut code = 0;
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || install().is_err() {
+                    code = 10;
+                } else {
+                    let r = libc::setpgid(0, 0);
+                    if r != -1 || *libc::__errno_location() != libc::EPERM {
+                        code = 11;
+                    }
+                    let r = libc::setsid();
+                    if r != -1 || *libc::__errno_location() != libc::EPERM {
+                        code = 12;
+                    }
+                    // Not a blanket ban: asking is fine.
+                    if libc::getpgid(0) < 0 {
+                        code = 13;
+                    }
+                }
+                libc::_exit(code);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child status {status:#x}"
+            );
+        }
     }
 }

@@ -117,16 +117,34 @@ fn check(r: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// A sentence the audit made for the user. It is its own error type so the
+/// client can tell it from an OS error or any other `io::Error` by type, not
+/// by how the text looks. It may hold archive names (cleaned for display).
+#[derive(Debug)]
+pub struct AuditMessage(String);
+
+impl std::fmt::Display for AuditMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AuditMessage {}
+
+pub(crate) fn message(words: impl Into<String>) -> io::Error {
+    io::Error::other(AuditMessage(words.into()))
+}
+
 fn failed_check() -> io::Error {
-    io::Error::other("The extracted files couldn't be checked.")
+    message("The extracted files couldn't be checked.")
 }
 
 fn changed() -> io::Error {
-    io::Error::other("The extracted files changed while they were being checked.")
+    message("The extracted files changed while they were being checked.")
 }
 
 fn too_many() -> io::Error {
-    io::Error::other("The extracted folder holds more items than Atlas Archive can check.")
+    message("The extracted folder holds more items than Atlas Archive can check.")
 }
 
 /// `openat2` below `dir` (`path` relative; empty for `dir` itself).
@@ -383,7 +401,7 @@ fn walk(staging: BorrowedFd<'_>, links_left: &mut usize) -> io::Result<(Vec<Foun
         for (name, st, link) in read_dir(fd.as_fd(), MAX_NODES - found.len(), links_left)? {
             let len = dir_path.len() + usize::from(!dir_path.is_empty()) + name.len();
             if depth >= MAX_DEPTH || len > MAX_PATH_LEN {
-                return Err(io::Error::other(
+                return Err(message(
                     "The extracted folder nests deeper than Atlas Archive can check.",
                 ));
             }
@@ -559,7 +577,7 @@ pub fn audit(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
         // A rename to a longer disk form (an invalid byte becomes U+FFFD)
         // can push a name or path past the kernel's limits.
         if e.raw_os_error() == Some(libc::ENAMETOOLONG) {
-            io::Error::other("A name in the extracted files is too long to check.")
+            message("A name in the extracted files is too long to check.")
         } else {
             e
         }
@@ -688,18 +706,16 @@ fn audit_fd(staging: BorrowedFd<'_>, umask: u32) -> io::Result<Audit> {
     // fails the same way, with that reason.
     if let Some(&i) = gone.iter().find(|&&i| found[i].kind == Kind::Dir) {
         let path = shown(&path_of(&found, &names, i));
-        return Err(io::Error::other(
-            match skip_reason.get(&(position[i] as u32)) {
-                Some(r) => format!("A folder in the extracted files ({path}) can't be kept: {r}"),
-                // Past MAX_SKIPPED the tree keeps no reason: say less.
-                None if tree_skips_full => {
-                    format!("A folder in the extracted files ({path}) can't be kept.")
-                }
-                None => format!(
-                    "Two folders in the extracted files ({path}) would end up with the same name, and Atlas Archive won't merge them."
-                ),
-            },
-        ));
+        return Err(message(match skip_reason.get(&(position[i] as u32)) {
+            Some(r) => format!("A folder in the extracted files ({path}) can't be kept: {r}"),
+            // Past MAX_SKIPPED the tree keeps no reason: say less.
+            None if tree_skips_full => {
+                format!("A folder in the extracted files ({path}) can't be kept.")
+            }
+            None => format!(
+                "Two folders in the extracted files ({path}) would end up with the same name, and Atlas Archive won't merge them."
+            ),
+        }));
     }
     gone.sort_by_key(|&i| found[i].parent);
     let mut folders = Folders::new();

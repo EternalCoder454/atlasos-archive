@@ -77,21 +77,16 @@ pub struct Extraction {
     pub skipped_more: u64,
 }
 
-/// Removes the staging folders of dead jobs. Quiet: only the log hears.
+/// Starts the sweep of dead jobs' staging folders and returns at once: it runs
+/// on a detached thread (at most every ten minutes) that nothing waits for, so
+/// a dead mount or a big leftover never holds up the command. Quiet: only the
+/// log hears.
 pub fn clean_stale_jobs() {
     let Some(dir) = client::default_state_dir() else {
         log::debug!("no state folder, so no stale jobs to clean");
         return;
     };
-    match client::clean_stale(&dir) {
-        Ok(c) => log::debug!(
-            "stale jobs: {} removed, {} still running, {} left",
-            c.removed,
-            c.live,
-            c.failed
-        ),
-        Err(e) => log::debug!("couldn't look for stale jobs: {e}"),
-    }
+    client::clean_stale_in_background(&dir);
 }
 
 /// Where the password question stands, for the exit code.

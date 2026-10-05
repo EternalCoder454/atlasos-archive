@@ -107,7 +107,8 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    mounts, modules and the other administrative calls, System V and POSIX
    message queues, shared memory and semaphores, `kcmp`, `setpriority`,
    `ioprio_set`, `migrate_pages`, `move_pages`, `pidfd_send_signal`,
-   `process_mrelease`, and
+   `process_mrelease`, `setpgid` and `setsid` (the group stays the one the
+   client made), and
    the terminal and btrfs `ioctl` commands that reach outside the worker
    (`TIOCSTI`, `TIOCLINUX`, `TIOCCONS`, `TIOCSCTTY`, `TIOCSETD`, subvolume
    and snapshot creation); `prlimit64` and the `sched_set*` calls work only
@@ -119,7 +120,11 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 256. On a kernel without Landlock the
    worker refuses to run unless the build was made for tests. The client
    starts it in its own process group with `PR_SET_PDEATHSIG(SIGKILL)` and
-   kills the group (by pidfd where the kernel has it). Its working folder is
+   signals the worker itself through its pidfd (flags 0, which can't be
+   redirected) and its group with `kill(-pid)`, both every time and only while
+   the child is unreaped, so the number is still its own; never the pidfd's
+   process-group flag, which follows the worker into whatever group it joined.
+   Its working folder is
    `/`, its signal dispositions and mask are reset, and every descriptor
    above 4 is closed at exec. The archive is opened `O_PATH` first, checked
    to be a regular file, then reopened read-only (`O_NOCTTY`) and checked to
@@ -147,10 +152,37 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    is a protocol error). A job may send at most 4,000,000 frames and
    1,000,000 skipped-entry frames; each kind of limit is asked once; after a
    declined limit only `Failed` is accepted; a password is asked 5 times at
-   most. The client enforces the size limits too: it checks staging's file
-   system at least once a second and kills the worker when the free space
+   most, and each one asked is tried. A listing batch with no entries
+   doesn't count as the job advancing. Progress of one byte at a time does,
+   so a hostile worker can creep along slowly; the user's Cancel ends it.
+   While a limit question is open, the client stops the worker and its
+   group (`SIGSTOP`) and continues them (`SIGCONT`) before sending the
+   answer; Cancel kills them as usual. If the stop can't be sent, the client
+   doesn't ask: it kills the worker and the job fails ("Atlas Archive
+   couldn't pause the archive reader to ask, so it stopped."). The space
+   check runs right after the stop, before the question. A worker's end that
+   can't be waited for (the host set `SIGCHLD` to be ignored after the
+   spawn) is confirmed through the pidfd, within the same bounded wait; if it
+   can't be, the worker counts as hung. At most 8 workers stuck on drives that
+   don't respond (waited for by reaper threads) exist at once; past that,
+   new jobs are refused ("Too many archive jobs are stuck…"). The client
+   enforces the size limits too: it checks staging's file system every
+   250 ms and kills the worker when the free space
    falls below the reserve, or the space used passes the approved size plus
-   an eighth (at least 16 MiB). Writes to the worker never raise `SIGPIPE`
+   an eighth (at least 16 MiB). The watch fails closed: where the drive gives
+   no usable figure (an error, or zeros for block size and count: some FUSE
+   and network file systems), an extraction is refused before the worker is
+   asked ("This drive doesn't report its free space, so Atlas Archive can't
+   extract here safely."), and the worker itself reports no figure there
+   too. A read that fails during a job is logged and tolerated; the third in
+   a row, at least 2 s after the first, stops the job. A pause (`SIGSTOP`)
+   is confirmed through the pidfd (`waitid`, which reports a stop only once
+   every thread has stopped; else the leader's state in `/proc` while the
+   child is unreaped), up to 3 s, before the space check, or the job fails.
+   Once the pidfd says the worker is gone (`ESRCH`), nothing more is
+   signalled by number, since the kernel may have reaped it and reused the
+   number. The xdg-document-portal's FUSE mount reports no figures, so a
+   folder passed through it is refused. Writes to the worker never raise `SIGPIPE`
    (blocked on the writing thread), so a host that doesn't ignore it can't
    be killed by a worker that closed its end.
 
@@ -179,7 +211,8 @@ Every entry path is untrusted. In `core::path`:
 The writer (`engine::extract`) works below one descriptor, the staging folder:
 
 - Staging is `.<archive name>.atlas-partial-<random>`, created 0700 with
-  `mkdirat` inside the destination, and opened `O_DIRECTORY|O_NOFOLLOW`.
+  `mkdirat` inside the destination, opened `O_DIRECTORY|O_NOFOLLOW`, and
+  used only if it is ours and empty.
 - Every open is `openat2(staging, path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
   | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`; files with `O_CREAT|O_EXCL|
   O_NOFOLLOW|O_CLOEXEC`. A symlink made earlier in the same archive can
@@ -229,9 +262,14 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   from the trash, and if that fails too, staging is kept and the message
   says where both are. Before and after the move out, the name in the
   destination is checked (device, inode, type) to be staging's descriptor.
+  A mismatch after the move deletes nothing (some FUSE and network file
+  systems change inode numbers); the user is told both places.
   A destination folder others can write to is refused unless it is sticky
   ("Choose a folder of your own"); so is one a group other than the
-  user's own can write to. Staging stays exactly 0700 until it is in place,
+  user's own can write to, and one whose access list lets another user or
+  a group write (an access list that can't be read counts as shared), and
+  one another user (not root) owns and can write, sticky or not. A user's
+  primary group is taken as private, as on Fedora. Staging stays exactly 0700 until it is in place,
   and gets its final mode by descriptor after the move. What remains is a race with the user's
   own processes, which have the user's rights anyway. On file systems
   without `RENAME_NOREPLACE` (FAT, exFAT, some FUSE, NFS and SMB mounts) the
@@ -249,13 +287,23 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   other writable), and the next start removes the ones whose job is dead
   (another boot, or the pid gone or reused). A record proves nothing by
   itself: the target's name must match `.<name>.atlas-partial-<16 hex>`,
-  and only a folder of ours with mode 0700 is deleted. When the device
+  and only a folder of ours with mode 0700 (setgid aside) is deleted, or of
+  ours by name alone where the record says the file system keeps no modes
+  (FAT, exFAT). When the device
   number differs (btrfs changes it across boots) but the folder's inode and
-  that proof hold, it is deleted. A record whose destination is missing
-  (an unplugged drive) or holds another folder now waits, and is dropped
-  after 30 days. The whole cleanup has a 20 s budget per start; a delete
-  that doesn't finish keeps its record for the next one. This runs off the
-  UI thread, since a dead mount can block it. The user's files
+  that proof hold, it is deleted. A record whose destination is gone, not
+  a folder, unreachable, or holds a folder that can't be proven waits, and
+  is dropped after 30 days (by the record's age) with a log line naming the
+  hidden folder, which then stays to be deleted by hand (a renamed or moved
+  destination ends this way); a record whose delete keeps failing is
+  dropped the same way. The whole cleanup has a 20 s budget per start; a
+  delete that doesn't finish keeps its record for the next one. It runs on
+  a background thread nobody waits for, at most once per 10 minutes (the
+  stamp `jobs/sweep.stamp`, 0600, replaced by rename), since a dead mount
+  can block it; the CLI may exit with it unfinished, so a huge leftover
+  found only by short CLI runs goes a slice at a time (the GUI, which stays
+  open, finishes it). Residual: a thread
+  stuck in a hard-mounted dead NFS share can still hold up process exit. The user's files
   never mix with half a tree.
 - Before writing, the free space below the destination is checked against
   the declared total; a full disk mid-way stops with "There isn't enough
@@ -264,7 +312,9 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   walks staging by descriptor (`openat2` as above, never following links,
   breadth first, one descriptor open at a time, with the node, depth and
   path-length caps of the tree; past one, the audit fails and staging is
-  deleted). Staging itself is set to 0700 first (the move out gives the
+  deleted). When it fails with one of its own fixed sentences (two folders
+  with one name, too many items, nested too deep, a name too long), the
+  user sees that sentence; an OS error keeps the generic text. Staging itself is set to 0700 first (the move out gives the
   folder its final mode). The audit describes what is there as archive
   entries and builds a `Tree` from them, so the same rules decide: anything but regular files, folders
   and symlinks is removed; a file with more links than names in staging (a
@@ -433,7 +483,7 @@ Job objects, `/net/eterneon/atlas/archive/job/<n>`, interface
 - properties (with `PropertiesChanged`, at most 10 a second): `Title` (s),
   `State` (s: `queued`, `running`, `paused`, `waiting-for-user`, `done`,
   `failed`, `cancelled`), `ProcessedBytes` (t), `TotalBytes` (t, 0 unknown),
-  `ProcessedItems` (u), `TotalItems` (u, 0 unknown), `Error` (s, plain words)
+  `ProcessedItems` (u), `TotalItems` (u, 0 unknown), `Error` (s, plain words; it can hold archive names, with paths escaped, so it is plain text and every front end shows it with `Text.PlainText`)
 - methods: `Pause()`, `Resume()` (`SIGSTOP`/`SIGCONT` to the worker),
   `Cancel()`
 - signal: `Finished(s state, as results)`, `results` being the URIs of what

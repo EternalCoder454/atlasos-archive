@@ -203,25 +203,11 @@ pub fn getegid() -> u32 {
     unsafe { libc::getegid() }
 }
 
-/// Opens `name` in `dir` as an `O_PATH` descriptor without following a link:
+/// Opens `name` in `dir` as an `O_PATH` descriptor (by `openat2` with the
+/// client's resolve flags, so not across a mount either), never through a link:
 /// good for `fstat` and `fchmod_path`, nothing else.
 pub fn open_path_nofollow(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<OwnedFd> {
-    let c = cstr(name)?;
-    retry(|| {
-        // SAFETY: a valid descriptor and C string; a new descriptor we own.
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                c.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(owned(fd))
-        }
-    })
+    openat2(dir, name, libc::O_PATH | libc::O_NOFOLLOW)
 }
 
 /// `fchmod` for an `O_PATH` descriptor (which `fchmod` refuses), through
@@ -275,13 +261,24 @@ pub fn fd_path(fd: BorrowedFd<'_>) -> Option<std::path::PathBuf> {
     p.is_absolute().then_some(p)
 }
 
-/// The bytes a non-root user can still write on the file system of `fd`.
+/// The bytes a non-root user can still write on the file system of `fd`;
+/// `ErrorKind::Unsupported` when the file system gives no figures.
 pub fn free_bytes(fd: BorrowedFd<'_>) -> io::Result<u64> {
     let mut v = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: a valid descriptor; `v` is filled on success.
     check(unsafe { libc::fstatvfs(fd.as_raw_fd(), v.as_mut_ptr()) })?;
     // SAFETY: initialised by the successful call.
     let v = unsafe { v.assume_init() };
+    // Some file systems (FUSE and network mounts) answer with zeros for
+    // everything: that is "no figure", and reading it as "no space free"
+    // would be as wrong as reading it as plenty. A full drive still has its
+    // blocks counted.
+    if v.f_frsize == 0 || v.f_blocks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the file system gives no free-space figures",
+        ));
+    }
     Ok(v.f_bavail.saturating_mul(v.f_frsize))
 }
 
@@ -486,6 +483,16 @@ pub fn bfd(fd: &OwnedFd) -> BorrowedFd<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_space_of_a_drive_with_no_figures_is_unsupported() {
+        // /proc reports no blocks at all.
+        let proc = std::fs::File::open("/proc").unwrap();
+        let e = free_bytes(proc.as_fd()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        let here = std::fs::File::open(std::env::temp_dir()).unwrap();
+        assert!(free_bytes(here.as_fd()).is_ok());
+    }
 
     #[test]
     fn percent_encoding_round_trips() {

@@ -7,8 +7,8 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -22,6 +22,10 @@ const STAGING_FD: RawFd = 4;
 /// Where the parent keeps its copies until the child places them: above
 /// everything std or the caller can have opened as 0 to 4.
 const HIGH_FD: RawFd = 100;
+/// The least a copy may be numbered, when `RLIMIT_NOFILE` leaves no room for
+/// `HIGH_FD`: it only has to be above the targets, 3 and 4. The child's own
+/// 0 to 2 are placed by dup2 over whatever is there, and the copies are close-on-exec.
+const LOW_FD: RawFd = 5;
 /// The longest log line kept, and the most lines per worker.
 const LOG_LINE_MAX: usize = 512;
 const LOG_LINES_MAX: usize = 200;
@@ -29,6 +33,36 @@ const LOG_LINES_MAX: usize = 200;
 /// called unresponsive (a process in uninterruptible I/O on a dead mount
 /// doesn't die at SIGKILL until the I/O returns).
 const KILL_WAIT: Duration = Duration::from_secs(10);
+/// How long a SIGSTOP may take to show. Generous: a write held in the
+/// kernel's writeback throttling on a slow USB stick returns to user mode
+/// (and stops) only when its I/O allows.
+const STOP_WAIT: Duration = Duration::from_secs(3);
+/// The most workers that may be stuck in the kernel at once, process-wide,
+/// each with a reaper thread and a log thread. Past it no job starts.
+const MAX_STUCK: usize = 8;
+/// Reaper threads that have not yet seen their worker end.
+static REAPERS: AtomicUsize = AtomicUsize::new(0);
+/// Stuck workers no reaper thread could be started for, tried again by
+/// `check_capacity`; they count as stuck until they end.
+static ORPHANS: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+/// The words for `check_capacity` failing; the client maps `ResourceBusy` to them.
+pub const TOO_MANY_STUCK: &str = "Too many archive jobs are stuck on drives that don't respond.";
+
+/// `Err(ResourceBusy)` when `MAX_STUCK` workers are still stuck on dead drives
+/// (their drives came back, or not, since): a new job could only join them.
+pub fn check_capacity() -> io::Result<()> {
+    let orphans = {
+        let mut o = ORPHANS.lock().unwrap_or_else(|p| p.into_inner());
+        // A wait that errors means the child is gone for us as well.
+        o.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        o.len()
+    };
+    if REAPERS.load(Ordering::SeqCst) + orphans >= MAX_STUCK {
+        return Err(io::Error::new(io::ErrorKind::ResourceBusy, TOO_MANY_STUCK));
+    }
+    Ok(())
+}
 
 /// Stops a running job from any thread. Cheap to clone; every clone is the
 /// same handle.
@@ -168,6 +202,10 @@ pub struct Running {
     /// A handle on the child that can't name a later process; `None` where
     /// the kernel has no `pidfd_open` (before Linux 5.3).
     pidfd: Option<OwnedFd>,
+    /// The pidfd said the worker is gone (`ESRCH`): it may have been reaped
+    /// by the kernel already, so its number may name something else now and
+    /// nothing more is sent by number.
+    gone: bool,
     killed: bool,
     input: Option<OwnedFd>,
     output: OwnedFd,
@@ -242,22 +280,33 @@ pub fn spawn(
     let ignored = unsafe {
         let mut old: libc::sigaction = std::mem::zeroed();
         libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) == 0
-            && old.sa_sigaction == libc::SIG_IGN
+            && (old.sa_sigaction == libc::SIG_IGN || old.sa_flags & libc::SA_NOCLDWAIT != 0)
     };
     if ignored {
         return Err(io::Error::other(
-            "SIGCHLD is ignored by this program, so the archive reader can't be waited for",
+            "SIGCHLD is ignored (or children are not kept for waiting) by this program, so the archive reader can't be waited for",
         ));
     }
+    check_capacity()?;
     // Copies above the target range first: the pipes std makes for 0 to 2 can
     // be any numbers, and placing one descriptor must never overwrite another
     // still to come.
-    let a = sys::dup_above(archive.as_fd(), HIGH_FD)?;
-    let s = staging
-        .map(|s| sys::dup_above(s.as_fd(), HIGH_FD))
-        .transpose()?;
+    let a = dup_high(archive.as_fd())?;
+    let s = staging.map(|s| dup_high(s.as_fd())).transpose()?;
     let (a_raw, s_raw) = (a.as_raw_fd(), s.as_ref().map(AsRawFd::as_raw_fd));
 
+    // std's pipe that reports a failed exec takes the lowest free number in
+    // the child. Were that 3 or 4, the `dup2` below would close it and a failed
+    // exec would go unreported (the worker would just be gone, and the user
+    // told it stopped). Two throwaway copies take the lowest free numbers from
+    // 3 up for the duration of the spawn, so the pipe lands above 4. Best
+    // effort: with no descriptor to spare, the spawn goes on without them.
+    let holds = [
+        sys::dup_above(archive.as_fd(), 3).ok(),
+        sys::dup_above(archive.as_fd(), 3).ok(),
+    ];
+    // SAFETY: getpid takes no arguments and cannot fail.
+    let parent = unsafe { libc::getpid() };
     let mut cmd = Command::new(exe);
     cmd.env_clear()
         .env("LANG", "C.UTF-8")
@@ -273,7 +322,8 @@ pub fn spawn(
     unsafe {
         cmd.pre_exec(move || {
             // Nothing the parent ignored or blocked may reach the worker.
-            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGPIPE] {
+            // (SIGKILL and SIGSTOP refuse with EINVAL, which is fine.)
+            for sig in 1..=64 {
                 libc::signal(sig, libc::SIG_DFL);
             }
             let mut empty: libc::sigset_t = std::mem::zeroed();
@@ -282,6 +332,14 @@ pub fn spawn(
             // The worker dies with the thread that started it.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // If the whole process ended between the fork and the prctl, the
+            // signal guards nothing and the parent is already someone else.
+            // (getppid is the parent's process id, not its thread's: a thread
+            // that alone ended is not caught here, and the signal covers it
+            // from the prctl on.)
+            if libc::getppid() != parent {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
             }
             if libc::dup2(a_raw, ARCHIVE_FD) < 0 {
                 return Err(io::Error::last_os_error());
@@ -299,7 +357,9 @@ pub fn spawn(
             }
             // Everything above 4 is closed at exec, whatever the parent left
             // open without close-on-exec. (Marked, not closed now: std's pipe
-            // that reports a failed exec must live until then.)
+            // that reports a failed exec must live until then. It is numbered
+            // above 4 because of the holds in `spawn`, bar a thread of the
+            // program freeing a low descriptor at that very moment.)
             let first_extra: libc::c_uint = 5;
             let r = libc::syscall(
                 libc::SYS_close_range,
@@ -316,8 +376,9 @@ pub fn spawn(
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
-    drop((a, s));
+    let spawned = cmd.spawn();
+    drop((a, s, holds));
+    let mut child = spawned?;
     let pid = child.id() as libc::pid_t;
     // Right away: the child is not reaped (only we reap it), so the number
     // can't have been reused yet.
@@ -339,6 +400,7 @@ pub fn spawn(
         child: Some(child),
         pid,
         pidfd,
+        gone: false,
         killed: false,
         input: None,
         output,
@@ -351,11 +413,22 @@ pub fn spawn(
     sys::set_nonblocking(bfd(&running.output))?;
     running.input = Some(input);
     // The pipe must be drained or the worker would block on it; no thread
-    // means no worker.
+    // means no worker (`running` is killed and reaped as it drops).
     std::thread::Builder::new()
         .name("archive-worker-log".into())
         .spawn(move || drain_log(stderr))?;
     Ok(running)
+}
+
+/// A copy of `fd` numbered `HIGH_FD` or more, or at least `LOW_FD` when the
+/// descriptor limit is too low for that.
+fn dup_high(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    match sys::dup_above(fd, HIGH_FD) {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EMFILE)) => {
+            sys::dup_above(fd, LOW_FD)
+        }
+        r => r,
+    }
 }
 
 /// Copies the worker's stderr into the log: capped lines, capped count, no
@@ -438,6 +511,159 @@ fn write_no_sigpipe(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 }
 
 impl Running {
+    /// Sends `sig` to the worker itself: through the pidfd with no flags, which
+    /// names this process and can't be redirected; by `kill(pid)` only where
+    /// there is no pidfd (or it refuses) and the child is still unreaped, so
+    /// the number is still its own. `true`: the signal went out.
+    fn signal_worker(&mut self, sig: libc::c_int) -> bool {
+        if self.gone {
+            return false;
+        }
+        if let Some(p) = &self.pidfd {
+            // SAFETY: a valid pidfd; no siginfo; no flags.
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    p.as_raw_fd(),
+                    sig,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0 as libc::c_uint,
+                )
+            };
+            if r == 0 {
+                return true;
+            }
+            if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                // Already gone, and maybe auto-reaped (SIGCHLD ignored): the
+                // number may be reused, so no `kill` and no group signal.
+                self.gone = true;
+                return false;
+            }
+        }
+        // SAFETY: kill takes no pointers; an unreaped child keeps its number.
+        self.child.is_some() && unsafe { libc::kill(self.pid, sig) } == 0
+    }
+
+    /// Sends `sig` to the group the client made for the worker (its number is
+    /// the worker's pid), so 7z and unrar are reached too. By `kill(-pid)`,
+    /// never by the pidfd's group flag: that signals whatever group the worker
+    /// is in at send time, and a hostile worker can move itself into the
+    /// client's own group. Only while the child is unreaped: it pins the
+    /// number, so it can't have been reused. `true`: the signal went out.
+    fn signal_group(&self, sig: libc::c_int) -> bool {
+        if self.gone {
+            return false;
+        }
+        // SAFETY: kill takes no pointers; see above for why the number is ours.
+        self.child.is_some() && unsafe { libc::kill(-self.pid, sig) } == 0
+    }
+
+    /// The worker first, then its group; `true` if either signal went out.
+    /// Both always: the worker may have left the group, and the group may
+    /// hold more than the worker.
+    fn signal_both(&mut self, sig: libc::c_int) -> bool {
+        let single = self.signal_worker(sig);
+        let group = self.signal_group(sig);
+        single || group
+    }
+
+    /// Stops the worker and its group (SIGSTOP) so that nothing writes while
+    /// the user is asked a question. `false`: it could not be stopped. A
+    /// stopped worker still dies at `finish` or when the thread ends.
+    pub fn pause(&mut self) -> bool {
+        let ok = self.signal_both(libc::SIGSTOP) && self.wait_stopped();
+        if !ok {
+            log::warn!("The archive reader couldn't be stopped for a question.");
+        }
+        ok
+    }
+
+    /// SIGSTOP is asynchronous: waits (at most `STOP_WAIT`) until the worker
+    /// has really stopped, so nothing is written while the space is checked.
+    /// Through the pidfd (`waitid` with `P_PIDFD`, which never reaps), else
+    /// by number while the child is unreaped and the pidfd isn't readable.
+    fn wait_stopped(&mut self) -> bool {
+        let deadline = Instant::now() + STOP_WAIT;
+        loop {
+            match self.stopped_now() {
+                Some(true) => return true,
+                Some(false) => {}
+                None => return false,
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// `Some(stopped)`, or `None` when it can't be told (the worker is gone).
+    fn stopped_now(&mut self) -> Option<bool> {
+        if self.gone {
+            return None;
+        }
+        const P_PIDFD: libc::c_long = 3;
+        let opts = libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT | libc::WEXITED;
+        let mut err = libc::EINVAL;
+        if let Some(p) = &self.pidfd {
+            // SAFETY: siginfo_t is plain data; all zeros is a valid value.
+            let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid pidfd and siginfo; WNOWAIT never reaps.
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_waitid,
+                    P_PIDFD,
+                    p.as_raw_fd() as libc::c_long,
+                    &mut si as *mut libc::siginfo_t,
+                    opts,
+                    std::ptr::null::<libc::rusage>(),
+                )
+            };
+            if r == 0 {
+                // SAFETY: filled by the successful call.
+                return match (unsafe { si.si_pid() } != 0).then_some(si.si_code) {
+                    Some(libc::CLD_STOPPED | libc::CLD_TRAPPED) => Some(true),
+                    // Exited or killed: it can't be stopped.
+                    Some(_) => None,
+                    None => Some(false),
+                };
+            }
+            err = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+        }
+        if err == libc::ESRCH {
+            self.gone = true;
+            return None;
+        }
+        // No pidfd waitid (an old kernel, or the kernel reaps for us): the
+        // state letter in /proc, while the number is still ours.
+        if self.child.is_none() && self.pidfd.is_none() {
+            return None;
+        }
+        if let Some(p) = &self.pidfd {
+            let mut fds = [libc::pollfd {
+                fd: p.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: one valid pollfd; no wait.
+            if unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) } > 0 {
+                return None;
+            }
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
+        let state = stat.rsplit_once(')')?.1.trim_start().chars().next()?;
+        Some(matches!(state, 'T' | 't'))
+    }
+
+    /// Lets a worker stopped by `pause` go on (SIGCONT).
+    pub fn resume(&mut self) {
+        if !self.signal_both(libc::SIGCONT) {
+            log::warn!("The archive reader couldn't be continued.");
+        }
+    }
+
     /// How long a reply may go without the job advancing.
     pub fn timeout(&self) -> Duration {
         self.timeout
@@ -546,6 +772,34 @@ impl Running {
         }
     }
 
+    /// Whether the pidfd says the worker has ended, waiting until `deadline`.
+    /// `false` with no pidfd or when it hasn't ended in time.
+    fn gone_by_pidfd(&self, deadline: Instant) -> bool {
+        let Some(p) = &self.pidfd else {
+            return false;
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut fds = [libc::pollfd {
+                fd: p.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32 + 1;
+            // SAFETY: one valid pollfd.
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+            if r > 0 {
+                return fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0;
+            }
+            if r < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return false;
+            }
+            if remaining.is_zero() {
+                return false;
+            }
+        }
+    }
+
     /// Kills the worker and everything in its group, then reaps it, waiting
     /// at most `KILL_WAIT`. The kill goes out before the reap, while the
     /// number still names our child (and the pidfd names it for good), so it
@@ -558,23 +812,14 @@ impl Running {
     pub fn finish(&mut self) -> io::Result<ExitStatus> {
         if !self.killed {
             self.killed = true;
-            // SAFETY: the child is not reaped (only the code below does
-            // that), so `pid` is still its pid and its group's id.
-            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
-            let sent = self.pidfd.as_ref().is_some_and(|p| {
-                // SAFETY: a valid pidfd; no siginfo, no flags.
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        p.as_raw_fd(),
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    ) == 0
-                }
-            });
-            // The group may be gone while the child is not (setpgid failed).
-            if !sent && let Some(c) = self.child.as_mut() {
+            // The child is not reaped (only the code below does that), so
+            // `pid` is still its pid and its group's id, and the pidfd names
+            // it for good. SIGKILL ends a stopped worker too.
+            // Not when the pidfd said it is gone: the number may be reused.
+            if !self.signal_both(libc::SIGKILL)
+                && !self.gone
+                && let Some(c) = self.child.as_mut()
+            {
                 let _ = c.kill();
             }
         }
@@ -583,9 +828,25 @@ impl Running {
         };
         let deadline = Instant::now() + KILL_WAIT;
         loop {
-            if let Some(status) = child.try_wait()? {
-                self.child = None;
-                return Ok(status);
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    return Ok(status);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // The host set SIGCHLD to be ignored since the spawn, so
+                    // the kernel reaps the worker itself and `wait` can't
+                    // say. The pidfd still tells when it is gone.
+                    log::warn!("The archive reader's end can't be waited for: {e}");
+                    if self.gone_by_pidfd(deadline) {
+                        self.child = None;
+                        return Err(io::Error::other(
+                            "the archive reader ended, but not how (SIGCHLD is ignored)",
+                        ));
+                    }
+                    break;
+                }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -600,20 +861,46 @@ impl Running {
                     }];
                     let ms = remaining.as_millis().min(i32::MAX as u128) as i32 + 1;
                     // SAFETY: one valid pollfd; EINTR just loops.
-                    unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+                    let started = Instant::now();
+                    let r = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+                    // Readable yet not reaped: don't spin on it.
+                    if r > 0 && started.elapsed() < Duration::from_millis(10) {
+                        std::thread::sleep(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10)),
+                        );
+                    }
                 }
                 None => std::thread::sleep(remaining.min(Duration::from_millis(10))),
             }
         }
         // Still not gone. Hand the zombie-to-be to a thread that waits for it.
-        if let Some(mut child) = self.child.take() {
+        // (`check_capacity` keeps the number of these down.)
+        if let Some(child) = self.child.take() {
+            let slot = Arc::new(Mutex::new(Some(child)));
+            let theirs = Arc::clone(&slot);
+            REAPERS.fetch_add(1, Ordering::SeqCst);
             let spawned = std::thread::Builder::new()
                 .name("archive-worker-reaper".into())
                 .spawn(move || {
-                    let _ = child.wait();
+                    let child = theirs.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    if let Some(mut child) = child {
+                        let _ = child.wait();
+                    }
+                    REAPERS.fetch_sub(1, Ordering::SeqCst);
                 });
             if let Err(e) = spawned {
                 log::warn!("No thread to reap a stuck archive reader: {e}");
+                REAPERS.fetch_sub(1, Ordering::SeqCst);
+                // Keep the child: `check_capacity` looks at it again later.
+                let child = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(child) = child {
+                    ORPHANS
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(child);
+                }
             }
         }
         Err(io::Error::new(

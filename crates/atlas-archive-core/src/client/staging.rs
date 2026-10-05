@@ -132,6 +132,9 @@ struct Record {
     ino: u64,
     /// The staging folder's name in the destination.
     staging: String,
+    /// Whether the file system kept the folder's 0700 mode when it was made.
+    /// False on FAT and the like: the mode then proves nothing.
+    modes: bool,
 }
 
 impl Record {
@@ -141,8 +144,9 @@ impl Record {
             .as_ref()
             .map(|b| format!("boot={b}\n"))
             .unwrap_or_default();
+        let modes = if self.modes { "" } else { "modes=0\n" };
         format!(
-            "pid={}\nstart={}\n{boot}dev={}\nino={}\ndest={}\nstaging={}\n",
+            "pid={}\nstart={}\n{boot}dev={}\nino={}\ndest={}\nstaging={}\n{modes}",
             self.pid,
             self.start,
             self.dev,
@@ -177,6 +181,12 @@ impl Record {
             }
             Some(_) => return None,
         };
+        // Older records have no such line: their folders kept their modes.
+        let modes = match f.get("modes") {
+            None | Some(&"1") => true,
+            Some(&"0") => false,
+            Some(_) => return None,
+        };
         Some(Record {
             pid: f.get("pid")?.parse().ok()?,
             start: f.get("start")?.parse().ok()?,
@@ -185,6 +195,7 @@ impl Record {
             ino: f.get("ino")?.parse().ok()?,
             dest: PathBuf::from(std::ffi::OsStr::from_bytes(&dest)),
             staging,
+            modes,
         })
     }
 }
@@ -198,10 +209,19 @@ struct RecordFile {
 impl RecordFile {
     /// Writes `data` atomically: a new 0600 file beside it, synced, a rename,
     /// then a sync of the folder. A failed write leaves no temporary file.
+    /// The temporary name is this write's own, so two writers never remove
+    /// each other's, and one a killed writer left is swept as stale.
     fn write(&self, data: &[u8]) -> io::Result<()> {
-        let tmp = format!("{}.tmp", self.file);
+        let tmp = format!(
+            "{}.{}-{}.tmp",
+            self.file,
+            std::process::id(),
+            sys::random_hex()?
+        );
+        let mut made = false;
         let result = (|| {
             let fd = create_new(bfd(&self.dir), tmp.as_bytes(), 0o600)?;
+            made = true;
             let mut f = std::fs::File::from(fd);
             f.write_all(data)?;
             f.sync_all()?;
@@ -221,7 +241,7 @@ impl RecordFile {
             }
             Ok(())
         })();
-        if result.is_err() {
+        if result.is_err() && made {
             let _ = sys::unlinkat(bfd(&self.dir), tmp.as_bytes(), 0);
         }
         result
@@ -260,17 +280,86 @@ fn create_new(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<OwnedFd
 /// Whether others can change the folder `st` describes and could therefore
 /// swap names in it under us: write for others without the sticky bit, or
 /// write for a group that isn't our own (group write on the user's own
-/// private group stays allowed).
+/// private group stays allowed). The caveat: a user's primary group is
+/// taken to be private to them, as on Fedora; where it is a shared group
+/// (a `users` group everyone is in) group write is not seen as shared.
+/// POSIX ACLs are looked at by `acl_is_shared`, which needs the descriptor.
 /// Residual risk, documented in DESIGN.md: a process of the same user, or
 /// anyone who can write the destination, can still race the name-based moves.
 pub fn dest_is_shared(st: &libc::stat) -> bool {
-    shared_for(st, sys::getegid())
+    shared_for(st, sys::getuid(), sys::getegid())
 }
 
-fn shared_for(st: &libc::stat, egid: u32) -> bool {
-    st.st_mode & libc::S_ISVTX == 0
-        && (st.st_mode & libc::S_IWOTH != 0
-            || (st.st_mode & libc::S_IWGRP != 0 && st.st_gid != egid))
+/// Also shared: a folder another user owns and can write, even when sticky
+/// (an owner may rename anything in it). Root is left out: it can do
+/// anything anyway.
+fn shared_for(st: &libc::stat, uid: u32, egid: u32) -> bool {
+    let foreign_owner = st.st_uid != uid && st.st_uid != 0 && st.st_mode & libc::S_IWUSR != 0;
+    foreign_owner
+        || st.st_mode & libc::S_ISVTX == 0
+            && (st.st_mode & libc::S_IWOTH != 0
+                || (st.st_mode & libc::S_IWGRP != 0 && st.st_gid != egid))
+}
+
+/// `system.posix_acl_access`: version 2, then 8-byte entries (tag, permission, id).
+const ACL_XATTR: &CStr = c"system.posix_acl_access";
+const ACL_VERSION: u32 = 2;
+const ACL_USER: u16 = 2;
+const ACL_GROUP: u16 = 8;
+const ACL_MASK: u16 = 0x10;
+const ACL_WRITE: u16 = 2;
+
+/// Whether the access ACL `acl` (as the xattr holds it) lets a user other
+/// than `uid`, or any named group, write: with the mask letting it through.
+/// Anything malformed counts as shared.
+fn acl_grants_others(acl: &[u8], uid: u32) -> bool {
+    if acl.len() < 4
+        || !(acl.len() - 4).is_multiple_of(8)
+        || u32::from_le_bytes([acl[0], acl[1], acl[2], acl[3]]) != ACL_VERSION
+    {
+        return true;
+    }
+    let entries = || {
+        acl[4..].as_chunks::<8>().0.iter().map(|e| {
+            (
+                u16::from_le_bytes([e[0], e[1]]),
+                u16::from_le_bytes([e[2], e[3]]),
+                u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+            )
+        })
+    };
+    let mask = entries().find(|e| e.0 == ACL_MASK).map(|e| e.1);
+    let through = mask.is_none_or(|m| m & ACL_WRITE != 0);
+    through
+        && entries().any(|(tag, perm, id)| {
+            perm & ACL_WRITE != 0 && (tag == ACL_GROUP || (tag == ACL_USER && id != uid))
+        })
+}
+
+/// Whether the folder `fd`'s POSIX ACL lets others write in it. No ACL, or a
+/// file system without them, is not shared; an ACL that can't be read is an
+/// error, so the answer is never a guess.
+pub fn acl_is_shared(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    let mut buf = [0u8; 4096];
+    // SAFETY: a valid descriptor, name and a buffer of the length passed.
+    let n = unsafe {
+        libc::fgetxattr(
+            fd.as_raw_fd(),
+            ACL_XATTR.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENODATA | libc::ENOTSUP) => Ok(false),
+            // More entries than 4 KiB hold: surely shared.
+            Some(libc::ERANGE) => Ok(true),
+            _ => Err(e),
+        };
+    }
+    Ok(acl_grants_others(&buf[..n as usize], sys::getuid()))
 }
 
 /// A folder of ours: what a staging folder we just made must be.
@@ -303,6 +392,12 @@ impl Staging {
         state_dir: Option<&Path>,
     ) -> io::Result<Staging> {
         let st = sys::fstat(bfd(&dest))?;
+        if acl_is_shared(bfd(&dest))? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "other users can change this folder (it has an access list), so it isn't safe to extract into",
+            ));
+        }
         // The path the kernel knows the folder by is the one a later start
         // can open without a link in the way.
         let recorded_dest = sys::fd_path(bfd(&dest)).unwrap_or_else(|| dest_path.to_path_buf());
@@ -332,6 +427,7 @@ impl Staging {
                     dev: st.st_dev,
                     ino: st.st_ino,
                     staging: name.clone(),
+                    modes: true,
                 };
                 if let Err(e) = r.write(rec.encode().as_bytes()) {
                     log::warn!("The job record couldn't be written: {e}");
@@ -350,25 +446,49 @@ impl Staging {
             }
         };
         let opened = sys::open_subdir(bfd(&dest), name.as_bytes()).and_then(|fd| {
-            // The name must lead to the folder we just made: a folder of ours.
+            // The name must lead to the folder we just made: a folder of ours,
+            // and a new one, so empty (not one that was there before).
             if !is_our_dir(&sys::fstat(bfd(&fd))?) {
                 return Err(io::Error::other("the new staging folder isn't ours"));
+            }
+            if !read_names(bfd(&fd), 1)?.is_empty() {
+                return Err(io::Error::other("the new staging folder isn't empty"));
             }
             // mkdirat applied the umask; the folder is the user's alone until
             // it is moved out. (A file system without modes keeps what it has;
             // that is tolerated only here, for a folder that is ours.)
             sys::fchmod_soft(bfd(&fd), 0o700)?;
-            Ok(fd)
+            let kept = sys::fstat(bfd(&fd))?.st_mode & 0o777 == 0o700;
+            Ok((fd, kept))
         });
         match opened {
-            Ok(fd) => Ok(Staging {
-                dest,
-                name,
-                fd,
-                record,
-                gone: false,
-                stuck: AtomicBool::new(false),
-            }),
+            Ok((fd, kept)) => {
+                if !kept && let Some(r) = &record {
+                    // The mode proves nothing on this file system: say so in
+                    // the record, so a later start doesn't demand it.
+                    let rec = Record {
+                        pid: std::process::id(),
+                        start: sys::proc_start(std::process::id()).unwrap_or(0),
+                        boot,
+                        dest: recorded_dest,
+                        dev: st.st_dev,
+                        ino: st.st_ino,
+                        staging: name.clone(),
+                        modes: false,
+                    };
+                    if let Err(e) = r.write(rec.encode().as_bytes()) {
+                        log::warn!("The job record couldn't be updated: {e}");
+                    }
+                }
+                Ok(Staging {
+                    dest,
+                    name,
+                    fd,
+                    record,
+                    gone: false,
+                    stuck: AtomicBool::new(false),
+                })
+            }
             Err(e) => {
                 let _ = sys::unlinkat(bfd(&dest), name.as_bytes(), libc::AT_REMOVEDIR);
                 if let Some(r) = &record {
@@ -415,7 +535,8 @@ impl Staging {
     /// next start's cleanup and never deleted again by this job.
     pub fn clear_within(&self, budget: Duration) -> io::Result<()> {
         let r = purge(self.fd.as_fd(), Some(Instant::now() + budget));
-        if matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
+        if r.is_err() {
+            // Out of time or failed: one try is all this job makes.
             self.stuck.store(true, Ordering::Relaxed);
         }
         r
@@ -429,15 +550,23 @@ impl Staging {
         if self.gone || self.stuck.load(Ordering::Relaxed) {
             return Ok(());
         }
-        // Out of time: the folder and record stay and `Drop` doesn't try again.
-        self.clear_within(REMOVE_BUDGET)?;
-        if self.name_is_ours()? {
-            sys::unlinkat(self.dest.as_fd(), self.name.as_bytes(), libc::AT_REMOVEDIR)?;
-        } else {
-            log::warn!("The staging folder's name was changed; its content was removed in place.");
+        // On any error the folder and record stay and `Drop` doesn't try again
+        // (a second try would spend a second budget).
+        let r = self.clear_within(REMOVE_BUDGET).and_then(|()| {
+            if self.name_is_ours()? {
+                sys::unlinkat(self.dest.as_fd(), self.name.as_bytes(), libc::AT_REMOVEDIR)?;
+            } else {
+                log::warn!(
+                    "The staging folder's name was changed; its content was removed in place."
+                );
+            }
+            Ok(())
+        });
+        match r {
+            Ok(()) => self.forget(),
+            Err(_) => self.stuck.store(true, Ordering::Relaxed),
         }
-        self.forget();
-        Ok(())
+        r
     }
 
     /// The folder itself was moved out (or is kept for the user): nothing is
@@ -581,19 +710,12 @@ pub fn clean_stale_within(state_dir: &Path, budget: Duration) -> io::Result<Clea
                 let _ = sys::unlinkat(bfd(&dir), &name, 0);
                 out.removed += 1;
             }
-            Ok(Dead::NotOurs) => {
-                log::warn!(
-                    "A job record named {}, which is no staging folder of ours; it was left alone.",
-                    rec.staging.escape_debug()
-                );
-                let _ = sys::unlinkat(bfd(&dir), &name, 0);
-            }
             Ok(Dead::Waiting(why)) => {
                 let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
                 if age > WAIT_LIMIT {
                     log::warn!(
-                        "Dropping the job record of {}: {why} for over 30 days.",
-                        rec.staging.escape_debug()
+                        "Dropping the job record after over 30 days: {why}. The hidden folder {} may still be there; it can be deleted by hand.",
+                        sys::log_path(&rec.dest.join(&rec.staging))
                     );
                     let _ = sys::unlinkat(bfd(&dir), &name, 0);
                     out.aged_out += 1;
@@ -613,15 +735,97 @@ pub fn clean_stale_within(state_dir: &Path, budget: Duration) -> io::Result<Clea
                 out.unfinished += 1;
             }
             Err(e) => {
-                log::warn!(
-                    "A leftover staging folder {} couldn't be removed: {e}",
-                    rec.staging.escape_debug()
-                );
-                out.failed += 1;
+                let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
+                if age > WAIT_LIMIT {
+                    log::warn!(
+                        "Dropping the job record after over 30 days of failing to remove {}: {e}. It can be deleted by hand.",
+                        sys::log_path(&rec.dest.join(&rec.staging))
+                    );
+                    let _ = sys::unlinkat(bfd(&dir), &name, 0);
+                    out.aged_out += 1;
+                } else {
+                    log::warn!(
+                        "A leftover staging folder {} couldn't be removed: {e}",
+                        sys::log_path(&rec.dest.join(&rec.staging))
+                    );
+                    out.failed += 1;
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// The file in the jobs folder whose time says when a sweep last began. It
+/// ends in neither `.job` nor `.tmp`, so the sweep leaves it alone.
+const STAMP: &str = "sweep.stamp";
+/// The least time between two sweeps started by `clean_stale_if_due`.
+const SWEEP_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a sweep is due, and if so claims it by writing the stamp (atomic,
+/// 0600, never through a link: the stamp is replaced by rename and read with
+/// `lstat`). Two starts at once: the one whose temporary file is taken backs off.
+fn claim_sweep(state_dir: &Path) -> io::Result<bool> {
+    let dir = match open_jobs_dir(state_dir, false) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if let Ok(st) = sys::lstatat(bfd(&dir), STAMP.as_bytes())
+        && st.st_mode & libc::S_IFMT == libc::S_IFREG
+        && st.st_uid == sys::getuid()
+    {
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(st.st_mtime.max(0) as u64);
+        // A time in the future (a clock that was wrong) is not a recent sweep.
+        if SystemTime::now()
+            .duration_since(then)
+            .is_ok_and(|age| age < SWEEP_EVERY)
+        {
+            return Ok(false);
+        }
+    }
+    let stamp = RecordFile {
+        dir,
+        file: STAMP.to_string(),
+    };
+    match stamp.write(b"") {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        // The sweep still runs: without a stamp it is only more frequent.
+        Err(e) => {
+            log::warn!("The sweep stamp couldn't be written: {e}");
+            Ok(true)
+        }
+    }
+}
+
+/// `clean_stale`, but only when none began in the last ten minutes. Blocks as
+/// long as `clean_stale` does: call it off the UI thread, or use
+/// `clean_stale_in_background`. `None` when it wasn't due.
+pub fn clean_stale_if_due(state_dir: &Path) -> io::Result<Option<Cleaned>> {
+    if !claim_sweep(state_dir)? {
+        return Ok(None);
+    }
+    clean_stale(state_dir).map(Some)
+}
+
+/// Starts `clean_stale_if_due` on a thread of its own and returns at once. The
+/// thread is detached and nothing waits for it: a dead network mount in a
+/// record can hold it forever, and a process that ends meanwhile just leaves
+/// the rest for the next sweep (the delete works by descriptor and the records
+/// stay until their folders are gone). Only the log hears of the result.
+pub fn clean_stale_in_background(state_dir: &Path) {
+    let dir = state_dir.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("stale-sweep".into())
+        .spawn(move || match clean_stale_if_due(&dir) {
+            Ok(Some(c)) => log::debug!("stale jobs: {c:?}"),
+            Ok(None) => log::debug!("stale jobs: swept recently, nothing to do"),
+            Err(e) => log::debug!("couldn't look for stale jobs: {e}"),
+        });
+    if let Err(e) = spawned {
+        log::warn!("The sweep for stale jobs couldn't be started: {e}");
+    }
 }
 
 /// The record `name` in the jobs folder, when it is a plain file of ours that
@@ -652,18 +856,36 @@ fn read_record(dir: BorrowedFd<'_>, name: &[u8]) -> Option<(Record, SystemTime)>
 
 enum Dead {
     Removed,
-    NotOurs,
-    /// The destination can't be checked now (gone, or a different folder):
-    /// the folder may still exist, so the record waits.
+    /// The destination can't be checked now (gone, a different folder, no
+    /// longer a folder, not reachable), or the folder isn't one that can be
+    /// proven to be a staging folder: it may still exist, so the record waits
+    /// and is dropped (with a log line naming the folder) after `WAIT_LIMIT`.
     Waiting(&'static str),
 }
 
-/// A staging folder that the job made: a folder of ours, mode exactly 0700
-/// (it is that until it moves out, so nothing a user made matches).
-fn is_proven_staging(st: &libc::stat) -> bool {
+/// Why an error opening the destination means "not now" rather than a failure
+/// of the delete.
+fn dest_unavailable(e: &io::Error) -> Option<&'static str> {
+    match e.raw_os_error() {
+        Some(libc::ENOENT) => Some("the destination isn't there"),
+        Some(libc::ENOTDIR) => Some("the destination is no longer a folder"),
+        Some(libc::EACCES) => Some("the destination can't be opened"),
+        Some(libc::ENAMETOOLONG) => Some("the destination's path is too long"),
+        Some(libc::ELOOP) => Some("the destination's path leads through a link loop"),
+        _ => None,
+    }
+}
+
+/// A staging folder that the job made: a folder of ours whose mode is 0700
+/// (setgid from the destination aside: a crash between making it and setting
+/// its mode leaves 02700). Where the file system keeps no modes (`modes`
+/// false, noted in the record) the mode proves nothing and any folder of ours
+/// with the record's staging name will do; the name is the tag's 64 random
+/// bits.
+fn is_proven_staging(st: &libc::stat, modes: bool) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFDIR
         && st.st_uid == sys::getuid()
-        && st.st_mode & 0o7777 == 0o700
+        && (!modes || st.st_mode & 0o5777 == 0o700)
 }
 
 fn remove_dead(rec: &Record, deadline: Option<Instant>) -> io::Result<Dead> {
@@ -672,13 +894,13 @@ fn remove_dead(rec: &Record, deadline: Option<Instant>) -> io::Result<Dead> {
     // device and inode.
     let (dest, followed) = match sys::open_dir_nofollow(&rec.dest) {
         Ok(d) => (d, false),
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => (sys::open_dir(&rec.dest)?, true),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => match sys::open_dir(&rec.dest) {
+            Ok(d) => (d, true),
+            Err(e) => return unavailable(e),
+        },
         // Gone, or on a drive that isn't mounted: the hidden folder may still
         // be there, so the record waits.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok(Dead::Waiting("the destination isn't there"));
-        }
-        Err(e) => return Err(e),
+        Err(e) => return unavailable(e),
     };
     let st = sys::fstat(bfd(&dest))?;
     // The pinned inode must always match. The device may differ across boots
@@ -690,14 +912,20 @@ fn remove_dead(rec: &Record, deadline: Option<Instant>) -> io::Result<Dead> {
             "the destination isn't the folder the job was given",
         ));
     }
-    match remove_proven(
-        bfd(&dest),
-        rec.staging.as_bytes(),
-        deadline,
-        &is_proven_staging,
-    )? {
+    match remove_proven(bfd(&dest), rec.staging.as_bytes(), deadline, &|st| {
+        is_proven_staging(st, rec.modes)
+    })? {
         true => Ok(Dead::Removed),
-        false => Ok(Dead::NotOurs),
+        false => Ok(Dead::Waiting(
+            "the folder isn't one that can be proven to be a staging folder of ours",
+        )),
+    }
+}
+
+fn unavailable(e: io::Error) -> io::Result<Dead> {
+    match dest_unavailable(&e) {
+        Some(why) => Ok(Dead::Waiting(why)),
+        None => Err(e),
     }
 }
 
@@ -1030,6 +1258,7 @@ mod tests {
             dev: 3,
             ino: 4,
             staging: ".x.zip.atlas-partial-0123456789abcdef".into(),
+            modes: true,
         };
         assert_eq!(Record::parse(&r.encode()), Some(r));
         let old =
@@ -1147,14 +1376,25 @@ mod tests {
     #[test]
     fn shared_destinations_are_told_by_other_write_or_a_foreign_group() {
         let me = 1000;
-        assert!(!shared_for(&fake_stat(0o755, 7), me));
-        assert!(shared_for(&fake_stat(0o757, me), me));
-        assert!(!shared_for(&fake_stat(0o1777, me), me), "sticky");
+        assert!(!shared_for(&fake_stat(0o755, 7), me, me));
+        assert!(shared_for(&fake_stat(0o757, me), me, me));
+        assert!(!shared_for(&fake_stat(0o1777, me), me, me), "sticky");
         // Group write on our own group is allowed; on another group it isn't.
-        assert!(!shared_for(&fake_stat(0o775, me), me));
-        assert!(shared_for(&fake_stat(0o775, 7), me));
-        assert!(!shared_for(&fake_stat(0o1775, 7), me), "sticky");
-        assert!(!shared_for(&fake_stat(0o755, 7), me), "group read only");
+        assert!(!shared_for(&fake_stat(0o775, me), me, me));
+        assert!(shared_for(&fake_stat(0o775, 7), me, me));
+        assert!(!shared_for(&fake_stat(0o1775, 7), me, me), "sticky");
+        assert!(!shared_for(&fake_stat(0o755, 7), me, me), "group read only");
+        // Another user's folder that it can write: its owner can swap names.
+        let mut bobs = fake_stat(0o755, me);
+        bobs.st_uid = 1001;
+        assert!(shared_for(&bobs, me, me));
+        bobs.st_mode = libc::S_IFDIR | 0o1777;
+        assert!(shared_for(&bobs, me, me), "sticky doesn't bind the owner");
+        bobs.st_mode = libc::S_IFDIR | 0o555;
+        assert!(!shared_for(&bobs, me, me), "an owner without write");
+        let mut ours = fake_stat(0o755, me);
+        ours.st_uid = me;
+        assert!(!shared_for(&ours, me, me));
     }
 
     #[test]
@@ -1208,6 +1448,7 @@ mod tests {
             dev,
             ino,
             staging: name.to_string(),
+            modes: true,
         };
         RecordFile {
             dir,
@@ -1326,5 +1567,193 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(jobs_dir(&state)).unwrap().count(), 1);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut v = 2u32.to_le_bytes().to_vec();
+        for (t, p, i) in entries {
+            v.extend(t.to_le_bytes());
+            v.extend(p.to_le_bytes());
+            v.extend(i.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn acls_that_let_others_write_count_as_shared() {
+        let me = 1000;
+        let base = [(1, 7, u32::MAX), (4, 5, u32::MAX), (0x20, 0, u32::MAX)];
+        let with = |extra: &[(u16, u16, u32)]| {
+            let mut e = base.to_vec();
+            e.extend(extra);
+            acl(&e)
+        };
+        assert!(!acl_grants_others(&acl(&base), me));
+        // A named user who can write, another user or a group.
+        assert!(acl_grants_others(&with(&[(2, 7, 2000), (0x10, 7, 0)]), me));
+        assert!(acl_grants_others(&with(&[(8, 2, 50), (0x10, 7, 0)]), me));
+        // Read only, our own entry, or a mask that takes write away.
+        assert!(!acl_grants_others(&with(&[(2, 4, 2000), (0x10, 7, 0)]), me));
+        assert!(!acl_grants_others(&with(&[(2, 7, me), (0x10, 7, 0)]), me));
+        assert!(!acl_grants_others(&with(&[(2, 7, 2000), (0x10, 5, 0)]), me));
+        // Malformed is shared.
+        assert!(acl_grants_others(b"", me));
+        assert!(acl_grants_others(&[3, 0, 0, 0], me));
+        assert!(acl_grants_others(&[2, 0, 0, 0, 1, 2, 3], me));
+    }
+
+    #[test]
+    fn a_plain_folder_has_no_shared_acl() {
+        let base = scratch("acl");
+        let d = sys::open_dir(&base).unwrap();
+        assert!(!acl_is_shared(bfd(&d)).unwrap());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_folder_is_proven_by_owner_and_mode_unless_modes_are_not_kept() {
+        let mut st = fake_stat(0o700, 0);
+        st.st_uid = sys::getuid();
+        assert!(is_proven_staging(&st, true));
+        st.st_mode = libc::S_IFDIR | 0o2700;
+        assert!(is_proven_staging(&st, true), "setgid from the destination");
+        st.st_mode = libc::S_IFDIR | 0o755;
+        assert!(!is_proven_staging(&st, true));
+        assert!(is_proven_staging(&st, false), "a file system without modes");
+        st.st_uid += 1;
+        assert!(!is_proven_staging(&st, false), "not ours");
+        st.st_uid -= 1;
+        st.st_mode = libc::S_IFREG | 0o700;
+        assert!(!is_proven_staging(&st, false), "not a folder");
+    }
+
+    #[test]
+    fn records_without_a_modes_line_keep_modes_and_zero_says_none() {
+        let old = format!("pid=1\nstart=1\ndev=1\nino=1\ndest=/a\nstaging={STAGE}\n");
+        assert!(Record::parse(&old).unwrap().modes);
+        assert!(!Record::parse(&format!("{old}modes=0\n")).unwrap().modes);
+        assert_eq!(Record::parse(&format!("{old}modes=x\n")), None);
+    }
+
+    #[test]
+    fn leftovers_are_removed_by_mode_or_by_name_where_modes_are_not_kept() {
+        let _g = serial();
+        let base = scratch("modes");
+        let dest = base.join("dest");
+        let state = base.join("state");
+        let st = {
+            std::fs::create_dir_all(&dest).unwrap();
+            stat_of(&dest)
+        };
+        let set = |name: &str, mode: u32| {
+            std::fs::create_dir_all(dest.join(name)).unwrap();
+            std::fs::set_permissions(
+                dest.join(name),
+                std::os::unix::fs::PermissionsExt::from_mode(mode),
+            )
+            .unwrap();
+        };
+        let a = ".a.atlas-partial-0000000000000001";
+        let b = ".b.atlas-partial-0000000000000002";
+        set(a, 0o2700);
+        set(b, 0o755);
+        dead_record(&state, &dest, st.st_dev, st.st_ino, a);
+        let rb = dead_record(&state, &dest, st.st_dev, st.st_ino, b);
+        let c = clean_stale(&state).unwrap();
+        assert_eq!((c.removed, c.waiting, c.failed), (1, 1, 0), "{c:?}");
+        assert!(!dest.join(a).exists());
+        assert!(dest.join(b).exists() && rb.exists(), "kept, not dropped");
+        // The same folder, its record saying modes aren't kept there.
+        let dir = open_jobs_dir(&state, false).unwrap();
+        let rec = Record {
+            pid: 0x7fff_fff0,
+            start: 1,
+            boot: None,
+            dest: dest.clone(),
+            dev: st.st_dev,
+            ino: st.st_ino,
+            staging: b.to_string(),
+            modes: false,
+        };
+        RecordFile {
+            dir,
+            file: "dead-".to_string() + b + ".job",
+        }
+        .write(rec.encode().as_bytes())
+        .unwrap();
+        let c = clean_stale(&state).unwrap();
+        assert_eq!(c.removed, 1, "{c:?}");
+        assert!(!dest.join(b).exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_destination_that_became_a_file_waits_and_ages_out() {
+        let _g = serial();
+        let base = scratch("enotdir");
+        let state = base.join("state");
+        let file = base.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let direct = dead_record(&state, &file, 1, 1, STAGE);
+        let below = dead_record(
+            &state,
+            &file.join("sub"),
+            1,
+            1,
+            ".y.zip.atlas-partial-0123456789abcdef",
+        );
+        let c = clean_stale(&state).unwrap();
+        assert_eq!((c.waiting, c.failed), (2, 0), "{c:?}");
+        back_date(&direct, 31);
+        back_date(&below, 31);
+        let c = clean_stale(&state).unwrap();
+        assert_eq!((c.aged_out, c.failed), (2, 0), "{c:?}");
+        assert!(!direct.exists() && !below.exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_runs_at_most_once_in_ten_minutes_and_never_follows_the_stamp() {
+        let _g = serial();
+        let base = scratch("stamp");
+        let state = base.join("state");
+        // No jobs folder, nothing to sweep.
+        assert!(!claim_sweep(&state).unwrap());
+        drop(open_jobs_dir(&state, true).unwrap());
+        assert!(claim_sweep(&state).unwrap());
+        assert!(!claim_sweep(&state).unwrap(), "too soon");
+        let stamp = jobs_dir(&state).join(STAMP);
+        let mode = std::fs::metadata(&stamp).unwrap();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
+            0o600
+        );
+        back_date(&stamp, 1);
+        assert!(claim_sweep(&state).unwrap(), "ten minutes passed");
+        // A link in its place is replaced, and what it pointed at is not touched.
+        let target = base.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::remove_file(&stamp).unwrap();
+        std::os::unix::fs::symlink(&target, &stamp).unwrap();
+        assert!(claim_sweep(&state).unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert!(!std::fs::symlink_metadata(&stamp).unwrap().is_symlink());
+        let c = clean_stale_if_due(&state).unwrap();
+        assert!(c.is_none(), "just swept");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_failed_clear_is_not_retried_by_drop() {
+        let _g = serial();
+        let base = scratch("failed");
+        let dest = sys::open_dir(&base).unwrap();
+        let mut st = Staging::create(dest, &base, b"a.zip", None).unwrap();
+        // A stuck flag from any error: `remove` leaves the folder alone.
+        st.stuck.store(true, Ordering::Relaxed);
+        assert!(st.remove().is_ok());
+        assert!(base.join(st.name()).exists());
+        st.forget();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

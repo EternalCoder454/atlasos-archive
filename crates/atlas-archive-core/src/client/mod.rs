@@ -26,7 +26,10 @@ use zeroize::Zeroizing;
 
 pub use extract::{default_name, numbered_name};
 pub use spawn::Cancel;
-pub use staging::{Cleaned, clean_stale, clean_stale_within, default_state_dir};
+pub use staging::{
+    Cleaned, clean_stale, clean_stale_if_due, clean_stale_in_background, clean_stale_within,
+    default_state_dir,
+};
 pub use trash::Trash;
 
 use crate::audit::{self, Removed};
@@ -47,7 +50,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The most entries one listing may hold: what the tree holds. Past it the
 /// archive is refused.
 pub const MAX_ENTRIES: usize = MAX_NODES;
-/// Passwords asked for in one job before giving up.
+/// Passwords asked for, and tried, in one job before giving up.
 const MAX_PASSWORD_TRIES: u32 = 5;
 /// The most frames one worker may send in one job.
 const MAX_FRAMES: u64 = 4_000_000;
@@ -56,7 +59,7 @@ const MAX_SKIP_FRAMES: u64 = 1_000_000;
 /// The most `Callbacks::skipped_more` calls in one job.
 const MAX_SKIP_MORE_CALLBACKS: u64 = 1_000;
 /// How often the staging folder's drive is looked at, at least.
-const WATCH_EVERY: Duration = Duration::from_secs(1);
+const WATCH_EVERY: Duration = Duration::from_millis(250);
 /// Progress is passed on at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(50);
 /// The longest reason kept from a reply, in characters.
@@ -95,6 +98,25 @@ fn fail(words: impl Into<String>, detail: impl fmt::Display) -> Error {
     let words = words.into();
     log::warn!("{words} ({detail})");
     Error::Failed(words)
+}
+
+/// The audit failed. Its own messages (a folder that can't be kept, too many
+/// items, nested too deep, a name too long) are `audit::AuditMessage`s: fixed
+/// sentences made for the user, with no OS error behind them. Those are shown,
+/// cleaned, because the archive's names and the worker's reasons are in some
+/// of them. Any other error (an OS error, whatever its text looks like) gets
+/// the generic sentence; its detail goes to the log.
+fn audit_error(e: &io::Error) -> Error {
+    let own = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<audit::AuditMessage>());
+    let words = if let Some(own) = own {
+        let shown = clean(&own.to_string(), MAX_REASON);
+        format!("The extracted files couldn't be checked, so nothing was kept. {shown}")
+    } else {
+        "The extracted files couldn't be checked, so nothing was kept.".to_string()
+    };
+    fail(words, format!("audit: {e}"))
 }
 
 /// A failed system call in plain words, "<what couldn't be done> because...".
@@ -355,7 +377,11 @@ impl Worker {
         })?;
         let dest_st =
             sys::fstat(sys::bfd(&dest)).map_err(|e| io_words("look at the folder", &e))?;
-        if staging::dest_is_shared(&dest_st) {
+        // An access list that can't be read counts as shared, like a
+        // malformed one.
+        if staging::dest_is_shared(&dest_st)
+            || staging::acl_is_shared(sys::bfd(&dest)).unwrap_or(true)
+        {
             return Err(fail(
                 "Other users can change this folder, so extracting into it isn't safe. Pick a folder of your own.",
                 format!("{} is writable by others", sys::log_path(req.dest_dir)),
@@ -397,12 +423,7 @@ impl Worker {
             return Err(Error::Cancelled);
         }
         let umask = sys::read_umask();
-        let audit = audit::audit(staging.fd(), umask).map_err(|e| {
-            fail(
-                "The extracted files couldn't be checked, so nothing was kept.",
-                format!("audit: {e}"),
-            )
-        })?;
+        let audit = audit::audit(staging.fd(), umask).map_err(|e| audit_error(&e))?;
         cross_check(&col.written, &audit.top_level());
 
         let default = default_name(&file_name);
@@ -443,7 +464,8 @@ impl Worker {
         col: &mut Collected,
     ) -> Result<(), Error> {
         let mut password: Option<Zeroizing<Vec<u8>>> = None;
-        for attempt in 0..MAX_PASSWORD_TRIES {
+        // One try with no password, then one for each that is given.
+        for attempt in 0..=MAX_PASSWORD_TRIES {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -463,6 +485,7 @@ impl Worker {
                 size_ceiling: self.size_ceiling,
             };
             match self.attempt(&a, cancel, cb, col)? {
+                Final::NeedPassword(_) if attempt == MAX_PASSWORD_TRIES => break,
                 Final::NeedPassword(wrong) => match cb.password(wrong) {
                     Some(p) => password = Some(p),
                     None => return Err(Error::PasswordRequired),
@@ -481,6 +504,8 @@ impl Worker {
         cb: &mut dyn Callbacks,
         col: &mut Collected,
     ) -> Result<Final, Error> {
+        // Before the archive is opened, which can itself wait on a dead drive.
+        spawn::check_capacity().map_err(|e| fail(spawn::TOO_MANY_STUCK, e))?;
         let file = spawn::open_archive(a.archive).map_err(|e| {
             if e.kind() == io::ErrorKind::InvalidInput {
                 Error::Failed(e.to_string())
@@ -503,6 +528,8 @@ impl Worker {
         .map_err(|e| {
             let words = if e.kind() == io::ErrorKind::NotFound {
                 "The archive reader isn't installed."
+            } else if e.kind() == io::ErrorKind::ResourceBusy {
+                spawn::TOO_MANY_STUCK
             } else {
                 "The archive reader couldn't be started."
             };
@@ -605,14 +632,29 @@ fn clean(text: &str, max: usize) -> String {
     sys::sanitize(text, max, ' ').trim().to_string()
 }
 
+/// Failed reads of the free space in a row that stop a job, when they also
+/// span `READ_FAILURE_SPAN`: checks come with every Progress frame too, so a
+/// count alone would let a 150 ms hiccup of a network mount end a job.
+const MAX_READ_FAILURES: u8 = 3;
+const READ_FAILURE_SPAN: Duration = Duration::from_secs(2);
+
 /// Watches the free space of the staging folder's drive, from outside the
 /// worker, which is the thing under test: the worker's own bomb limits are
 /// not trusted to hold.
+///
+/// It fails closed: a file system with no usable free-space figure (some FUSE
+/// and network mounts, which answer with zeros) can't be watched, and an
+/// extraction there is refused before the worker is asked. A read that fails
+/// in the middle of a job is tolerated (logged); the third in a row, at
+/// least `READ_FAILURE_SPAN` after the first, stops the job.
 struct SpaceWatch<'a> {
     fd: BorrowedFd<'a>,
     start_free: u64,
     floor: u64,
     last: Instant,
+    /// Reads of the free space that failed in a row, and when the first did.
+    failures: u8,
+    first_failure: Option<Instant>,
 }
 
 impl<'a> SpaceWatch<'a> {
@@ -623,9 +665,11 @@ impl<'a> SpaceWatch<'a> {
                 start_free: free,
                 floor: reserve_for(free),
                 last: Instant::now(),
+                failures: 0,
+                first_failure: None,
             }),
             Err(e) => {
-                log::warn!("The free space can't be watched: {e}");
+                log::warn!("The free space can't be watched, so the job is refused: {e}");
                 None
             }
         }
@@ -644,10 +688,20 @@ impl<'a> SpaceWatch<'a> {
         let free = match sys::free_bytes(self.fd) {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("The free space couldn't be read: {e}");
+                self.failures = self.failures.saturating_add(1);
+                let first = *self.first_failure.get_or_insert_with(Instant::now);
+                log::warn!(
+                    "The free space couldn't be read ({} in a row): {e}",
+                    self.failures
+                );
+                if self.failures >= MAX_READ_FAILURES && first.elapsed() >= READ_FAILURE_SPAN {
+                    return Err("Atlas Archive can no longer tell how much space is free on this drive, so the job was stopped.".into());
+                }
                 return Ok(());
             }
         };
+        self.failures = 0;
+        self.first_failure = None;
         if free < self.floor {
             return Err("There isn't enough space on this drive, so the job was stopped.".into());
         }
@@ -672,6 +726,21 @@ fn drive(
     cb: &mut dyn Callbacks,
     col: &mut Collected,
 ) -> Result<Final, Halt> {
+    let watch = a
+        .staging
+        .filter(|_| a.op == Op::Extract)
+        .map(|s| SpaceWatch::new(s.fd()));
+    // Fail closed: no figures, no extraction (and the worker is not asked).
+    let mut watch = match watch {
+        Some(None) => {
+            return Err(Halt::Failed(
+                "This drive doesn't report its free space, so Atlas Archive can't extract here safely."
+                    .into(),
+            ));
+        }
+        Some(w) => w,
+        None => None,
+    };
     if let Some(p) = a.password {
         running.send(&Request::Password(p.clone()).encode(), cancel)?;
     }
@@ -688,10 +757,6 @@ fn drive(
     // What the job may write: the worker's total limit, or no ceiling once
     // the user went past it. The free-space floor applies either way.
     let mut ceiling = Some(a.size_ceiling);
-    let mut watch = a
-        .staging
-        .filter(|_| a.op == Op::Extract)
-        .and_then(|s| SpaceWatch::new(s.fd()));
     let mut last_progress: Option<Instant> = None;
     let mut seen = (0u64, 0u64);
     let (mut frames, mut skip_frames, mut skip_calls, mut more_calls) = (0u64, 0u64, 0usize, 0u64);
@@ -719,7 +784,11 @@ fn drive(
                 col.format = Some(f);
             }
             Reply::Entries(batch) if a.op == Op::List => {
-                deadline = Instant::now() + timeout;
+                // An empty batch is no progress: a worker can't keep itself
+                // alive with them.
+                if !batch.is_empty() {
+                    deadline = Instant::now() + timeout;
+                }
                 col.listing_bytes += frame_len as u64;
                 if col.listing_bytes > MAX_LISTING {
                     return Err(Halt::Failed(
@@ -775,7 +844,30 @@ fn drive(
                 }
                 asked.push(e.kind);
                 // The ones that can't be gone past are never asked.
-                let go_on = e.kind.askable() && cb.limit(&e);
+                let go_on = if e.kind.askable() {
+                    // The worker (and its group) stands still while the user
+                    // is asked: the space watch can't look during the dialog,
+                    // and nothing may be written meanwhile.
+                    if !running.pause() {
+                        return Err(Halt::Failed(
+                            "Atlas Archive couldn't pause the archive reader to ask, so it stopped."
+                                .into(),
+                        ));
+                    }
+                    // What was written up to the stop may already be too much.
+                    if let Some(w) = watch.as_mut() {
+                        w.check(ceiling).map_err(Halt::Failed)?;
+                    }
+                    let answer = cb.limit(&e);
+                    if cancel.is_cancelled() {
+                        // Left stopped: the kill that follows works on it.
+                        return Err(Halt::Stop(Stop::Cancelled));
+                    }
+                    running.resume();
+                    answer
+                } else {
+                    false
+                };
                 if go_on {
                     if e.kind == Kind::TotalSize {
                         ceiling = None;
@@ -853,5 +945,34 @@ fn cross_check(written: &[Vec<u8>], top: &[String]) {
             a.len(),
             b.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(e: &Error) -> &str {
+        match e {
+            Error::Failed(w) => w,
+            _ => panic!("not a Failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn only_the_audits_own_type_is_shown() {
+        let generic = "The extracted files couldn't be checked, so nothing was kept.";
+        let own = audit_error(&audit::message("A folder (a) can't be kept."));
+        assert_eq!(
+            words(&own),
+            format!("{generic} A folder (a) can't be kept.")
+        );
+        // Capital letter, kind Other, no OS code: the old heuristic's match.
+        let lookalike = audit_error(&io::Error::other("Permission denied by /secret/path"));
+        assert_eq!(words(&lookalike), generic);
+        let os = audit_error(&io::Error::from_raw_os_error(libc::EACCES));
+        assert_eq!(words(&os), generic);
+        let plain = audit_error(&io::Error::new(io::ErrorKind::InvalidData, "Bad"));
+        assert_eq!(words(&plain), generic);
     }
 }

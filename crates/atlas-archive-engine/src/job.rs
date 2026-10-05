@@ -137,7 +137,9 @@ pub struct ExtractJob<'a> {
     pub raw_name: String,
 }
 
-/// The bytes free on the file system holding `dir`, if it can tell.
+/// The bytes free on the file system holding `dir`, if it can tell. A drive
+/// that answers with zeros for its block size or count (some FUSE and network
+/// file systems) gives no figure: `None`, never `Some(0)`.
 pub fn free_space(dir: BorrowedFd<'_>) -> Option<u64> {
     let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: fstatvfs fills `st` on success; `dir` is a live descriptor.
@@ -146,7 +148,12 @@ pub fn free_space(dir: BorrowedFd<'_>) -> Option<u64> {
     }
     // SAFETY: initialised by the successful call above.
     let st = unsafe { st.assume_init() };
-    Some(st.f_bavail.saturating_mul(st.f_frsize))
+    free_from(st.f_bavail, st.f_frsize, st.f_blocks)
+}
+
+/// The figure, or `None` when block size or count is zero.
+fn free_from(bavail: u64, frsize: u64, blocks: u64) -> Option<u64> {
+    (frsize != 0 && blocks != 0).then(|| bavail.saturating_mul(frsize))
 }
 
 /// Asks the client about a limit. `Ok`: go on, with that limit off. A limit
@@ -781,6 +788,17 @@ mod tests {
             free_space(crate::extract::open_dir(&staging).unwrap().as_fd()).is_some_and(|f| f > 0)
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_drive_with_zero_figures_gives_no_free_space() {
+        assert_eq!(free_from(10, 4096, 100), Some(40960));
+        assert_eq!(free_from(0, 4096, 100), Some(0));
+        assert_eq!(free_from(10, 0, 100), None);
+        assert_eq!(free_from(10, 4096, 0), None);
+        // /proc reports no blocks at all.
+        let proc = std::fs::File::open("/proc").unwrap();
+        assert_eq!(free_space(proc.as_fd()), None);
     }
 
     /// A tar made by a shell script run in `d/src`.

@@ -71,6 +71,12 @@ impl Scratch {
             .with_timeout(Duration::from_millis(500))
     }
 
+    /// A fake worker for a job that must succeed: a generous timeout, so a
+    /// busy machine can't turn a slow script start into "stopped responding".
+    fn fake_ok(&self, body: &str) -> Worker {
+        self.fake(body).with_timeout(Duration::from_secs(30))
+    }
+
     /// Writes a reply as the frame a fake worker `cat`s.
     fn frame(&self, file: &str, reply: &Reply) {
         let payload = reply.encode();
@@ -418,7 +424,9 @@ fn clash_replace_moves_the_old_item_to_the_trash() {
     let info = read(s.trash.join("info/note.txt.trashinfo"));
     let lines: Vec<&str> = info.lines().collect();
     assert_eq!(lines[0], "[Trash Info]");
-    let want = format!("Path={}/note.txt", s.dest.display());
+    // The trash records the folder as the kernel knows it: resolved, so a
+    // scratch path through `deps/..` reads differently.
+    let want = format!("Path={}/note.txt", s.dest.canonicalize().unwrap().display());
     assert_eq!(lines[1], want);
     let date = lines[2].strip_prefix("DeletionDate=").expect(&info);
     assert_eq!(date.len(), 19);
@@ -547,6 +555,20 @@ fn no_password_given_is_its_own_error() {
 
 // ---- fake workers ----
 
+/// Runs `job`, again when the script that was just written was "busy" because
+/// a sibling test forked while it was open for writing.
+fn retried<T>(mut job: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
+    for _ in 0..5 {
+        match job() {
+            Err(Error::Failed(m)) if m.contains("couldn't be started") => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            r => return r,
+        }
+    }
+    job()
+}
+
 fn failing(s: &Scratch, w: &Worker, a: &Path) -> String {
     for _ in 0..5 {
         match w.extract(
@@ -641,7 +663,7 @@ fn a_cut_short_frame_is_not_a_hang() {
 fn what_a_compromised_worker_leaves_in_staging_is_fixed_before_the_move() {
     let s = Scratch::new("evil");
     s.frame("done.bin", &Reply::Done { written: vec![] });
-    let w = s.fake(
+    let w = s.fake_ok(
         "echo fine > /proc/self/fd/4/ok.txt\n\
          echo x > /proc/self/fd/4/suid\n\
          chmod 4755 /proc/self/fd/4/suid\n\
@@ -979,12 +1001,12 @@ fn a_test_job_asks_about_limits_too() {
         },
     );
     // Accepted: the test goes on to its end.
-    let w = s.fake("cat \"$DIR/l.bin\" \"$DIR/done.bin\"; exec sleep 30");
+    let w = s.fake_ok("cat \"$DIR/l.bin\" \"$DIR/done.bin\"; exec sleep 30");
     let mut rec = Rec {
         accept_limits: true,
         ..Rec::default()
     };
-    w.test(&a, &mut rec, &Cancel::new()).unwrap();
+    retried(|| w.test(&a, &mut rec, &Cancel::new())).unwrap();
     // Declined: the worker stops, and the client says why.
     let w = s.fake("cat \"$DIR/l.bin\" \"$DIR/failed.bin\"; exec sleep 30");
     let e = w.test(&a, &mut Rec::default(), &Cancel::new()).unwrap_err();
@@ -1000,21 +1022,31 @@ fn the_worker_gets_only_its_descriptors_a_clean_cwd_and_no_text_tricks() {
     let c = std::ffi::CString::new(marker.to_str().unwrap()).unwrap();
     // Open without close-on-exec, as careless code would leave it.
     // SAFETY: a C string; the descriptor is closed below.
-    let leaked = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+    // (Moved above 4: sibling tests close descriptors, so a plain open can
+    // get a low number.)
+    let low = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+    assert!(low >= 0);
+    let leaked = unsafe { libc::fcntl(low, libc::F_DUPFD, 20) };
+    unsafe { libc::close(low) };
     assert!(leaked > 4);
     s.frame("done.bin", &Reply::Done { written: vec![] });
-    let w = s.fake(&format!(
+    let w = s.fake_ok(&format!(
         "pwd > \"$DIR/cwd\"\n[ -e /proc/$$/fd/{leaked} ] && echo leaked > \"$DIR/leak\"\n\
          for f in /proc/$$/fd/*; do case \"$f\" in */0|*/1|*/2|*/3|*/4) ;; *) [ -e \"$f\" ] && echo \"$f\" >> \"$DIR/extra\";; esac; done\n\
          cat \"$DIR/done.bin\""
     ));
-    let _ = w.extract(
-        &request(&a, &s.dest, to("out")),
-        &mut Rec::default(),
-        &Cancel::new(),
-    );
+    // The script must have run to its end for the checks below to mean anything.
+    let r = retried(|| {
+        let _ = std::fs::remove_file(s.root.join("extra"));
+        w.extract(
+            &request(&a, &s.dest, to("out")),
+            &mut Rec::default(),
+            &Cancel::new(),
+        )
+    });
     // SAFETY: closes the descriptor opened above.
     unsafe { libc::close(leaked) };
+    r.unwrap();
     assert_eq!(read(s.root.join("cwd")).trim(), "/");
     assert!(
         !s.root.join("leak").exists(),
@@ -1032,23 +1064,296 @@ fn a_worker_that_writes_past_the_approved_size_is_stopped_by_the_client() {
     s.frame("p1.bin", &Reply::Progress { bytes: 1, items: 1 });
     s.frame("p2.bin", &Reply::Progress { bytes: 2, items: 2 });
     // Random data: a compressing file system would otherwise not notice it.
+    // The client sees the drive's free space, which other programs change too
+    // (on this machine other jobs write and delete big trees at the same
+    // time): so the worker keeps writing until it is stopped, up to 1 GB.
     let w = s
         .fake(
-            "cat \"$DIR/p1.bin\"\nhead -c 80000000 /dev/urandom > /proc/self/fd/4/big\n\
-             sync -f \"$DIR\"\ncat \"$DIR/p2.bin\"\nexec sleep 30",
+            "cat \"$DIR/p1.bin\"\ni=0\nwhile [ $i -lt 12 ]; do\n\
+             head -c 80000000 /dev/urandom > /proc/self/fd/4/big$i\n\
+             sync -f \"$DIR\"\ncat \"$DIR/p2.bin\"\ni=$((i+1))\ndone\nexec sleep 30",
         )
         .with_size_ceiling(1 << 20)
-        .with_timeout(Duration::from_secs(20));
+        // `sync -f` can take long on a busy disk; the check is on the client.
+        .with_timeout(Duration::from_secs(60));
     let t = Instant::now();
-    let e = w
-        .extract(
+    let e = retried(|| {
+        w.extract(
             &request(&a, &s.dest, Mode::ExtractHere),
             &mut Rec::default(),
             &Cancel::new(),
         )
-        .unwrap_err();
+    })
+    .unwrap_err();
     assert!(e.to_string().contains("more than it said"), "{e}");
-    assert!(t.elapsed() < Duration::from_secs(15));
+    assert!(t.elapsed() < Duration::from_secs(55));
+    assert!(s.ls().is_empty() && s.jobs().is_empty());
+}
+
+/// The front end for the questions: what it saw while it was asked.
+struct Asker {
+    grow: PathBuf,
+    cancel: Option<Cancel>,
+    sizes: Option<(u64, u64)>,
+    asked: u32,
+}
+
+impl Callbacks for Asker {
+    fn limit(&mut self, _: &Exceeded) -> bool {
+        self.asked += 1;
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        // Time for the stop to land, then a long look.
+        std::thread::sleep(Duration::from_millis(300));
+        let before = size(&self.grow);
+        if let Some(c) = &self.cancel {
+            c.cancel();
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        self.sizes = Some((before, size(&self.grow)));
+        true
+    }
+}
+
+#[test]
+fn the_worker_stands_still_while_the_user_is_asked() {
+    let s = Scratch::new("pause");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("l.bin", &limit_reply(Kind::Entries));
+    s.frame("done.bin", &Reply::Done { written: vec![] });
+    // A writer keeps adding to staging and to a file outside it; the main
+    // script waits out the question and then ends the job.
+    let w = s.fake_ok(
+        "( while :; do printf x >> /proc/self/fd/4/grow; printf x >> \"$DIR/grow\"; sleep 0.02; done ) &\n\
+         W=$!\nprintf x >> \"$DIR/grow\"\ncat \"$DIR/l.bin\"\nsleep 4\nkill $W\ncat \"$DIR/done.bin\"",
+    );
+    let mut asker = Asker {
+        grow: s.root.join("grow"),
+        cancel: None,
+        sizes: None,
+        asked: 0,
+    };
+    retried(|| {
+        let _ = std::fs::remove_file(s.root.join("grow"));
+        w.extract(&request(&a, &s.dest, to("out")), &mut asker, &Cancel::new())
+    })
+    .unwrap();
+    let (before, after) = asker.sizes.expect("asked");
+    assert!(before > 0, "the writer never ran");
+    assert_eq!(
+        before, after,
+        "the worker wrote while the question was open"
+    );
+    let end = std::fs::metadata(s.root.join("grow")).unwrap().len();
+    assert!(end > after, "the worker was never let go on");
+}
+
+#[test]
+fn a_cancel_during_a_question_kills_the_stopped_worker() {
+    let s = Scratch::new("pausecancel");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("l.bin", &limit_reply(Kind::Entries));
+    let w = s.fake_ok("echo $$ > \"$DIR/pid\"\ncat \"$DIR/l.bin\"\nexec sleep 60");
+    let cancel = Cancel::new();
+    let mut asker = Asker {
+        grow: s.root.join("grow"),
+        cancel: Some(cancel.clone()),
+        sizes: None,
+        asked: 0,
+    };
+    let t = Instant::now();
+    let e = retried(|| {
+        w.extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut asker,
+            &cancel,
+        )
+    })
+    .unwrap_err();
+    assert!(matches!(e, Error::Cancelled), "{e}");
+    assert!(t.elapsed() < Duration::from_secs(10));
+    let pid = read(s.root.join("pid")).trim().to_string();
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the stopped worker is gone"
+    );
+    assert!(s.ls().is_empty() && s.jobs().is_empty());
+}
+
+#[test]
+fn empty_listing_batches_do_not_extend_the_deadline() {
+    let s = Scratch::new("empty");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("e.bin", &Reply::Entries(vec![]));
+    let w = s.fake("while :; do cat \"$DIR/e.bin\" || exit 0; sleep 0.05; done");
+    let t = Instant::now();
+    let e = w
+        .list(&a, None, &mut Rec::default(), &Cancel::new())
+        .unwrap_err();
+    assert_eq!(e.to_string(), "The archive reader stopped responding.");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+#[test]
+fn every_password_asked_for_is_tried() {
+    let s = Scratch::new("pwcap");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("n.bin", &Reply::NeedPassword { wrong: true });
+    let w = s.fake_ok("echo x >> \"$DIR/runs\"\ncat \"$DIR/n.bin\"\nexec sleep 30");
+    let mut rec = Rec {
+        passwords: VecDeque::from([&b"1"[..], b"2", b"3", b"4", b"5", b"6"]),
+        ..Rec::default()
+    };
+    let e = w
+        .extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut rec,
+            &Cancel::new(),
+        )
+        .unwrap_err();
+    assert_eq!(e.to_string(), "Too many passwords were tried.");
+    assert_eq!(rec.wrong_seen.len(), 5, "five asked");
+    assert_eq!(rec.passwords.len(), 1, "five taken");
+    assert_eq!(
+        read(s.root.join("runs")).lines().count(),
+        6,
+        "one run each, and the first"
+    );
+    assert!(s.ls().is_empty());
+}
+
+/// The state letter of `pid` from /proc, or `None` when it is gone.
+fn proc_state(pid: i32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.trim().chars().next()
+}
+
+/// Notes who is stopped while the user is asked about a limit.
+struct Probe {
+    sentinel: i32,
+    worker_pid_file: PathBuf,
+    asked: bool,
+    worker_state: Option<char>,
+    sentinel_state: Option<char>,
+}
+
+impl Callbacks for Probe {
+    fn limit(&mut self, _: &Exceeded) -> bool {
+        self.asked = true;
+        let worker: i32 = std::fs::read_to_string(&self.worker_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The stop is delivered at once, but not in the same instant.
+        let until = Instant::now() + Duration::from_secs(5);
+        while proc_state(worker) != Some('T') && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.worker_state = proc_state(worker);
+        // Time for a misdirected signal to land.
+        std::thread::sleep(Duration::from_millis(200));
+        self.sentinel_state = proc_state(self.sentinel);
+        false
+    }
+}
+
+#[test]
+fn a_worker_that_joins_another_group_cannot_stop_or_kill_it() {
+    use std::os::unix::process::CommandExt;
+    let s = Scratch::new("regroup");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    // Stands for the client's own group: same session, a group of its own.
+    let mut sentinel = Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = sentinel.id() as i32;
+    s.frame("limit.bin", &limit_reply(Kind::Entries));
+    s.frame(
+        "failed.bin",
+        &Reply::Failed {
+            reason: "stopped".into(),
+        },
+    );
+    // The fake worker isn't sandboxed, so it can do what the filter forbids
+    // the real one: join the sentinel's group, then ask a question.
+    std::fs::write(
+        s.root.join("w.py"),
+        format!(
+            "import os, sys, time\n\
+             d = {dir:?}\n\
+             os.setpgid(0, {pgid})\n\
+             open(d + '/wpgid', 'w').write(str(os.getpgid(0)))\n\
+             open(d + '/wpid', 'w').write(str(os.getpid()))\n\
+             os.read(0, 65536)\n\
+             sys.stdout.buffer.write(open(d + '/limit.bin', 'rb').read())\n\
+             sys.stdout.buffer.flush()\n\
+             os.read(0, 65536)\n\
+             sys.stdout.buffer.write(open(d + '/failed.bin', 'rb').read())\n\
+             sys.stdout.buffer.flush()\n\
+             time.sleep(30)\n",
+            dir = s.root.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let w = s.fake_ok("exec python3 \"$DIR/w.py\"");
+    let mut probe = Probe {
+        sentinel: pgid,
+        worker_pid_file: s.root.join("wpid"),
+        asked: false,
+        worker_state: None,
+        sentinel_state: None,
+    };
+    let r = retried(|| {
+        w.extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut probe,
+            &Cancel::new(),
+        )
+    });
+    let after = proc_state(pgid);
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
+    assert!(
+        matches!(r, Err(Error::LimitRefused(_))),
+        "{:?}",
+        r.map(|_| ())
+    );
+    assert_eq!(read(s.root.join("wpgid")), pgid.to_string(), "it joined");
+    assert!(probe.asked);
+    assert_eq!(probe.worker_state, Some('T'), "the worker stood still");
+    assert!(
+        matches!(probe.sentinel_state, Some('S' | 'R')),
+        "the sentinel was touched while asked: {:?}",
+        probe.sentinel_state
+    );
+    assert!(
+        matches!(after, Some('S' | 'R')),
+        "the sentinel was touched at the end: {after:?}"
+    );
+}
+
+#[test]
+fn the_audits_own_words_reach_the_user() {
+    let s = Scratch::new("auditwords");
+    let a = s.tar("a.tar.gz", &[("a.txt", "a")]);
+    s.frame("done.bin", &Reply::Done { written: vec![] });
+    let w = s.fake_ok(
+        "cd /proc/self/fd/4\ni=0\nwhile [ $i -lt 300 ]; do mkdir d && cd d; i=$((i+1)); done\n\
+         cat \"$DIR/done.bin\"",
+    );
+    let e = retried(|| {
+        w.extract(
+            &request(&a, &s.dest, Mode::ExtractHere),
+            &mut Rec::default(),
+            &Cancel::new(),
+        )
+    })
+    .unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains("nests deeper"), "{m}");
     assert!(s.ls().is_empty() && s.jobs().is_empty());
 }
 
@@ -1220,7 +1525,10 @@ fn a_record_cannot_name_a_folder_that_isnt_a_staging_folder() {
     for d in [plain, wide, tagless, n] {
         assert_eq!(read(s.dest.join(d).join("sub/f")), "f", "{d}");
     }
-    assert!(s.jobs().is_empty(), "unusable records are dropped");
+    // Folders that can't be proven ours wait (and age out); records that
+    // are unusable in themselves are dropped.
+    assert_eq!(s.jobs(), ["1.job", "2.job"], "{c:?}");
+    assert_eq!(c.waiting, 2, "{c:?}");
     let mode = std::fs::metadata(s.state.join("atlas-archive/jobs"))
         .unwrap()
         .mode()
