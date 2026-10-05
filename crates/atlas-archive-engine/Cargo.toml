@@ -11,3 +11,4 @@ rust-version.workspace = true
 atlas-archive-core = { path = "../atlas-archive-core" }
 libc.workspace = true
 log.workspace = true
+zeroize.workspace = true

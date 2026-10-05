@@ -25,6 +25,9 @@ libc = "0.2"
 encoding_rs = "0.8"
 chardetng = "1.0"
 zeroize = { version = "1.8", features = ["std"] }
+# The worker's sandbox. Vetted: maintained by the Landlock project, MIT or
+# Apache-2.0, depends only on enumflags2, libc and thiserror.
+landlock = "0.4.7"
 
 [profile.release]
 lto = "thin"

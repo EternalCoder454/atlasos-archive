@@ -15,6 +15,7 @@ use atlas_archive_core::limits::{Exceeded, Limits, Meter};
 use atlas_archive_core::name::NameEncoding;
 use atlas_archive_core::proto::{self, Entry, Format, Kind, Reply, Request};
 use atlas_archive_core::tree::{Added, Tree};
+use zeroize::Zeroizing;
 
 use crate::extract::Writer;
 use crate::libarchive::Reader;
@@ -123,6 +124,8 @@ pub struct ExtractJob<'a> {
     pub entries: Option<HashSet<u32>>,
     /// The worker makes them with `Limits::new(free_space(staging))`.
     pub limits: Limits,
+    /// For encrypted entries.
+    pub password: Option<Zeroizing<Vec<u8>>>,
     pub raw_name: String,
 }
 
@@ -163,6 +166,8 @@ enum Stop {
     /// The client said not to go past a limit, or went away.
     Declined,
     Failed(String),
+    /// An encrypted entry needs a password; `true`: the one given is wrong.
+    NeedPassword(bool),
 }
 
 impl From<io::Error> for Stop {
@@ -206,6 +211,7 @@ pub fn extract(conn: &mut impl Conn, job: ExtractJob<'_>) -> io::Result<()> {
             reason: "Stopped before going past a limit.".into(),
         }),
         Err(Stop::Failed(reason)) => conn.send(&Reply::Failed { reason }),
+        Err(Stop::NeedPassword(wrong)) => conn.send(&Reply::NeedPassword { wrong }),
     }
 }
 
@@ -214,7 +220,9 @@ fn run_extract(
     job: ExtractJob<'_>,
     written: &mut Vec<String>,
 ) -> Result<(), Stop> {
-    let mut reader = Reader::open(job.archive).map_err(|e| Stop::Failed(e.0))?;
+    let mut reader = Reader::open_with(job.archive, job.password.as_deref().map(Vec::as_slice))
+        .map_err(|e| Stop::Failed(e.0))?;
+    let had_password = job.password.is_some();
     let mut writer = Writer::new(job.staging, job.umask);
     let mut meter = Meter::new(job.limits);
     let mut tree: Option<Tree> = None;
@@ -288,6 +296,9 @@ fn run_extract(
             let n = match reader.read(&mut buf) {
                 Ok(0) => break Ok(()),
                 Ok(n) => n,
+                Err(e) if entry.encrypted && e.is_password() => {
+                    return Err(Stop::NeedPassword(had_password));
+                }
                 Err(e) => break Err(Stop::Failed(e.0)),
             };
             if let Err(e) = out.write_all(&buf[..n]) {
@@ -369,8 +380,12 @@ fn is_fatal(e: &io::Error) -> bool {
 }
 
 /// Reads every entry's data and reports the damaged ones.
-pub fn test(conn: &mut impl Conn, archive: BorrowedFd<'_>) -> io::Result<()> {
-    let mut reader = match Reader::open(archive) {
+pub fn test(
+    conn: &mut impl Conn,
+    archive: BorrowedFd<'_>,
+    password: Option<&[u8]>,
+) -> io::Result<()> {
+    let mut reader = match Reader::open_with(archive, password) {
         Ok(r) => r,
         Err(e) => return conn.send(&Reply::Failed { reason: e.0 }),
     };
@@ -392,6 +407,11 @@ pub fn test(conn: &mut impl Conn, archive: BorrowedFd<'_>) -> io::Result<()> {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => bytes += n as u64,
+                Err(e) if entry.encrypted && e.is_password() => {
+                    return conn.send(&Reply::NeedPassword {
+                        wrong: password.is_some(),
+                    });
+                }
                 Err(e) => {
                     conn.send(&Reply::Skipped {
                         index: entry.index,
@@ -483,6 +503,7 @@ mod tests {
                 encoding: NameEncoding::Utf8,
                 entries: None,
                 limits,
+                password: None,
                 raw_name: "data".into(),
             },
         )
@@ -529,6 +550,78 @@ mod tests {
         );
         assert_eq!(std::fs::read(staging.join("top/l")).unwrap(), b"content");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn extract_with(archive: &Path, staging: &Path, password: Option<&[u8]>) -> Fake {
+        let f = std::fs::File::open(archive).unwrap();
+        let mut c = fake(false);
+        extract(
+            &mut c,
+            ExtractJob {
+                archive: f.as_fd(),
+                staging: crate::extract::open_dir(staging).unwrap(),
+                umask: 0o022,
+                encoding: NameEncoding::Utf8,
+                entries: None,
+                limits: Limits::new(None),
+                raw_name: String::new(),
+                password: password.map(|p| Zeroizing::new(p.to_vec())),
+            },
+        )
+        .unwrap();
+        c
+    }
+
+    #[test]
+    fn encrypted_zips_ask_for_the_password() {
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        for name in ["aes256-secret.zip", "zipcrypto-secret.zip"] {
+            let d = scratch(name);
+            let a = data.join(name);
+            for (password, want) in [
+                (None, Some(false)),
+                (Some(&b"wrong"[..]), Some(true)),
+                (Some(&b"secret"[..]), None),
+            ] {
+                let staging = d.join("staging");
+                let _ = std::fs::remove_dir_all(&staging);
+                std::fs::create_dir(&staging).unwrap();
+                let c = extract_with(&a, &staging, password);
+                match want {
+                    Some(wrong) => assert_eq!(
+                        c.replies.last(),
+                        Some(&Reply::NeedPassword { wrong }),
+                        "{name}"
+                    ),
+                    None => {
+                        assert!(
+                            matches!(c.replies.last(), Some(Reply::Done { .. })),
+                            "{name}: {:?}",
+                            c.replies
+                        );
+                        assert_eq!(
+                            std::fs::read(staging.join("f.txt")).unwrap(),
+                            b"secret text\n"
+                        );
+                    }
+                }
+                let f = std::fs::File::open(&a).unwrap();
+                let mut c = fake(false);
+                test(&mut c, f.as_fd(), password).unwrap();
+                match want {
+                    Some(wrong) => assert_eq!(
+                        c.replies.last(),
+                        Some(&Reply::NeedPassword { wrong }),
+                        "{name}"
+                    ),
+                    None => assert!(
+                        matches!(c.replies.last(), Some(Reply::Done { .. })),
+                        "{name}"
+                    ),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     #[test]

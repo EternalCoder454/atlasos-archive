@@ -13,6 +13,7 @@ use std::fmt;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use atlas_archive_core::proto::{Entry, Kind};
+use zeroize::Zeroizing;
 
 #[allow(non_camel_case_types)]
 type archive = c_void;
@@ -58,6 +59,7 @@ unsafe extern "C" {
     fn archive_read_support_format_zip(a: *mut archive) -> c_int;
     fn archive_read_support_format_raw(a: *mut archive) -> c_int;
     fn archive_read_support_format_empty(a: *mut archive) -> c_int;
+    fn archive_read_add_passphrase(a: *mut archive, passphrase: *const c_char) -> c_int;
     fn archive_read_set_options(a: *mut archive, opts: *const c_char) -> c_int;
     fn archive_read_open_fd(a: *mut archive, fd: c_int, block_size: usize) -> c_int;
     fn archive_read_next_header(a: *mut archive, entry: *mut *mut archive_entry) -> c_int;
@@ -97,6 +99,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// libarchive wants a password, or a different one ("Passphrase
+    /// required for this entry", "Incorrect passphrase").
+    pub fn is_password(&self) -> bool {
+        self.0.contains("assphrase")
+    }
+}
+
 /// One archive being read, front to back.
 pub struct Reader {
     a: *mut archive,
@@ -117,6 +127,24 @@ impl Reader {
     /// Opens the archive at `fd` (read from its current offset). The fd must
     /// stay open while the reader lives.
     pub fn open(fd: BorrowedFd<'_>) -> Result<Reader, Error> {
+        Reader::open_with(fd, None)
+    }
+
+    /// As `open`, with the password for encrypted entries. libarchive keeps
+    /// its own copy, which lives until the worker exits after this job.
+    pub fn open_with(fd: BorrowedFd<'_>, password: Option<&[u8]>) -> Result<Reader, Error> {
+        let password = match password {
+            Some(p) if p.contains(&0) => {
+                return Err(Error("The password can't contain a NUL character.".into()));
+            }
+            Some(p) => {
+                let mut c = Zeroizing::new(Vec::with_capacity(p.len() + 1));
+                c.extend_from_slice(p);
+                c.push(0);
+                Some(c)
+            }
+            None => None,
+        };
         // SAFETY: plain libarchive calls on a handle we own; it is freed in
         // Drop, also on the error paths (the Reader exists from here on).
         unsafe {
@@ -156,6 +184,11 @@ impl Reader {
             // tar files joined by `cat`, as GNU tar -i reads them.
             let opts = c"read_concatenated_archives";
             archive_read_set_options(a, opts.as_ptr());
+            if let Some(p) = &password
+                && archive_read_add_passphrase(a, p.as_ptr().cast()) != ARCHIVE_OK
+            {
+                return Err(r.error("The password couldn't be used"));
+            }
             if archive_read_open_fd(a, fd.as_raw_fd(), 256 * 1024) != ARCHIVE_OK {
                 return Err(r.error("The file isn't an archive Atlas Archive can read"));
             }

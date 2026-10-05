@@ -10,3 +10,11 @@ rust-version.workspace = true
 [dependencies]
 atlas-archive-core = { path = "../../crates/atlas-archive-core" }
 atlas-archive-engine = { path = "../../crates/atlas-archive-engine" }
+libc.workspace = true
+landlock.workspace = true
+zeroize.workspace = true
+
+[features]
+# Lets the worker run where Landlock is off. Test builds only; the RPM never
+# enables it.
+unsandboxed = []
