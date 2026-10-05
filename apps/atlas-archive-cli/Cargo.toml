@@ -12,3 +12,12 @@ atlas-archive-core = { path = "../../crates/atlas-archive-core" }
 log.workspace = true
 libc.workspace = true
 zeroize.workspace = true
+
+[features]
+# `--worker PATH`: run any executable as the worker, unsandboxed. For the
+# integration tests only; never in a shipped build.
+dev-worker = []
+
+[[test]]
+name = "cli"
+required-features = ["dev-worker"]

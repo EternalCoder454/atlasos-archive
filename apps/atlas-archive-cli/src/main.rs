@@ -27,12 +27,17 @@ const HELP: &str = "\
 Atlas Archive on the command line.
 
 Usage:
-  atlas-archive-cli list ARCHIVE [--json] [--encoding LABEL]
-  atlas-archive-cli extract ARCHIVE [ENTRY...] [--to DIR] [--here] [--name NAME]
+  atlas-archive-cli list [--json] [--encoding LABEL] [--] ARCHIVE
+  atlas-archive-cli extract [--to DIR] [--here] [--name NAME]
                     [--on-clash replace|skip|keep-both] [--allow-large]
-  atlas-archive-cli test ARCHIVE [--json]
-  atlas-archive-cli info ARCHIVE [--json]
+                    [--] ARCHIVE [ENTRY...]
+  atlas-archive-cli test [--json] [--] ARCHIVE
+  atlas-archive-cli info [--json] [--] ARCHIVE
   atlas-archive-cli create            (not available yet)
+
+Options come before ARCHIVE. ARCHIVE and everything after it are paths, even
+when they start with a dash; -- ends the options early. Pass -- before
+file names that aren't your own.
 
 Commands:
   list     Show what is inside: size, date, name; refused items marked with !.
@@ -50,9 +55,10 @@ Options:
   --encoding LABEL     Read names with this encoding (UTF-8, IBM437, Shift_JIS,
                        GBK, windows-1252...), instead of detecting it.
   --password-fd N      Read the password from descriptor N: one line, then the
-                       descriptor is closed. Without it a terminal is asked;
-                       a password is never taken from an argument or the
-                       environment.
+                       descriptor is closed, and waiting stops after 30
+                       seconds (exit 3). With N = 0 this uses up standard
+                       input. Without it a terminal is asked; a password is
+                       never taken from an argument or the environment.
   --allow-large        Go past the size and ratio limits that guard against
                        archives built to fill a disk. Without a terminal
                        they stop the job; with one you are asked.
@@ -62,14 +68,52 @@ Options:
   --version            Show the version.
 
 Exit codes: 0 done, 1 failed, 2 bad usage, 3 needs a password, 4 a limit
-refused it, 130 cancelled (Ctrl-C or SIGTERM).
+refused it, 130 cancelled (Ctrl-C, Ctrl-\\ or SIGTERM; a second one stops at once).
 ";
 
 fn main() {
     std::process::exit(run());
 }
 
+/// No core dump and no attaching to this process: a password may be in its
+/// memory. Failing to ask for either is a failure to start.
+fn harden() -> Result<(), io::Error> {
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `none` is a live rlimit; prctl takes plain integers.
+    unsafe {
+        if libc::setrlimit(libc::RLIMIT_CORE, &none) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// A panic says one fixed sentence: the payload may hold archive text. The
+/// terminal is put back and the program ends with exit 1.
+fn quiet_panics() {
+    std::panic::set_hook(Box::new(|_| {
+        term::restore_terminal();
+        let msg = b"atlas-archive-cli: Something went wrong inside the program.\n";
+        // SAFETY: writes from a live buffer, then ends the process.
+        unsafe {
+            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+            libc::_exit(error::EXIT_FAILED)
+        }
+    }));
+}
+
 fn run() -> i32 {
+    quiet_panics();
+    if let Err(e) = harden() {
+        eprintln!("atlas-archive-cli: The program couldn't be locked down ({e}).");
+        return error::EXIT_FAILED;
+    }
     // Before anything starts a thread: Ctrl-C and SIGTERM are blocked here,
     // and so in every thread made later.
     if let Err(e) = sig::block() {
@@ -100,7 +144,6 @@ fn run() -> i32 {
         }
         command => {
             log::init(parsed.verbose);
-            job::clean_stale_jobs();
             let cancel = job::Cancel::new();
             let sigs = match sig::watch(cancel.clone()) {
                 Ok(s) => s,
@@ -109,7 +152,16 @@ fn run() -> i32 {
                     return error::EXIT_FAILED;
                 }
             };
-            let job = Job::new(parsed.worker.as_deref(), cancel, &sigs);
+            ::log::debug!("atlas-archive-cli {} started", env!("CARGO_PKG_VERSION"));
+            // Only extraction leaves a staging folder behind; the sweep
+            // runs with the signal thread already watching.
+            if matches!(command, Command::Extract(_)) {
+                job::clean_stale_jobs();
+            }
+            #[cfg(feature = "dev-worker")]
+            let job = Job::with_worker(parsed.worker.as_deref(), cancel, &sigs);
+            #[cfg(not(feature = "dev-worker"))]
+            let job = Job::new(cancel, &sigs);
             finish(run_command(command, &job, &sigs))
         }
     }
@@ -134,10 +186,12 @@ fn password(c: &Common, sigs: &Signals) -> Result<Option<Zeroizing<Vec<u8>>>, Cl
     let Some(fd) = c.password_fd else {
         return Ok(None);
     };
+    let _busy = sigs.busy();
     match term::read_password_fd(fd, sigs.wake_fd()) {
         Ok(Some(p)) => Ok(Some(p)),
         Ok(None) => Err(CliError::Cancelled),
-        Err(m) => Err(CliError::Usage(m)),
+        Err(e) if e.timed_out => Err(CliError::NeedsPassword(e.message)),
+        Err(e) => Err(CliError::Usage(e.message)),
     }
 }
 

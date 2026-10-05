@@ -6,6 +6,7 @@
 //! through the safe-text functions.
 
 use std::collections::HashMap;
+#[cfg(feature = "dev-worker")]
 use std::ffi::OsStr;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -344,8 +345,19 @@ pub struct Job<'a> {
 }
 
 impl<'a> Job<'a> {
+    /// The installed, sandboxed worker, and no other.
+    #[cfg(not(feature = "dev-worker"))]
+    pub fn new(cancel: Cancel, sigs: &'a Signals) -> Job<'a> {
+        Job {
+            worker: Worker::system(),
+            cancel,
+            sigs,
+        }
+    }
+
     /// `worker`: the executable to use (tests); the installed one if `None`.
-    pub fn new(worker: Option<&OsStr>, cancel: Cancel, sigs: &'a Signals) -> Job<'a> {
+    #[cfg(feature = "dev-worker")]
+    pub fn with_worker(worker: Option<&OsStr>, cancel: Cancel, sigs: &'a Signals) -> Job<'a> {
         let worker = match worker {
             Some(p) => Worker::at(p),
             None => Worker::system(),
@@ -390,12 +402,14 @@ impl<'a> Job<'a> {
         pw: Option<Zeroizing<Vec<u8>>>,
         want_raw: bool,
     ) -> Result<Loaded, CliError> {
+        let _busy = self.sigs.busy();
         let mut front = self.front("Listing", pw);
         front.capture = want_raw;
         self.list_with(Path::new(&c.archive), c.encoding, &mut front)
     }
 
     pub fn test(&self, c: &Common, pw: Option<Zeroizing<Vec<u8>>>) -> Result<Tested, CliError> {
+        let _busy = self.sigs.busy();
         let mut front = self.front("Testing", pw);
         match self
             .worker
@@ -420,6 +434,7 @@ impl<'a> Job<'a> {
         a: &ExtractArgs,
         pw: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<Extraction, CliError> {
+        let _busy = self.sigs.busy();
         let archive = Path::new(&a.common.archive);
         let mut front = self.front("Extracting", pw);
         front.allow_large = a.allow_large;
@@ -470,7 +485,8 @@ impl<'a> Job<'a> {
         };
         front.progress.clear();
 
-        let names = select::names_by_index(&loaded.tree);
+        // Names only for the items that are printed.
+        let names = select::names_for(&loaded.tree, got.skipped.iter().map(|s| s.index).collect());
         let name_of = |i: u32| {
             names
                 .get(&i)

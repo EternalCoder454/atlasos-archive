@@ -270,7 +270,7 @@ pub fn info_text(out: &mut impl Write, l: &Loaded) -> io::Result<()> {
     writeln!(out, "Volumes:    {}", f.volumes)?;
     writeln!(out, "Names:      {}", l.tree.encoding.label())?;
     if let Some(c) = &f.comment {
-        let safe = term::safe(c);
+        let safe = term::safe_multiline(c);
         let mut lines = safe.lines();
         writeln!(out, "Comment:    {}", lines.next().unwrap_or(""))?;
         for line in lines {
@@ -282,7 +282,7 @@ pub fn info_text(out: &mut impl Write, l: &Loaded) -> io::Result<()> {
 
 pub fn info_json(out: &mut impl Write, l: &Loaded) -> io::Result<()> {
     let f = &l.format;
-    let comment = f.comment.as_deref().map(term::safe);
+    let comment = f.comment.as_deref().map(term::safe_multiline);
     let o = Obj::new()
         .str("format", &term::safe(&f.name))
         .num("entries", l.entries)

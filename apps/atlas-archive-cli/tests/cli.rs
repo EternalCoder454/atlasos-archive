@@ -83,6 +83,12 @@ impl Scratch {
     }
 
     fn run_os(&self, args: Vec<std::ffi::OsString>, password: Option<&str>) -> Run {
+        self.run_full(args, password, None)
+    }
+
+    /// The command with the real worker and every per-user place inside the
+    /// scratch folder; no terminal, no display.
+    fn base(&self, args: Vec<std::ffi::OsString>) -> Command {
         let mut cmd = Command::new(CLI);
         cmd.arg("--worker")
             .arg(&self.worker)
@@ -93,8 +99,21 @@ impl Scratch {
             .env("XDG_CACHE_HOME", self.path("cache"))
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env_remove("DISPLAY")
-            .env_remove("WAYLAND_DISPLAY")
-            .stdin(Stdio::null());
+            .env_remove("WAYLAND_DISPLAY");
+        cmd
+    }
+
+    fn run_full(
+        &self,
+        args: Vec<std::ffi::OsString>,
+        password: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Run {
+        let mut cmd = self.base(args);
+        cmd.stdin(Stdio::null());
+        if let Some(c) = cwd {
+            cmd.current_dir(c);
+        }
         let mut keep_open = None;
         let mut read_fd = -1;
         if let Some(p) = password {
@@ -338,7 +357,7 @@ fn read(p: impl AsRef<Path>) -> String {
 fn list_shows_a_table_in_display_form() {
     let s = scratch!("list");
     let a = sample(&s, "sample.zip");
-    let r = s.run(&["list", a.to_str().unwrap(), "--encoding", "cp437"], None);
+    let r = s.run(&["list", "--encoding", "cp437", a.to_str().unwrap()], None);
     r.assert_ok();
     r.assert_clean();
     let t = r.text();
@@ -370,7 +389,7 @@ fn list_json_is_one_object_per_line_with_a_summary() {
     let s = scratch!("listjson");
     let a = sample(&s, "sample.zip");
     let r = s.run(
-        &["list", a.to_str().unwrap(), "--json", "--encoding", "cp437"],
+        &["list", "--json", "--encoding", "cp437", a.to_str().unwrap()],
         None,
     );
     r.assert_ok();
@@ -418,7 +437,7 @@ fn list_json_is_one_object_per_line_with_a_summary() {
 fn list_of_an_encrypted_zip_names_it_encrypted() {
     let s = scratch!("listaes");
     let a = s.fixture("aes256-secret.zip");
-    let r = s.run(&["list", a.to_str().unwrap(), "--json"], None);
+    let r = s.run(&["list", "--json", a.to_str().unwrap()], None);
     r.assert_ok();
     let t = r.text();
     assert!(t.contains("\"path\":\"f.txt\""), "{t}");
@@ -442,7 +461,7 @@ fn info_describes_the_archive() {
     ] {
         assert!(t.contains(want), "{t}");
     }
-    let r = s.run(&["info", a.to_str().unwrap(), "--json"], None);
+    let r = s.run(&["info", "--json", a.to_str().unwrap()], None);
     r.assert_ok();
     let t = r.text();
     assert_eq!(t.lines().count(), 1, "{t}");
@@ -470,7 +489,7 @@ fn test_passes_a_good_archive() {
     let r = s.run(&["test", a.to_str().unwrap()], None);
     r.assert_ok();
     assert!(r.text().contains("No errors found."), "{}", r.text());
-    let r = s.run(&["test", a.to_str().unwrap(), "--json"], None);
+    let r = s.run(&["test", "--json", a.to_str().unwrap()], None);
     r.assert_ok();
     assert!(
         r.text().contains("{\"summary\":{\"ok\":true"),
@@ -493,7 +512,7 @@ fn test_fails_a_corrupt_archive() {
     assert!(r.err.contains("has errors"), "{}", r.err);
     assert!(!r.text().contains("No errors"), "{}", r.text());
     r.assert_clean();
-    let r = s.run(&["test", a.to_str().unwrap(), "--json"], None);
+    let r = s.run(&["test", "--json", a.to_str().unwrap()], None);
     assert_eq!(r.code, 1);
     assert!(r.text().contains("{\"skipped\":{"), "{}", r.text());
     assert!(r.text().contains("\"ok\":false"), "{}", r.text());
@@ -504,7 +523,7 @@ fn passwords_come_from_a_descriptor() {
     let s = scratch!("pw");
     let a = s.fixture("aes256-secret.zip");
     let a = a.to_str().unwrap();
-    let r = s.run(&["test", a, "--password-fd", "3"], Some("secret"));
+    let r = s.run(&["test", "--password-fd", "3", a], Some("secret"));
     r.assert_ok();
     // None given and no terminal.
     let r = s.run(&["test", a], None);
@@ -514,12 +533,12 @@ fn passwords_come_from_a_descriptor() {
         "atlas-archive-cli: This archive needs a password: run in a terminal or use --password-fd."
     );
     // A wrong one.
-    let r = s.run(&["test", a, "--password-fd", "3"], Some("wrong"));
+    let r = s.run(&["test", "--password-fd", "3", a], Some("wrong"));
     assert_eq!(r.code, 3, "{}", r.err);
     assert!(r.err.contains("didn't work"), "{}", r.err);
     assert!(!r.err.contains("wrong") || r.err.contains("didn't work"));
     // A descriptor that isn't open is a usage mistake.
-    let r = s.run(&["test", a, "--password-fd", "77"], None);
+    let r = s.run(&["test", "--password-fd", "77", a], None);
     assert_eq!(r.code, 2, "{}", r.err);
 }
 
@@ -528,14 +547,14 @@ fn a_password_is_never_logged() {
     let s = scratch!("pwlog");
     let a = s.fixture("zipcrypto-secret.zip");
     let r = s.run(
-        &["-v", "test", a.to_str().unwrap(), "--password-fd", "3"],
+        &["-v", "test", "--password-fd", "3", a.to_str().unwrap()],
         Some("secret"),
     );
     r.assert_ok();
     assert!(!r.err.contains("secret"), "{}", r.err);
     assert!(!r.text().contains("secret"));
     let r = s.run(
-        &["-v", "test", a.to_str().unwrap(), "--password-fd", "3"],
+        &["-v", "test", "--password-fd", "3", a.to_str().unwrap()],
         Some("hunter2"),
     );
     assert_eq!(r.code, 3);
@@ -585,9 +604,9 @@ fn extract_to_and_name_choose_the_folder() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
             "--to",
             dest.to_str().unwrap(),
+            a.to_str().unwrap(),
         ],
         None,
     );
@@ -597,31 +616,34 @@ fn extract_to_and_name_choose_the_folder() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
             "--to",
             dest.to_str().unwrap(),
             "--name",
             "Mine",
+            a.to_str().unwrap(),
         ],
         None,
     );
     r.assert_ok();
     assert_eq!(read(dest.join("Mine/top.txt")), "top\n");
-    // A name with a slash can't climb out: it is cleaned to one folder name.
-    let r = s.run(
-        &[
-            "extract",
-            a.to_str().unwrap(),
-            "--to",
-            dest.to_str().unwrap(),
-            "--name",
-            "../b",
-        ],
-        None,
-    );
-    r.assert_ok();
+    // A name with a slash can't climb out: refused before any work.
+    for bad in ["../b", "a/b", "..", "."] {
+        let r = s.run(
+            &[
+                "extract",
+                "--to",
+                dest.to_str().unwrap(),
+                "--name",
+                bad,
+                a.to_str().unwrap(),
+            ],
+            None,
+        );
+        assert_eq!(r.code, 2, "{bad}: {}", r.err);
+        assert!(r.err.contains("--name"), "{bad}: {}", r.err);
+    }
     assert!(!s.path("b").exists());
-    assert_eq!(s.ls(&dest).len(), 3, "{:?}", s.ls(&dest));
+    assert_eq!(s.ls(&dest).len(), 2, "{:?}", s.ls(&dest));
     assert!(!s.ls(&s.root).contains(&"b".to_string()));
 }
 
@@ -639,10 +661,10 @@ fn extract_here_moves_a_lone_folder_out_and_numbers_a_clash() {
     let dest = s.dest();
     let args = [
         "extract",
-        a.to_str().unwrap(),
         "--here",
         "--to",
         dest.to_str().unwrap(),
+        a.to_str().unwrap(),
     ];
     let r = s.run(&args, None);
     r.assert_ok();
@@ -654,14 +676,17 @@ fn extract_here_moves_a_lone_folder_out_and_numbers_a_clash() {
     assert_eq!(s.ls(&dest), ["only", "only (2)"], "{}", r.err);
     assert!(r.text().contains("only (2)"), "{}", r.text());
     // --on-clash skip leaves things as they are and says so.
-    let r = s.run(&[args.as_slice(), &["--on-clash", "skip"]].concat(), None);
+    let r = s.run(
+        &[&args[..1], &["--on-clash", "skip"], &args[1..]].concat(),
+        None,
+    );
     r.assert_ok();
     assert_eq!(s.ls(&dest), ["only", "only (2)"]);
     assert!(r.err.contains("Skip"), "{}", r.err);
     // --on-clash replace puts the new one in place; the old goes to the Trash.
     std::fs::write(dest.join("only/x.txt"), "changed\n").unwrap();
     let r = s.run(
-        &[args.as_slice(), &["--on-clash", "replace"]].concat(),
+        &[&args[..1], &["--on-clash", "replace"], &args[1..]].concat(),
         None,
     );
     r.assert_ok();
@@ -677,10 +702,10 @@ fn extract_here_wraps_many_items_in_a_folder() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
             "--here",
             "--to",
             dest.to_str().unwrap(),
+            a.to_str().unwrap(),
         ],
         None,
     );
@@ -697,11 +722,11 @@ fn extract_takes_only_the_entries_asked_for() {
     let r = s.run(
         &[
             "extract",
+            "--to",
+            d,
             a.to_str().unwrap(),
             "docs/sub",
             "top.txt",
-            "--to",
-            d,
         ],
         None,
     );
@@ -716,12 +741,12 @@ fn extract_takes_only_the_entries_asked_for() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
-            "nope.txt",
             "--to",
             d,
             "--name",
             "Other",
+            a.to_str().unwrap(),
+            "nope.txt",
         ],
         None,
     );
@@ -738,10 +763,10 @@ fn extract_json_reports_where_it_went() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
             "--json",
             "--to",
             dest.to_str().unwrap(),
+            a.to_str().unwrap(),
         ],
         None,
     );
@@ -765,11 +790,11 @@ fn extract_an_encrypted_zip_with_a_descriptor() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
             "--to",
             d,
             "--password-fd",
             "3",
+            a.to_str().unwrap(),
         ],
         Some("secret"),
     );
@@ -782,17 +807,17 @@ fn extract_an_encrypted_zip_with_a_descriptor() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
             "--to",
             o,
             "--password-fd",
             "3",
+            a.to_str().unwrap(),
         ],
         Some("nope"),
     );
     assert_eq!(r.code, 3, "{}", r.err);
     assert!(s.ls(&other).is_empty(), "{:?}", s.ls(&other));
-    let r = s.run(&["extract", a.to_str().unwrap(), "--to", o], None);
+    let r = s.run(&["extract", "--to", o, a.to_str().unwrap()], None);
     assert_eq!(r.code, 3, "{}", r.err);
     assert!(s.ls(&other).is_empty(), "{:?}", s.ls(&other));
 }
@@ -805,9 +830,9 @@ fn extract_into_a_missing_folder_fails_in_words() {
     let r = s.run(
         &[
             "extract",
-            a.to_str().unwrap(),
             "--to",
             gone.to_str().unwrap(),
+            a.to_str().unwrap(),
         ],
         None,
     );
@@ -845,12 +870,12 @@ fn limits_stop_extraction_unless_allowed() {
     };
     let dest = s.dest();
     let d = dest.to_str().unwrap();
-    let r = s.run(&["extract", a.to_str().unwrap(), "--to", d], None);
+    let r = s.run(&["extract", "--to", d, a.to_str().unwrap()], None);
     assert_eq!(r.code, 4, "{}", r.err);
     assert!(r.err.contains("--allow-large"), "{}", r.err);
     assert!(s.ls(&dest).is_empty(), "{:?}", s.ls(&dest));
     let r = s.run(
-        &["extract", a.to_str().unwrap(), "--to", d, "--allow-large"],
+        &["extract", "--to", d, "--allow-large", a.to_str().unwrap()],
         None,
     );
     r.assert_ok();
@@ -892,12 +917,12 @@ fn bad_usage_is_exit_2() {
         vec![],
         vec!["frobnicate"],
         vec!["list"],
-        vec!["list", a, "--bogus"],
-        vec!["list", a, "--here"],
-        vec!["extract", a, "--here", "--name", "x"],
-        vec!["extract", a, "--on-clash", "maybe"],
-        vec!["list", a, "--encoding", "klingon"],
-        vec!["test", a, "--password-fd", "x"],
+        vec!["list", "--bogus", a],
+        vec!["list", "--here", a],
+        vec!["extract", "--here", "--name", "x", a],
+        vec!["extract", "--on-clash", "maybe", a],
+        vec!["list", "--encoding", "klingon", a],
+        vec!["test", "--password-fd", "x", a],
     ] {
         let r = s.run(&args, None);
         assert_eq!(r.code, 2, "{args:?}: {}", r.err);
@@ -972,15 +997,289 @@ fn a_non_utf8_archive_path_works() {
     let r = s.run_os(
         vec![
             "extract".into(),
+            "--to".into(),
+            dest.clone().into_os_string(),
             s.root
                 .join(std::ffi::OsStr::from_bytes(&name))
                 .into_os_string(),
-            "--to".into(),
-            dest.clone().into_os_string(),
         ],
         None,
     );
     r.assert_ok();
     r.assert_clean();
     assert_eq!(s.ls(&dest).len(), 1, "{:?}", s.ls(&dest));
+}
+
+// ---- hardening ----
+
+#[test]
+fn a_worker_option_is_a_path_after_the_archive() {
+    // A glob such as `extract a.zip *` must never reach an option.
+    let s = scratch!("globopt");
+    let a = sample(&s, "sample.zip");
+    let r = s.run(
+        &["extract", a.to_str().unwrap(), "--worker=/bin/true"],
+        None,
+    );
+    assert_eq!(r.code, 1, "{}", r.err);
+    assert!(r.err.contains("--worker=/bin/true"), "{}", r.err);
+}
+
+#[test]
+fn a_file_named_like_a_flag_is_a_path_after_double_dash() {
+    let s = scratch!("dashfile");
+    let sample = sample(&s, "sample.zip");
+    std::fs::copy(&sample, s.path("--allow-large")).unwrap();
+    let go = |args: &[&str]| {
+        s.run_full(
+            args.iter().map(|a| (*a).into()).collect(),
+            None,
+            Some(&s.root),
+        )
+    };
+    // As an option it is one (and `list` has no such option).
+    let r = go(&["list", "--allow-large"]);
+    assert_eq!(r.code, 2, "{}", r.err);
+    // After `--` it is the archive.
+    let r = go(&["list", "--", "--allow-large"]);
+    r.assert_ok();
+    assert!(r.text().contains("top.txt"), "{}", r.text());
+    let dest = s.dest();
+    let r = go(&[
+        "extract",
+        "--to",
+        dest.to_str().unwrap(),
+        "--",
+        "--allow-large",
+        "top.txt",
+    ]);
+    r.assert_ok();
+    assert_eq!(read(dest.join("--allow-large/top.txt")), "top\n");
+    // After the archive it is an item to extract, not a flag.
+    let r = go(&["extract", "sample.zip", "--allow-large"]);
+    assert_eq!(r.code, 1, "{}", r.err);
+    assert!(
+        r.err.contains("no item called \"--allow-large\""),
+        "{}",
+        r.err
+    );
+}
+
+#[test]
+fn no_core_dump_and_no_attaching_while_it_runs() {
+    use std::os::unix::fs::MetadataExt;
+    let s = scratch!("dump");
+    let a = s.fixture("aes256-secret.zip");
+    // It waits for a password that never comes, on a pipe held open here.
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 fills two descriptors.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: new descriptors we own.
+    let (r, _w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let rfd = r.as_raw_fd();
+    let mut cmd = s.base(vec![
+        "test".into(),
+        "--password-fd".into(),
+        "3".into(),
+        a.into_os_string(),
+    ]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: only dup2 in the child.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(rfd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    let proc = format!("/proc/{}", child.id());
+    let mut ok = false;
+    for _ in 0..100 {
+        let limits = std::fs::read_to_string(format!("{proc}/limits")).unwrap_or_default();
+        let core = limits.lines().find(|l| l.starts_with("Max core file size"));
+        // A process that isn't dumpable owns its /proc files as root.
+        if core.is_some_and(|l| l.split_whitespace().nth(4) == Some("0"))
+            && std::fs::metadata(format!("{proc}/limits")).is_ok_and(|m| m.uid() == 0)
+        {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(ok, "core limit and dumpable were not both off");
+}
+
+/// A pseudo-terminal: the CLI gets the slave as its controlling terminal.
+struct Pty {
+    master: OwnedFd,
+    slave: OwnedFd,
+}
+
+impl Pty {
+    fn new() -> Pty {
+        let (mut m, mut sl) = (0, 0);
+        // SAFETY: openpty fills two descriptors; the optional arguments are null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut m,
+                &mut sl,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        // SAFETY: new descriptors we own.
+        unsafe {
+            Pty {
+                master: OwnedFd::from_raw_fd(m),
+                slave: OwnedFd::from_raw_fd(sl),
+            }
+        }
+    }
+
+    fn echo(&self) -> bool {
+        // SAFETY: tcgetattr fills a termios we own.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(self.slave.as_raw_fd(), &mut t) },
+            0
+        );
+        t.c_lflag & libc::ECHO != 0
+    }
+
+    /// Reads from the master until `needle` shows or five seconds pass.
+    fn wait_for(&self, needle: &str) -> String {
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            let mut fds = libc::pollfd {
+                fd: self.master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd.
+            if unsafe { libc::poll(&mut fds, 1, 50) } > 0 {
+                let mut buf = [0u8; 256];
+                // SAFETY: reads into a live buffer.
+                let n =
+                    unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), 256) };
+                if n > 0 {
+                    seen.extend_from_slice(&buf[..n as usize]);
+                }
+            }
+            if String::from_utf8_lossy(&seen).contains(needle) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    fn type_byte(&self, b: u8) {
+        // SAFETY: writes one byte from a live local.
+        unsafe { libc::write(self.master.as_raw_fd(), (&raw const b).cast(), 1) };
+    }
+}
+
+/// Starts `test ARCHIVE` on a pty at its password prompt.
+fn at_the_prompt(s: &Scratch, pty: &Pty) -> std::process::Child {
+    let a = s.fixture("aes256-secret.zip");
+    let mut cmd = s.base(vec!["test".into(), a.into_os_string()]);
+    let slave = pty.slave.as_raw_fd();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid and ioctl only, in the child.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            if libc::ioctl(slave, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().unwrap();
+    let seen = pty.wait_for("Password: ");
+    assert!(seen.contains("Password: "), "no prompt: {seen:?}");
+    assert!(!pty.echo(), "echo should be off at the prompt");
+    child
+}
+
+fn wait_code(child: &mut std::process::Child) -> Option<i32> {
+    for _ in 0..100 {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st.code();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+#[test]
+fn ctrl_backslash_at_the_prompt_cancels_and_restores_echo() {
+    let s = scratch!("quit");
+    let pty = Pty::new();
+    let mut child = at_the_prompt(&s, &pty);
+    pty.type_byte(0x1c); // Ctrl-\ : SIGQUIT to the foreground group
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(pty.echo(), "echo was left off");
+}
+
+#[test]
+fn ctrl_c_and_a_hangup_at_the_prompt_cancel_and_restore_echo() {
+    let s = scratch!("intr");
+    let pty = Pty::new();
+    let mut child = at_the_prompt(&s, &pty);
+    pty.type_byte(0x03);
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(pty.echo(), "echo was left off");
+}
+
+#[test]
+fn ctrl_z_at_the_prompt_doesnt_stop_it_with_echo_off() {
+    let s = scratch!("stop");
+    let pty = Pty::new();
+    let mut child = at_the_prompt(&s, &pty);
+    pty.type_byte(0x1a); // Ctrl-Z
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut status = 0;
+    // SAFETY: waitpid on our own child, with a live status.
+    let got = unsafe {
+        libc::waitpid(
+            child.id() as i32,
+            &mut status,
+            libc::WNOHANG | libc::WUNTRACED,
+        )
+    };
+    assert_eq!(got, 0, "the process stopped or ended (status {status})");
+    assert!(!pty.echo());
+    pty.type_byte(0x1c);
+    assert_eq!(wait_code(&mut child), Some(130));
+    assert!(pty.echo());
+}
+
+#[test]
+fn input_typed_before_a_cancel_is_thrown_away() {
+    let s = scratch!("flush");
+    let pty = Pty::new();
+    let mut child = at_the_prompt(&s, &pty);
+    for b in b"typed-ahead" {
+        pty.type_byte(*b);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    pty.type_byte(0x1c);
+    assert_eq!(wait_code(&mut child), Some(130));
+    // Nothing is left in the terminal's input for the shell to read.
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int.
+    unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::FIONREAD, &mut n) };
+    assert_eq!(n, 0, "{n} bytes of input were left");
 }

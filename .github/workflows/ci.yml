@@ -266,8 +266,14 @@ jobs:
       # --locked: also fails when Cargo.lock and the atlas-framework tag disagree.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy (CLI with dev-worker)
+        run: cargo clippy -p atlas-archive-cli --all-targets --locked --features dev-worker -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      # The CLI's integration tests point it at the test build's worker,
+      # which only the dev-worker feature allows; without it they're skipped.
+      - name: CLI integration tests
+        run: cargo test -p atlas-archive-cli --locked --features dev-worker
       - name: ccache statistics
         if: always()
         run: ccache -s || true

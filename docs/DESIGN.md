@@ -443,17 +443,31 @@ Job objects disappear 60 s after they finish.
 
 ### CLI: `atlas-archive-cli`
 
-`list`, `extract`, `test`, `create`, `info`, each with `--json` (one JSON
-object per line, names as given plus a `display` form). Passwords come from
-the terminal or `--password-fd N`, never an argument. Limits are enforced
-unless `--allow-large`. `extract ARCHIVE [ENTRY…]` takes `--to DIR`,
-`--here`, `--name N` and `--on-clash replace|skip|keep-both` (a folder
-ENTRY brings what is inside it); `list`, `info` and `extract` take
-`--encoding` for names without the UTF-8 flag. Notes on skipped and removed
-entries go to stderr. `test` fails (exit 1) when any item couldn't be read.
-Ctrl-C, SIGTERM and SIGHUP cancel. Exit codes: 0 done, 1 failed, 2 bad
-usage, 3 needs a password (or `--password-fd` gave a wrong one), 4 a limit
-refused, 130 cancelled. `create` exits 2 until the writers land.
+`atlas-archive-cli COMMAND [OPTIONS] [--] ARCHIVE [ENTRY…]`, with the
+commands `list`, `extract`, `test`, `create` and `info`, each with `--json`
+(one JSON object per line, names as given plus a `display` form; consumers
+use `display` or the index, never join `path` onto a folder). Options come
+before the archive, git-style: the first word that isn't an option, or
+`--`, ends them, so a file named `--allow-large` is never an option.
+Explorer and the launcher pass `--` before paths. Passwords come from the
+terminal or `--password-fd N` (at most 30 s of waiting, then exit 3),
+never an argument. Limits are enforced unless `--allow-large`. `extract`
+takes `--to DIR`, `--here`, `--name N` (one name, checked before any work)
+and `--on-clash replace|skip|keep-both`; ENTRY is matched component by
+component against the shown names (then the disk names; a name matching two
+entries is an error), and a folder ENTRY brings what is inside it. `list`,
+`info` and `extract` take `--encoding` for names without the UTF-8 flag.
+Notes on skipped and removed entries go to stderr, and every error, reason
+and log line is one line (only `info`'s archive comment keeps its line
+breaks). `test` fails (exit 1) when any item couldn't be read. A first
+Ctrl-C, Ctrl-\, SIGTERM or SIGHUP cancels; a second, or one with no job
+running, restores the terminal and exits at once; Ctrl-Z is blocked while
+the CLI runs. It sets its core limit to 0 and is not dumpable (it may hold
+a password). Stale staging is cleaned only by `extract`. The hidden
+`--worker PATH` exists only in builds with the `dev-worker` feature (the
+tests). Exit codes: 0 done, 1 failed, 2 bad usage, 3 needs a password (or
+`--password-fd` gave a wrong one), 4 a limit refused, 130 cancelled.
+`create` exits 2 until the writers land.
 
 The GUI takes `atlas-archive [--extract-here|--extract-to DIR|--extract-all|
 --compress-zip|--compress|--test] FILES…` (the Explorer actions without

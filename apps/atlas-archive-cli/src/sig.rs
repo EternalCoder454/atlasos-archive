@@ -1,17 +1,42 @@
-//! Ctrl-C, SIGTERM and SIGHUP: blocked in every thread, taken by one thread
-//! with `sigwait`, which cancels the job through the client. Nothing runs in
-//! a signal handler.
+//! Ctrl-C, Ctrl-\, SIGTERM and SIGHUP: blocked in every thread, taken by one
+//! thread with `sigwait`, which cancels the job through the client. Nothing
+//! runs in a signal handler. A second signal, or one while no job is
+//! running, ends the program at once (exit 130) with the terminal put back,
+//! so a stuck job never ignores them. Ctrl-Z (SIGTSTP) is blocked and never
+//! taken: the process can't be stopped with echo off at a password prompt.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use atlas_archive_core::client::Cancel;
 
 pub struct Signals {
     interrupted: Arc<AtomicBool>,
     wake: Arc<OwnedFd>,
+    busy: Arc<AtomicUsize>,
+}
+
+/// While it lives, a job is running that a first signal can cancel.
+pub struct Busy(Arc<AtomicUsize>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Ends the program with the cancelled code. Only async-signal-safe calls
+/// besides the terminal restore, and no locks on stderr.
+fn exit_now() -> ! {
+    crate::term::restore_terminal();
+    let msg = b"\natlas-archive-cli: Cancelled.\n";
+    // SAFETY: writes from a live buffer; the result can't be used anyway.
+    unsafe {
+        libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        libc::_exit(crate::error::EXIT_CANCELLED)
+    }
 }
 
 fn set(signals: &[libc::c_int]) -> libc::sigset_t {
@@ -33,8 +58,10 @@ pub fn block() -> io::Result<()> {
     // background job fails with an error instead of stopping the process.
     let all = set(&[
         libc::SIGINT,
+        libc::SIGQUIT,
         libc::SIGTERM,
         libc::SIGHUP,
+        libc::SIGTSTP,
         libc::SIGTTIN,
         libc::SIGTTOU,
     ]);
@@ -57,8 +84,13 @@ pub fn watch(cancel: Cancel) -> io::Result<Signals> {
     // SAFETY: a new descriptor we own.
     let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
     let interrupted = Arc::new(AtomicBool::new(false));
-    let (flag, wake_for_thread) = (Arc::clone(&interrupted), Arc::clone(&wake));
-    let waited = set(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+    let busy = Arc::new(AtomicUsize::new(0));
+    let (flag, wake_for_thread, busy_for_thread) = (
+        Arc::clone(&interrupted),
+        Arc::clone(&wake),
+        Arc::clone(&busy),
+    );
+    let waited = set(&[libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP]);
     std::thread::Builder::new()
         .name("signals".into())
         .spawn(move || {
@@ -72,8 +104,12 @@ pub fn watch(cancel: Cancel) -> io::Result<Signals> {
                     log::error!("sigwait failed: {}", io::Error::from_raw_os_error(rc));
                     return;
                 }
+                if flag.swap(true, Ordering::SeqCst) || busy_for_thread.load(Ordering::SeqCst) == 0
+                {
+                    // A second signal, or nothing to cancel: leave now.
+                    exit_now();
+                }
                 log::info!("signal {got}: cancelling");
-                flag.store(true, Ordering::SeqCst);
                 cancel.cancel();
                 let one = 1u64.to_ne_bytes();
                 // SAFETY: writes 8 bytes from a live buffer; EAGAIN means it
@@ -81,13 +117,23 @@ pub fn watch(cancel: Cancel) -> io::Result<Signals> {
                 unsafe { libc::write(wake_for_thread.as_raw_fd(), one.as_ptr().cast(), 8) };
             }
         })?;
-    Ok(Signals { interrupted, wake })
+    Ok(Signals {
+        interrupted,
+        wake,
+        busy,
+    })
 }
 
 impl Signals {
     /// A descriptor that turns readable when a signal came.
     pub fn wake_fd(&self) -> RawFd {
         self.wake.as_raw_fd()
+    }
+
+    /// Marks a cancellable job as running until the guard drops.
+    pub fn busy(&self) -> Busy {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        Busy(Arc::clone(&self.busy))
     }
 
     pub fn interrupted(&self) -> bool {

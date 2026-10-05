@@ -64,7 +64,7 @@ doubt, do what they do.
 |---|---|
 | Format | `scripts/dev.sh cargo fmt --all --check` |
 | Lint | `scripts/dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings` |
-| Tests | `scripts/dev.sh cargo test --workspace --locked` |
+| Tests | `scripts/dev.sh bash -c 'cargo test --workspace --locked && cargo test -p atlas-archive-cli --locked --features dev-worker'` (the second runs the CLI's integration tests, which need the `dev-worker` feature) |
 | App build | `scripts/dev.sh bash -c 'cmake -S apps/atlas-archive -B /work/cmake/dev -G Ninja && cmake --build /work/cmake/dev'` |
 | Smoke run | `scripts/dev.sh dbus-run-session -- env QT_QPA_PLATFORM=offscreen /work/cmake/dev/atlas-archive` |
 | RPM | `podman run --rm --security-opt label=disable -v "$PWD":/src -v <framework rpms>:/atlas-rpms:ro -e ATLAS_LOCAL_RPMS=/atlas-rpms -v atlas-cargo:/root/.cargo/registry -v atlas-cargo-git:/root/.cargo/git -e CARGO_HOME=/root/.cargo registry.fedoraproject.org/fedora:44 /src/packaging/build-rpm.sh /src/out` |

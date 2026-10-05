@@ -7,6 +7,8 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use atlas_archive_core::name::{self, NameEncoding};
 use zeroize::Zeroizing;
@@ -16,8 +18,19 @@ pub const MAX_PASSWORD: usize = 4096;
 /// The longest answer to a question.
 const MAX_ANSWER: usize = 64;
 
-/// Free text from an archive or the worker, safe to print.
+/// The longest `--password-fd` waits for the line.
+const FD_WAIT: Duration = Duration::from_secs(30);
+
+/// Free text from an archive or the worker, safe to print on one line: a
+/// newline shows as `\x0A`, so one reason can't forge a log or error line.
 pub fn safe(text: &str) -> String {
+    let chars: Vec<name::Piece> = text.chars().map(name::Piece::Char).collect();
+    name::display(&chars).0
+}
+
+/// Free text that may run over several lines (an archive comment): the
+/// newlines stay, every line is made safe.
+pub fn safe_multiline(text: &str) -> String {
     name::display_text(text)
 }
 
@@ -42,10 +55,13 @@ pub enum Line {
     Eof,
     /// The wake descriptor fired (a signal came).
     Interrupted,
+    /// The line was longer than allowed; the rest of it was read and dropped.
     TooLong,
+    /// Nothing finished the line in time.
+    TimedOut,
 }
 
-fn poll2(a: RawFd, b: RawFd) -> io::Result<(bool, bool)> {
+fn poll2(a: RawFd, b: RawFd, wait_ms: i32) -> io::Result<(bool, bool)> {
     let mut fds = [
         libc::pollfd {
             fd: a,
@@ -60,7 +76,7 @@ fn poll2(a: RawFd, b: RawFd) -> io::Result<(bool, bool)> {
     ];
     loop {
         // SAFETY: `fds` is a live array of two pollfd structs.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait_ms) };
         if n >= 0 {
             return Ok((fds[0].revents != 0, fds[1].revents != 0));
         }
@@ -73,11 +89,31 @@ fn poll2(a: RawFd, b: RawFd) -> io::Result<(bool, bool)> {
 
 /// Reads one line from `fd`, a byte at a time so nothing past the newline is
 /// taken from a shared pipe, giving up when `wake` becomes readable. The
-/// buffer is sized up front, so no reallocation leaves a copy behind.
-pub fn read_line(fd: RawFd, wake: RawFd, max: usize) -> io::Result<Line> {
+/// buffer is sized up front, so no reallocation leaves a copy behind. A line
+/// over `max` bytes is read to its end and dropped (`TooLong`), so the rest of
+/// it isn't taken for the next answer. With `timeout`, `TimedOut` comes when
+/// the whole line hasn't arrived by then.
+pub fn read_line(
+    fd: RawFd,
+    wake: RawFd,
+    max: usize,
+    timeout: Option<Duration>,
+) -> io::Result<Line> {
+    let deadline = timeout.map(|t| Instant::now() + t);
     let mut buf = Zeroizing::new(Vec::with_capacity(max + 1));
+    let mut too_long = false;
     loop {
-        let (ready, woken) = poll2(fd, wake)?;
+        let wait_ms = match deadline {
+            None => -1,
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(Line::TimedOut);
+                }
+                left.as_millis().clamp(1, 60_000) as i32
+            }
+        };
+        let (ready, woken) = poll2(fd, wake, wait_ms)?;
         if woken {
             return Ok(Line::Interrupted);
         }
@@ -95,6 +131,9 @@ pub fn read_line(fd: RawFd, wake: RawFd, max: usize) -> io::Result<Line> {
             }
         }
         if n == 0 {
+            if too_long {
+                return Ok(Line::TooLong);
+            }
             return Ok(if buf.is_empty() {
                 Line::Eof
             } else {
@@ -102,42 +141,109 @@ pub fn read_line(fd: RawFd, wake: RawFd, max: usize) -> io::Result<Line> {
             });
         }
         if byte == b'\n' {
-            return Ok(Line::Text(buf));
+            return Ok(if too_long {
+                Line::TooLong
+            } else {
+                Line::Text(buf)
+            });
+        }
+        if too_long {
+            continue;
         }
         if buf.len() >= max {
-            return Ok(Line::TooLong);
+            too_long = true;
+            continue;
         }
         buf.push(byte);
     }
 }
 
+/// Why `--password-fd` gave no password.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FdError {
+    /// Nothing arrived in time: the archive needs a password (exit 3), where
+    /// anything else is a usage mistake.
+    pub timed_out: bool,
+    /// A sentence.
+    pub message: String,
+}
+
+fn bad(message: String) -> FdError {
+    FdError {
+        timed_out: false,
+        message,
+    }
+}
+
 /// The password on `--password-fd`: one line, the newline dropped, the
-/// descriptor closed afterwards. The error is a sentence.
-pub fn read_password_fd(fd: RawFd, wake: RawFd) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+/// descriptor closed afterwards, 30 seconds at most. When the descriptor is
+/// 0 this takes the program's standard input.
+pub fn read_password_fd(fd: RawFd, wake: RawFd) -> Result<Option<Zeroizing<Vec<u8>>>, FdError> {
+    read_password_fd_within(fd, wake, FD_WAIT)
+}
+
+fn read_password_fd_within(
+    fd: RawFd,
+    wake: RawFd,
+    wait: Duration,
+) -> Result<Option<Zeroizing<Vec<u8>>>, FdError> {
     // Our own descriptors (the eventfds) are never a password source.
-    let target = std::fs::read_link(format!("/proc/self/fd/{fd}"))
-        .map_err(|_| format!("Descriptor {fd} isn't open, so there is no password to read."))?;
-    if target.as_os_str().as_bytes().starts_with(b"anon_inode:") {
-        return Err(format!(
+    let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).map_err(|_| {
+        bad(format!(
             "Descriptor {fd} isn't open, so there is no password to read."
-        ));
+        ))
+    })?;
+    if target.as_os_str().as_bytes().starts_with(b"anon_inode:") {
+        return Err(bad(format!(
+            "Descriptor {fd} isn't open, so there is no password to read."
+        )));
     }
     if is_tty(fd) {
-        return Err("--password-fd needs a pipe or a file, not a terminal.".into());
+        return Err(bad(
+            "--password-fd needs a pipe or a file, not a terminal.".into()
+        ));
     }
     // SAFETY: the descriptor is open (checked above) and nothing else in
     // this process owns it; the OwnedFd closes it when this function ends.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    match read_line(owned.as_raw_fd(), wake, MAX_PASSWORD) {
+    match read_line(owned.as_raw_fd(), wake, MAX_PASSWORD, Some(wait)) {
         Ok(Line::Text(p)) => Ok(Some(p)),
-        Ok(Line::Eof) => Err(format!("No password was sent on descriptor {fd}.")),
-        Ok(Line::TooLong) => Err("The password is too long.".into()),
+        Ok(Line::Eof) => Err(bad(format!("No password was sent on descriptor {fd}."))),
+        Ok(Line::TooLong) => Err(bad("The password is too long.".into())),
+        Ok(Line::TimedOut) => Err(FdError {
+            timed_out: true,
+            message: format!(
+                "This archive needs a password, and none came on descriptor {fd} within {} seconds.",
+                wait.as_secs().max(1)
+            ),
+        }),
         Ok(Line::Interrupted) => Ok(None),
         Err(e) => {
             log::warn!("reading descriptor {fd}: {e}");
-            Err(format!(
+            Err(bad(format!(
                 "The password couldn't be read from descriptor {fd}."
-            ))
+            )))
+        }
+    }
+}
+
+/// The terminal that has echo off, and how to put it back: read by the
+/// signal thread and the panic hook, which leave without running drops.
+static SAVED: Mutex<Option<(RawFd, libc::termios)>> = Mutex::new(None);
+
+fn saved() -> std::sync::MutexGuard<'static, Option<(RawFd, libc::termios)>> {
+    SAVED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Puts back a terminal that has echo off, and throws away what was typed
+/// meanwhile, so it isn't read by the shell. Safe to call at any time.
+pub fn restore_terminal() {
+    if let Some((fd, t)) = saved().take() {
+        // SAFETY: `t` is the termios tcgetattr gave for `fd`, a descriptor
+        // the prompt keeps open until it drops its guard.
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+            libc::tcflush(fd, libc::TCIFLUSH);
         }
     }
 }
@@ -163,12 +269,14 @@ impl EchoOff {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        *self::saved() = Some((fd, saved));
         Ok(EchoOff { fd, saved })
     }
 }
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
+        self::saved().take();
         // SAFETY: `saved` is the termios tcgetattr gave; the descriptor
         // outlives this guard (the Tty owns it).
         if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved) } != 0 {
@@ -209,27 +317,40 @@ impl Tty {
     /// of input, a signal, or a failed read.
     pub fn ask(&self, prompt: &str) -> Option<String> {
         self.say(prompt);
-        match read_line(self.file.as_raw_fd(), self.wake, MAX_ANSWER) {
+        match read_line(self.file.as_raw_fd(), self.wake, MAX_ANSWER, None) {
             Ok(Line::Text(t)) => Some(String::from_utf8_lossy(&t).trim().to_lowercase()),
+            // The whole long line was read and dropped: no answer.
             Ok(Line::TooLong) => Some(String::new()),
             Ok(_) => {
                 self.say("\n");
+                self.flush_input();
                 None
             }
             Err(e) => {
                 log::warn!("reading the terminal: {e}");
+                self.flush_input();
                 None
             }
         }
+    }
+
+    /// Drops what was typed and not read yet, after a prompt that ended
+    /// without an answer, so it doesn't reach the shell.
+    fn flush_input(&self) {
+        // SAFETY: tcflush takes a descriptor the Tty keeps open.
+        unsafe { libc::tcflush(self.file.as_raw_fd(), libc::TCIFLUSH) };
     }
 
     /// Asks for a password with echo off. `Err` when it can't be hidden.
     pub fn password(&self, prompt: &str) -> io::Result<Line> {
         let _quiet = EchoOff::new(self.file.as_raw_fd())?;
         self.say(prompt);
-        let line = read_line(self.file.as_raw_fd(), self.wake, MAX_PASSWORD);
+        let line = read_line(self.file.as_raw_fd(), self.wake, MAX_PASSWORD, None);
         // Echo was off, so the Enter key showed nothing.
         self.say("\n");
+        if !matches!(line, Ok(Line::Text(_))) {
+            self.flush_input();
+        }
         line
     }
 }
@@ -268,13 +389,13 @@ mod tests {
         let wake = eventfd();
         let (r, mut w) = pipe();
         w.write_all(b"secret\nnext\n").unwrap();
-        let first = read_line(r.as_raw_fd(), wake.as_raw_fd(), 100).unwrap();
+        let first = read_line(r.as_raw_fd(), wake.as_raw_fd(), 100, None).unwrap();
         assert_eq!(first, Line::Text(Zeroizing::new(b"secret".to_vec())));
-        let second = read_line(r.as_raw_fd(), wake.as_raw_fd(), 100).unwrap();
+        let second = read_line(r.as_raw_fd(), wake.as_raw_fd(), 100, None).unwrap();
         assert_eq!(second, Line::Text(Zeroizing::new(b"next".to_vec())));
         drop(w);
         assert_eq!(
-            read_line(r.as_raw_fd(), wake.as_raw_fd(), 100).unwrap(),
+            read_line(r.as_raw_fd(), wake.as_raw_fd(), 100, None).unwrap(),
             Line::Eof
         );
     }
@@ -286,20 +407,68 @@ mod tests {
         w.write_all(b"abc").unwrap();
         drop(w);
         assert_eq!(
-            read_line(r.as_raw_fd(), wake.as_raw_fd(), 100).unwrap(),
+            read_line(r.as_raw_fd(), wake.as_raw_fd(), 100, None).unwrap(),
             Line::Text(Zeroizing::new(b"abc".to_vec()))
         );
     }
 
     #[test]
-    fn a_long_line_is_refused() {
+    fn a_long_line_is_dropped_through_its_newline() {
         let wake = eventfd();
         let (r, mut w) = pipe();
         w.write_all(&[b'x'; 50]).unwrap();
+        w.write_all(b"\nnext\n").unwrap();
+        let fd = r.as_raw_fd();
         assert_eq!(
-            read_line(r.as_raw_fd(), wake.as_raw_fd(), 10).unwrap(),
+            read_line(fd, wake.as_raw_fd(), 10, None).unwrap(),
             Line::TooLong
         );
+        // Nothing of the long line is left to be taken for an answer.
+        assert_eq!(
+            read_line(fd, wake.as_raw_fd(), 10, None).unwrap(),
+            Line::Text(Zeroizing::new(b"next".to_vec()))
+        );
+        // The same at the very limit and without a final newline.
+        w.write_all(&[b'y'; 10]).unwrap();
+        w.write_all(b"\n").unwrap();
+        assert!(matches!(
+            read_line(fd, wake.as_raw_fd(), 10, None).unwrap(),
+            Line::Text(_)
+        ));
+        w.write_all(&[b'z'; 11]).unwrap();
+        drop(w);
+        assert_eq!(
+            read_line(fd, wake.as_raw_fd(), 10, None).unwrap(),
+            Line::TooLong
+        );
+    }
+
+    #[test]
+    fn a_silent_descriptor_times_out() {
+        let wake = eventfd();
+        let (r, _w) = pipe();
+        let t = Instant::now();
+        let got = read_line(
+            r.as_raw_fd(),
+            wake.as_raw_fd(),
+            10,
+            Some(Duration::from_millis(100)),
+        )
+        .unwrap();
+        assert_eq!(got, Line::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(5));
+        let fd = r.as_raw_fd();
+        std::mem::forget(r);
+        let e =
+            read_password_fd_within(fd, wake.as_raw_fd(), Duration::from_millis(100)).unwrap_err();
+        assert!(e.timed_out, "{e:?}");
+        assert!(e.message.contains("needs a password"), "{e:?}");
+    }
+
+    #[test]
+    fn text_is_one_line_unless_asked() {
+        assert_eq!(safe("a\nb\r\x1b[2J"), "a\\x0Ab\\x0D\\x1B[2J");
+        assert_eq!(safe_multiline("a\nb\x1b"), "a\nb\\x1B");
     }
 
     #[test]
@@ -310,7 +479,7 @@ mod tests {
         // SAFETY: writes 8 bytes from a live buffer.
         unsafe { libc::write(wake.as_raw_fd(), one.as_ptr().cast(), 8) };
         assert_eq!(
-            read_line(r.as_raw_fd(), wake.as_raw_fd(), 10).unwrap(),
+            read_line(r.as_raw_fd(), wake.as_raw_fd(), 10, None).unwrap(),
             Line::Interrupted
         );
     }
@@ -329,17 +498,19 @@ mod tests {
     #[test]
     fn password_fd_errors_are_sentences() {
         let wake = eventfd();
-        let e = read_password_fd(900, wake.as_raw_fd()).unwrap_err();
+        let e = read_password_fd(900, wake.as_raw_fd()).unwrap_err().message;
         assert!(e.contains("isn't open"), "{e}");
         // An eventfd is ours, not a password source.
         let other = eventfd();
-        let e = read_password_fd(other.as_raw_fd(), wake.as_raw_fd()).unwrap_err();
+        let e = read_password_fd(other.as_raw_fd(), wake.as_raw_fd())
+            .unwrap_err()
+            .message;
         assert!(e.contains("isn't open"), "{e}");
         let (r, w) = pipe();
         drop(w);
         let fd = r.as_raw_fd();
         std::mem::forget(r);
-        let e = read_password_fd(fd, wake.as_raw_fd()).unwrap_err();
+        let e = read_password_fd(fd, wake.as_raw_fd()).unwrap_err().message;
         assert!(e.contains("No password"), "{e}");
     }
 }

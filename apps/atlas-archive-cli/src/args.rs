@@ -59,7 +59,8 @@ pub struct Parsed {
     pub command: Command,
     /// `-v`: log to stderr.
     pub verbose: bool,
-    /// `--worker PATH` (tests only).
+    /// `--worker PATH` (the `dev-worker` feature, tests only).
+    #[cfg(feature = "dev-worker")]
     pub worker: Option<OsString>,
 }
 
@@ -86,8 +87,17 @@ fn allowed(command: &str) -> &'static [&'static str] {
 fn takes_value(opt: &str) -> bool {
     matches!(
         opt,
-        "--encoding" | "--password-fd" | "--to" | "--name" | "--on-clash" | "--worker"
+        "--encoding" | "--password-fd" | "--to" | "--name" | "--on-clash"
     )
+}
+
+/// `--name` becomes the one folder made in the destination: a single
+/// component, so it can't point anywhere else.
+fn check_name(name: &str) -> Result<(), Usage> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return usage("--name must be one folder name, without a / in it.");
+    }
+    Ok(())
 }
 
 fn text<'a>(opt: &str, v: &'a OsStr) -> Result<&'a str, Usage> {
@@ -113,7 +123,8 @@ where
 {
     let mut args = args.into_iter();
     let mut verbose = false;
-    let mut worker = None;
+    #[cfg_attr(not(feature = "dev-worker"), allow(unused_mut))]
+    let mut worker: Option<OsString> = None;
     let mut command: Option<String> = None;
 
     // Options may come before the command; the first other word is it.
@@ -127,6 +138,7 @@ where
             Some("-h" | "--help") => return Ok(done(Command::Help, verbose, worker)),
             Some("--version") => return Ok(done(Command::Version, verbose, worker)),
             Some("-v") => verbose = true,
+            #[cfg(feature = "dev-worker")]
             Some(s) if s == "--worker" || s.starts_with("--worker=") => {
                 let v = take_value("--worker", s, &mut args)?;
                 worker = Some(v);
@@ -163,11 +175,15 @@ where
     let mut on_clash = None;
     let mut positional: Vec<OsString> = Vec::new();
 
+    // Options come before the archive, as with `git`: the first word that
+    // isn't one, or a `--`, ends them, and everything after is a path. A
+    // file called `--allow-large` reached by a glob is a path, not a flag.
     let mut rest = pending.into_iter();
     let mut options_done = false;
     while let Some(a) = rest.next() {
         let s = a.to_str();
         if options_done || s.is_none_or(|s| !s.starts_with('-') || s == "-") {
+            options_done = true;
             positional.push(a);
             continue;
         }
@@ -184,6 +200,7 @@ where
                 verbose = true;
                 continue;
             }
+            #[cfg(feature = "dev-worker")]
             "--worker" => {
                 worker = Some(take_value(opt, s, &mut rest)?);
                 continue;
@@ -222,7 +239,11 @@ where
                         }
                         to = Some(v)
                     }
-                    "--name" => name = Some(text(opt, &v)?.to_string()),
+                    "--name" => {
+                        let n = text(opt, &v)?;
+                        check_name(n)?;
+                        name = Some(n.to_string());
+                    }
                     "--on-clash" => {
                         on_clash = Some(match text(opt, &v)? {
                             "replace" => OnClash::Replace,
@@ -272,9 +293,12 @@ where
 }
 
 fn done(command: Command, verbose: bool, worker: Option<OsString>) -> Parsed {
+    #[cfg(not(feature = "dev-worker"))]
+    let _ = worker;
     Parsed {
         command,
         verbose,
+        #[cfg(feature = "dev-worker")]
         worker,
     }
 }
@@ -317,7 +341,7 @@ mod tests {
 
     #[test]
     fn list_takes_an_archive_and_flags() {
-        let Command::List(c) = cmd(&["list", "a.zip", "--json", "--encoding", "cp437"]) else {
+        let Command::List(c) = cmd(&["list", "--json", "--encoding", "cp437", "a.zip"]) else {
             panic!()
         };
         assert_eq!(c.archive, "a.zip");
@@ -327,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn options_may_come_before_the_archive_and_use_equals() {
+    fn options_come_before_the_archive_and_use_equals() {
         let Command::List(c) = cmd(&["list", "--encoding=UTF-8", "--json", "x"]) else {
             panic!()
         };
@@ -339,16 +363,16 @@ mod tests {
     fn extract_collects_entries_and_options() {
         let Command::Extract(e) = cmd(&[
             "extract",
-            "a.zip",
             "--to",
             "out",
             "--here",
-            "one",
-            "two/three",
             "--allow-large",
             "--on-clash=skip",
             "--password-fd",
             "3",
+            "a.zip",
+            "one",
+            "two/three",
         ]) else {
             panic!()
         };
@@ -361,18 +385,18 @@ mod tests {
 
     #[test]
     fn name_conflicts_with_here() {
-        assert!(err(&["extract", "a.zip", "--here", "--name", "x"]).contains("--here"));
+        assert!(err(&["extract", "--here", "--name", "x", "a.zip"]).contains("--here"));
         assert!(matches!(
-            cmd(&["extract", "a.zip", "--name", "x"]),
+            cmd(&["extract", "--name", "x", "a.zip"]),
             Command::Extract(_)
         ));
     }
 
     #[test]
     fn unknown_options_and_commands_are_refused() {
-        assert!(err(&["list", "a.zip", "--bogus"]).contains("Unknown option --bogus"));
-        assert!(err(&["list", "a.zip", "--here"]).contains("Unknown option --here for list"));
-        assert!(err(&["test", "a.zip", "--encoding", "utf-8"]).contains("Unknown option"));
+        assert!(err(&["list", "--bogus", "a.zip"]).contains("Unknown option --bogus"));
+        assert!(err(&["list", "--here", "a.zip"]).contains("Unknown option --here for list"));
+        assert!(err(&["test", "--encoding", "utf-8", "a.zip"]).contains("Unknown option"));
         assert!(err(&["frobnicate"]).contains("Unknown command"));
         assert!(err(&["--frob"]).contains("Unknown option"));
         assert!(err(&[]).contains("Say what to do"));
@@ -381,20 +405,20 @@ mod tests {
     #[test]
     fn missing_archive_or_value_is_refused() {
         assert!(err(&["list"]).contains("needs an archive"));
-        assert!(err(&["extract", "a.zip", "--to"]).contains("needs a value"));
+        assert!(err(&["extract", "--to"]).contains("needs a value"));
         assert!(err(&["list", "a", "b"]).contains("takes one archive"));
     }
 
     #[test]
     fn values_are_checked() {
-        assert!(err(&["list", "a", "--encoding", "klingon"]).contains("Unknown name encoding"));
-        assert!(err(&["extract", "a", "--on-clash", "maybe"]).contains("--on-clash"));
-        assert!(err(&["test", "a", "--password-fd", "x"]).contains("descriptor"));
-        assert!(err(&["test", "a", "--password-fd", "-4"]).contains("descriptor"));
-        assert!(err(&["test", "a", "--password-fd", "1"]).contains("standard output"));
-        assert!(err(&["list", "a", "--json=yes"]).contains("doesn't take a value"));
+        assert!(err(&["list", "--encoding", "klingon", "a"]).contains("Unknown name encoding"));
+        assert!(err(&["extract", "--on-clash", "maybe", "a"]).contains("--on-clash"));
+        assert!(err(&["test", "--password-fd", "x", "a"]).contains("descriptor"));
+        assert!(err(&["test", "--password-fd", "-4", "a"]).contains("descriptor"));
+        assert!(err(&["test", "--password-fd", "1", "a"]).contains("standard output"));
+        assert!(err(&["list", "--json=yes", "a"]).contains("doesn't take a value"));
         assert!(matches!(
-            cmd(&["test", "a", "--password-fd", "0"]),
+            cmd(&["test", "--password-fd", "0", "a"]),
             Command::Test(_)
         ));
     }
@@ -402,18 +426,68 @@ mod tests {
     #[test]
     fn help_version_and_create() {
         assert_eq!(cmd(&["--help"]), Command::Help);
-        assert_eq!(cmd(&["list", "-h"]), Command::Help);
+        assert_eq!(cmd(&["list", "-h", "a"]), Command::Help);
         assert_eq!(cmd(&["--version"]), Command::Version);
         assert_eq!(cmd(&["create", "a", "b"]), Command::Create);
     }
 
+    #[cfg(feature = "dev-worker")]
     #[test]
-    fn global_options_work_anywhere() {
+    fn global_options_work_before_the_archive() {
         let r = p(&["--worker", "/w", "-v", "list", "a.zip"]).unwrap();
         assert_eq!(r.worker.as_deref(), Some(OsStr::new("/w")));
         assert!(r.verbose);
-        let r = p(&["list", "a.zip", "--worker=/x"]).unwrap();
+        let r = p(&["list", "--worker=/x", "a.zip"]).unwrap();
         assert_eq!(r.worker.as_deref(), Some(OsStr::new("/x")));
+    }
+
+    #[cfg(not(feature = "dev-worker"))]
+    #[test]
+    fn worker_is_not_an_option_in_a_normal_build() {
+        for args in [
+            &["--worker=x", "list", "a.zip"][..],
+            &["--worker", "x", "list", "a.zip"],
+            &["list", "--worker=x", "a.zip"],
+            &["extract", "--worker", "x", "a.zip"],
+        ] {
+            assert!(err(args).contains("Unknown option"), "{args:?}");
+        }
+        // After the archive it is just another path.
+        let Command::Extract(e) = cmd(&["extract", "a.zip", "--worker=x"]) else {
+            panic!()
+        };
+        assert_eq!(e.entries, ["--worker=x"]);
+    }
+
+    #[test]
+    fn the_first_path_ends_the_options() {
+        // A glob that expands to file names that look like flags.
+        let Command::Extract(e) = cmd(&["extract", "a.zip", "--allow-large", "--to=/x", "-v"])
+        else {
+            panic!()
+        };
+        assert!(!e.allow_large && e.to.is_none());
+        assert_eq!(e.entries, ["--allow-large", "--to=/x", "-v"]);
+        let Command::Test(c) = cmd(&["test", "--json", "--", "--allow-large"]) else {
+            panic!()
+        };
+        assert!(c.json);
+        assert_eq!(c.archive, "--allow-large");
+        assert!(err(&["test", "a.zip", "b.zip"]).contains("takes one"));
+    }
+
+    #[test]
+    fn name_is_one_component() {
+        for bad in ["", ".", "..", "a/b", "/abs", "../x", "a\0b"] {
+            assert!(
+                err(&["extract", "--name", bad, "a.zip"]).contains("--name"),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            cmd(&["extract", "--name=my folder", "a.zip"]),
+            Command::Extract(_)
+        ));
     }
 
     #[test]
