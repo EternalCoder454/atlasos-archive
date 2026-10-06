@@ -19,7 +19,7 @@ rust-version = "1.89"
 # The atlas-framework crates (startup, settings, logging, crash reports); to
 # move the pin, see CLAUDE.md. Atlas.Ui is not pinned here: it is the
 # installed atlas-ui package.
-atlas-framework-ui = { git = "https://github.com/EternalCoder454/atlas-framework", tag = "v1.4.0" }
+atlas-framework-ui = { git = "https://github.com/EternalCoder454/atlas-framework", tag = "v1.6.0" }
 log = { version = "0.4", features = ["std"] }
 libc = "0.2"
 encoding_rs = "0.8"
