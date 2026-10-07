@@ -133,9 +133,9 @@ jobs:
   # like an Atlas.Ui type), at the release the crates are pinned to.
   atlas:
     name: Atlas app checks
-    uses: EternalCoder454/atlas-framework/.github/workflows/app-checks.yml@7a114a112bd1fff4fe3d6facc81b0a81e5d2db30 # v1.4.0
+    uses: EternalCoder454/atlas-framework/.github/workflows/app-checks.yml@b9d72940fb94178f400c3f074fe8f9744b6c6f53 # v1.6.0
     with:
-      framework-ref: v1.4.0
+      framework-ref: v1.6.0
 
   # Atlas.Ui (atlas-ui), which the app builds against, is in no repository:
   # atlas-framework's RPMs at the release the crates are pinned to, built
