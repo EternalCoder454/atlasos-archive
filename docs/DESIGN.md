@@ -1,4 +1,4 @@
-# Atlas Archive: design
+# Telamon Archive: design
 
 What this file fixes: the layout, the backends, the sandbox, the extraction
 rules, the API other apps call, the threading rule, the failure modes and the
@@ -8,17 +8,17 @@ reasons are the Atlas Notes note "AtlasOS/Archive/Plan"; the checklist is
 
 ## Scope
 
-Atlas Archive replaces KDE Ark on AtlasOS. It is as simple as Windows 11's
+Telamon Archive replaces KDE Ark on Telamon OS. It is as simple as Windows 11's
 "Extract all" and macOS's double-click, with 7-Zip's power underneath.
 
 | Who | Does what |
 |---|---|
 | Archive window | Opens an archive as a folder: browse, search, preview, drag out, open nested archives in place, add, rename, delete, test, Extract All |
 | Archive job windows | Progress with Cancel for every extract, compress and test, including those Explorer starts |
-| `atlas-archive-cli` | The same operations for scripts and the launcher, with JSON output |
-| D-Bus `net.eterneon.atlas.Archive1` | What Explorer's right-click actions and drag-out call |
+| `telamon-archive-cli` | The same operations for scripts and the launcher, with JSON output |
+| D-Bus `net.eterneon.telamon.Archive1` | What Explorer's right-click actions and drag-out call |
 | Explorer | Shows the actions and calls the API; never links libarchive |
-| The AtlasOS image (coordinator) | Removes Ark, sets the mimeapps defaults listed below |
+| The Telamon OS image (coordinator) | Removes Ark, sets the mimeapps defaults listed below |
 
 ### Formats
 
@@ -30,7 +30,7 @@ Atlas Archive replaces KDE Ark on AtlasOS. It is as simple as Windows 11's
 | tar, tar.gz/.bz2/.xz/.zst/.lz4 | yes | yes | yes, by rewriting | libarchive |
 | gz, xz, zst, bz2, lz4 (one file) | yes | yes | no (one file) | libarchive |
 | rar 4 and 5, multi-volume | yes | no | no | libarchive |
-| rar encrypted (data or names) | yes | no | no | `unrar` (RPM Fusion nonfree, shipped in the AtlasOS image) |
+| rar encrypted (data or names) | yes | no | no | `unrar` (RPM Fusion nonfree, shipped in the Telamon OS image) |
 | iso9660 (Joliet, Rock Ridge), cab, cpio, ar | yes | cpio only | no | libarchive |
 | deb, rpm | yes (read only) | no | no | libarchive |
 | Split volumes `.001`, `.002`… of any of the above | yes | yes (zip, 7z) | no | a joined reader, or `7z -v` |
@@ -42,7 +42,7 @@ Backends, vetted 2026-10-05:
   reader, and what bsdtar and Windows 11 use. Its C parsers have a steady CVE
   stream (3.8.8 and 3.8.9 fix a RAR5 double free and a tar overflow that
   Fedora 44 stable still has; 3.8.8 is in updates-testing), which is why it
-  only ever runs in the sandboxed worker. The AtlasOS image moves to the
+  only ever runs in the sandboxed worker. The Telamon OS image moves to the
   fixed version when it reaches stable (the coordinator tracks it). Hand-written FFI for the ~40 functions used, linked with
   pkg-config; the old `libarchive3-sys` (2016) is unmaintained.
 - **`zip` crate** (zip2 8.6, MIT, actively maintained, fuzzed upstream). Pure
@@ -60,7 +60,7 @@ Backends, vetted 2026-10-05:
   `compress-tools` (a thin wrapper that extracts by itself).
 - **unrar** (RPM Fusion nonfree, 7.2.7) is freeware, not free software: its
   licence allows free redistribution with the licence text, and Zach chose to
-  ship it in the AtlasOS image (2026-10-05) for encrypted RAR. It runs inside
+  ship it in the Telamon OS image (2026-10-05) for encrypted RAR. It runs inside
   the sandbox as `unrar x -p -y -- <archive>` with no tty: it then reads the
   password from stdin (verified, RAR4 and RAR5, encrypted names too), so it
   never goes on argv. On a system without it, encrypted RAR says "Encrypted
@@ -69,23 +69,23 @@ Backends, vetted 2026-10-05:
 
 ## Layout
 
-- `crates/atlas-archive-core`: no Qt, no C parser. Entry paths and their
+- `crates/telamon-archive-core`: no Qt, no C parser. Entry paths and their
   checks, names (encoding detection, display and on-disk sanitising), limits,
   the worker protocol (both ends), the archive tree (an arena of entries, the
   model behind every view), the job model, the format table.
-- `crates/atlas-archive-engine`: runs only in the worker. libarchive FFI, the
+- `crates/telamon-archive-engine`: runs only in the worker. libarchive FFI, the
   zip and 7z/unrar drivers, the joined split-volume reader, and the
   extraction writer (`openat2` below the staging folder).
-- `apps/atlas-archive-worker`: the sandboxed process (`/usr/libexec/atlas-archive/atlas-archive-worker`, `client::SYSTEM_WORKER`).
-- `apps/atlas-archive-cli`: `atlas-archive-cli`, no Qt.
-- `apps/atlas-archive`: the GUI. CXX-Qt backend in `src/`, `cpp/main.cpp`
+- `apps/telamon-archive-worker`: the sandboxed process (`/usr/libexec/telamon-archive/telamon-archive-worker`, `client::SYSTEM_WORKER`).
+- `apps/telamon-archive-cli`: `telamon-archive-cli`, no Qt.
+- `apps/telamon-archive`: the GUI. CXX-Qt backend in `src/`, `cpp/main.cpp`
   (Qt start, single instance, the D-Bus adaptor), `qml/`.
 - `fuzz/`: cargo-fuzz targets (below).
 
 ## The sandbox
 
 The GUI and CLI never parse archive bytes. Each operation (list, extract,
-test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
+test, preview, create, edit) runs in a fresh `telamon-archive-worker` process:
 
 1. The client opens the archive (and each volume) read-only and creates the
    staging folder, then starts the worker with those descriptors, a pipe for
@@ -123,7 +123,7 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    `/etc/localtime`. On a kernel without Landlock, or with one older than ABI
    6, the worker refuses to run unless the build was made for tests, and
    says so in plain words ("This system's kernel doesn't offer the sandbox
-   Atlas Archive needs"); the library's own error goes to the log. The client
+   Telamon Archive needs"); the library's own error goes to the log. The client
    starts it in its own process group with `PR_SET_PDEATHSIG(SIGKILL)` and
    signals the worker itself through its pidfd (flags 0, which can't be
    redirected) and its group with `kill(-pid)`, both every time and only while
@@ -185,7 +185,7 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    While a limit question is open, the client stops the worker and its
    group (`SIGSTOP`) and continues them (`SIGCONT`) before sending the
    answer; Cancel kills them as usual. If the stop can't be sent, the client
-   doesn't ask: it kills the worker and the job fails ("Atlas Archive
+   doesn't ask: it kills the worker and the job fails ("Telamon Archive
    couldn't pause the archive reader to ask, so it stopped."). The space
    check runs right after the stop, before the question. A worker's end that
    can't be waited for (the host set `SIGCHLD` to be ignored after the
@@ -199,7 +199,7 @@ test, preview, create, edit) runs in a fresh `atlas-archive-worker` process:
    an eighth (at least 16 MiB). The watch fails closed: where the drive gives
    no usable figure (an error, or zeros for block size and count: some FUSE
    and network file systems), an extraction is refused before the worker is
-   asked ("This drive doesn't report its free space, so Atlas Archive can't
+   asked ("This drive doesn't report its free space, so Telamon Archive can't
    extract here safely."), and the worker itself reports no figure there
    too. A read that fails during a job is logged and tolerated; the third in
    a row, at least 2 s after the first, stops the job. The "approved size" is
@@ -259,11 +259,11 @@ The writer (`engine::extract`) works below one descriptor, the staging folder:
   hostile archive with data on both names keeps the first's); and if the
   name that carries the data is refused, the first name is removed and
   reported ("its data wasn't found in the archive").
-- Staging is `.<archive name>.atlas-partial-<random>`, created 0700 with
+- Staging is `.<archive name>.telamon-partial-<random>`, created 0700 with
   `mkdirat` inside the destination, opened `O_DIRECTORY|O_NOFOLLOW`, and
   used only if it is ours and empty. On a drive that rejects the archive's
   name in it (FAT, exFAT and NTFS refuse `: ? * " < > |`, answering
-  `EINVAL`), the name is `.archive.atlas-partial-<random>` instead, tried
+  `EINVAL`), the name is `.archive.telamon-partial-<random>` instead, tried
   once. The sweep takes an `flock` on `jobs/sweep.lock` (0600) and holds it
   while it runs, so two starts never sweep at once.
 - Every open is `openat2(staging, path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
@@ -341,10 +341,10 @@ Then the result moves out of staging with `renameat2(RENAME_NOREPLACE)`:
   is left for the next start, never retried at once). A crash leaves only the
   hidden staging folder: each job records its staging path, the boot id and
   the destination folder's device and inode in
-  `~/.local/state/atlas-archive/jobs/` (0700, records ours and not group or
+  `~/.local/state/telamon-archive/jobs/` (0700, records ours and not group or
   other writable), and the next start removes the ones whose job is dead
   (another boot, or the pid gone or reused). A record proves nothing by
-  itself: the target's name must match `.<name>.atlas-partial-<16 hex>`,
+  itself: the target's name must match `.<name>.telamon-partial-<16 hex>`,
   and only a folder of ours with mode 0700 (setgid aside) is deleted, or of
   ours by name alone where the record says the file system keeps no modes
   (FAT, exFAT). When the device
@@ -508,12 +508,12 @@ libarchive's `hdrcharset` with the same guess.
   into an in-memory tree (paths split once, names interned). Views are
   folder models over it, so navigating is instant.
 - **Preview** (images, text, PDF via Explorer's previewer later): the entry
-  is extracted by a worker into `~/.cache/atlas-archive/<window>/` (0700),
+  is extracted by a worker into `~/.cache/telamon-archive/<window>/` (0700),
   capped at 256 MiB, and shown from there; images are read with a
   `QImageReader` allocation limit, text as plain text.
 - **Drag-out:** the drag carries `text/uri-list` of files extracted to that
   cache when the selection is under 512 MiB, and always
-  `application/x-atlas-archive-entries` (the archive path and the entry
+  `application/x-telamon-archive-entries` (the archive path and the entry
   IDs). Explorer, on a drop of the latter, calls `ExtractEntries` so large
   selections extract straight into the drop folder, with progress.
 - **Nested archives** open in place: extracted to the cache, listed by a new
@@ -525,7 +525,7 @@ libarchive's `hdrcharset` with the same guess.
 ## Editing
 
 Archives are never changed in place. A new archive is written beside the
-original (`.<name>.atlas-edit-<random>`, same folder, same permissions),
+original (`.<name>.telamon-edit-<random>`, same folder, same permissions),
 `fsync`ed, then renamed over it; the original stays intact until that rename.
 zip copies unchanged entries raw; 7z edits run `7z a|d|rn` on a reflink
 (`FICLONE`, instant on btrfs) or a copy in staging; tar rewrites through
@@ -535,21 +535,45 @@ or 7z."
 
 ## The API other apps call
 
-App ID, D-Bus name and desktop file: `net.eterneon.atlas.archive`
+App ID, D-Bus name and desktop file: `net.eterneon.telamon.archive`
 (`DBusActivatable=true`, `KDBusService::Unique`, so
 `org.freedesktop.Application` works too).
 
-### D-Bus: `net.eterneon.atlas.Archive1` at `/net/eterneon/atlas/archive`
+### The names until 0.2.0 (Atlas Archive)
+
+Telamon Archive was Atlas Archive up to 0.1.x, and the apps that call it
+(Explorer, the launcher) and the image change names one by one. For one
+release the old names work as well as the new ones, and an app may use
+either:
+
+| Old name | Now | What keeps the old one working |
+|---|---|---|
+| `atlas-archive`, `atlas-archive-cli` | `telamon-archive`, `telamon-archive-cli` | symbolic links in `/usr/bin` |
+| package `atlas-archive` | `telamon-archive` | `Obsoletes:` and `Provides: atlas-archive` |
+| `net.eterneon.atlas.archive.desktop` | `net.eterneon.telamon.archive.desktop` | the old file stays, hidden (`NoDisplay=true`), with the same `MimeType=` list (Explorer reads it) and `Exec=telamon-archive`, so mimeapps defaults that name it still open the app |
+| `kio/servicemenus/net.eterneon.atlas.archive.desktop` | `.../net.eterneon.telamon.archive.desktop` | the old file stays with no actions, so the right-click actions are not shown twice |
+| D-Bus `net.eterneon.atlas.archive` at `/net/eterneon/atlas/archive` | `net.eterneon.telamon.archive` at `/net/eterneon/telamon/archive` | the running instance owns both names; `org.freedesktop.Application` answers on both (`cpp/main.cpp`). The `Archive1` interface below is served as `net.eterneon.atlas.Archive1` too when it lands, with the same objects (`.../atlas/archive/job/<n>`, `net.eterneon.atlas.Archive1.Job`) and error names |
+| drag type `application/x-atlas-archive-entries` | `application/x-telamon-archive-entries` | a drop carrying either is accepted, and a drag carries both |
+| `atlas-archive:` KIO worker (not built yet) | `telamon-archive:` | the old scheme is registered with it |
+| `~/.config/atlas-archiverc` | `telamon-archiverc` | copied once by the framework (`[Atlas]` becomes `[Telamon]`) |
+| `~/.local/state/atlas-archive/jobs` | `~/.local/state/telamon-archive/jobs` | the folder moves in one rename the first time; the records in it name staging folders that are still removed |
+| staging folders `.<name>.atlas-partial-<hex>` | `.<name>.telamon-partial-<hex>` | the leftovers of 0.1.x are recognised and removed like ours |
+| `~/.cache/atlas-archive/<window>/` | `~/.cache/telamon-archive/<window>/` | a cache that 0.1.x never wrote; nothing to move |
+
+The old names go in the release after the image and the other apps use the
+new ones.
+
+### D-Bus: `net.eterneon.telamon.Archive1` at `/net/eterneon/telamon/archive`
 
 Every method takes `file://` URIs (absolute, local, no NUL; others are
-refused with `net.eterneon.atlas.Archive1.Error.InvalidArgs`) and an
+refused with `net.eterneon.telamon.Archive1.Error.InvalidArgs`) and an
 `a{sv}` of options. Known options: `activation_token` (s, for focus),
 `parent_window` (s, `wayland:<xdg-foreign handle>` or `x11:<hex id>`, so our
 dialogs stack on the caller's window), `show_progress` (b, default true;
 Explorer passes false and shows the job in its own queue). Unknown keys are
 ignored. A call returns as soon as the job is queued; at most 16 jobs wait at
 once, and past that a call fails with
-`net.eterneon.atlas.Archive1.Error.TooManyJobs` (Explorer says "Archive is
+`net.eterneon.telamon.Archive1.Error.TooManyJobs` (Explorer says "Archive is
 busy, try again when a job finishes" and doesn't retry by itself).
 
 | Method | Does |
@@ -566,8 +590,8 @@ busy, try again when a job finishes" and doesn't retry by itself).
 A password is never a D-Bus argument: when one is needed, the job's own
 window asks for it.
 
-Job objects, `/net/eterneon/atlas/archive/job/<n>`, interface
-`net.eterneon.atlas.Archive1.Job`:
+Job objects, `/net/eterneon/telamon/archive/job/<n>`, interface
+`net.eterneon.telamon.Archive1.Job`:
 
 - properties (with `PropertiesChanged`, at most 10 a second): `Title` (s),
   `State` (s: `queued`, `running`, `paused`, `waiting-for-user`, `done`,
@@ -584,7 +608,7 @@ How Explorer uses it (agreed with the Explorer session, 2026-10-05): it
 always passes `activation_token` and `parent_window` and `show_progress`
 false, and drives Pause, Resume and Cancel through the Job interface;
 "Extract To…" is `ExtractAll` (our dialog, no picker of its own); drops of
-`application/x-atlas-archive-entries` on a local folder, tab, breadcrumb
+`application/x-telamon-archive-entries` on a local folder, tab, breadcrumb
 segment or sidebar place call `ExtractEntries(archive, ids, folder, {})`
 with the entry ids kept opaque, `text/uri-list` being the fallback for
 other targets. A later `List(s archive, s inner_path)` for Quick Look on an
@@ -592,9 +616,9 @@ archive (a top-level listing capped at 200 entries plus a total count) is
 wanted but low priority; changing a signature here means telling Explorer
 first.
 
-### CLI: `atlas-archive-cli`
+### CLI: `telamon-archive-cli`
 
-`atlas-archive-cli COMMAND [OPTIONS] [--] ARCHIVE [ENTRY…]`, with the
+`telamon-archive-cli COMMAND [OPTIONS] [--] ARCHIVE [ENTRY…]`, with the
 commands `list`, `extract`, `test`, `create` and `info`, each with `--json`
 (one JSON object per line, names as given plus a `display` form; consumers
 use `display` or the index, never join `path` onto a folder). Options come
@@ -638,9 +662,9 @@ tests). Exit codes: 0 done, 1 failed, 2 bad usage, 3 needs a password (or
 `--password-fd` gave a wrong one), 4 a limit refused, 130 cancelled.
 `create` exits 2 until the writers land.
 
-The GUI takes `atlas-archive [--extract-here|--extract-to DIR|--extract-all|
+The GUI takes `telamon-archive [--extract-here|--extract-to DIR|--extract-all|
 --compress-zip|--compress|--test] FILES…` (the Explorer actions without
-D-Bus), and `atlas-archive FILE` opens it.
+D-Bus), and `telamon-archive FILE` opens it.
 
 ### Browsing inside Explorer
 
@@ -650,7 +674,7 @@ stock KIO worker (kio-extras' `zip:`/`tar:`) parses archives in-process
 outside this sandbox and caches passwords in kpasswdserver, and FUSE exposes
 the contents to every process of the user for the mount's lifetime.
 
-After parity, an `atlas-archive:` KIO worker may follow, for Explorer and file
+After parity, an `telamon-archive:` KIO worker may follow, for Explorer and file
 dialogs: a thin read-only shim (list, stat, get) with no parser of its own,
 which runs every request through the same sandboxed worker and asks for
 passwords through this app's dialog, never kpasswdserver. It ships only after
@@ -682,10 +706,10 @@ that), since extraction is disk-bound.
 
 ## Look
 
-Atlas.Ui throughout (`AtlasWindow`, `AtlasHeaderBar`, `AtlasBreadcrumb`,
-`DataTable`, `StatusHero`, `Section`/`SectionRow`, `AtlasDialog`,
-`AtlasProgressBar`, `AtlasPasswordField`, `AtlasSegmentedControl`,
-`AtlasDropZone`, `ContextMenu`).
+Telamon.Ui throughout (`TelamonWindow`, `TelamonHeaderBar`, `TelamonBreadcrumb`,
+`DataTable`, `StatusHero`, `Section`/`SectionRow`, `TelamonDialog`,
+`TelamonProgressBar`, `TelamonPasswordField`, `TelamonSegmentedControl`,
+`TelamonDropZone`, `ContextMenu`).
 
 - **No archive open:** a centred hero ("Open an archive, or drop files here
   to compress them"), Open Archive… as the one accent button, Create
@@ -696,7 +720,7 @@ Atlas.Ui throughout (`AtlasWindow`, `AtlasHeaderBar`, `AtlasBreadcrumb`,
   table (Name, Size, Packed, Modified); an info and preview pane on the right
   toggles.
 - **Password needed:** the hero with a lock, the password field and Open.
-- **Job window** (Windows' copy dialog, drawn with Atlas.Ui): title ("Extracting
+- **Job window** (Windows' copy dialog, drawn with Telamon.Ui): title ("Extracting
   photos.zip"), progress, "1.2 GB of 3.4 GB · about 2 minutes left", Cancel;
   when done "Extracted to Photos" with Show Files (accent) and Close, and a
   details list of anything skipped or renamed.
@@ -704,7 +728,7 @@ Atlas.Ui throughout (`AtlasWindow`, `AtlasHeaderBar`, `AtlasBreadcrumb`,
   TAR.ZST), Level (Store, Fast, Normal, Best), Password (with "Encrypt file
   names" for 7z, and a note that ZIP encryption hides contents but not
   names), Split (Off, 100 MB, 700 MB, 4 GB, Custom; a note that split zips
-  need Atlas Archive or 7-Zip to join).
+  need Telamon Archive or 7-Zip to join).
 
 ## Failure modes
 
@@ -720,7 +744,7 @@ Atlas.Ui throughout (`AtlasWindow`, `AtlasHeaderBar`, `AtlasBreadcrumb`,
 | Cancel at any point | Worker killed, staging removed, nothing left in the destination |
 | Crash or power loss | Hidden staging only, cleaned at next start; edited archives are either old or new, never half |
 | Huge archive (1M entries) | Listing streams in, the window stays responsive, the limit question comes first |
-| No Landlock | Refuses to open archives, saying why (AtlasOS kernels have it) |
+| No Landlock | Refuses to open archives, saying why (Telamon OS kernels have it) |
 | `7z` missing | 7z creation and encrypted 7z say "7-Zip is missing"; other formats work |
 
 ## Privilege

@@ -1,0 +1,14 @@
+[package]
+name = "telamon-archive-engine"
+description = "Telamon Archive's parsers and extraction writer; runs only inside the sandboxed worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+telamon-archive-core = { path = "../telamon-archive-core" }
+libc.workspace = true
+log.workspace = true
+zeroize.workspace = true

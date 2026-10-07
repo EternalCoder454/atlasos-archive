@@ -1,0 +1,20 @@
+[package]
+name = "telamon-archive-worker"
+description = "Telamon Archive's sandboxed worker: the only process that parses archive bytes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+telamon-archive-core = { path = "../../crates/telamon-archive-core" }
+telamon-archive-engine = { path = "../../crates/telamon-archive-engine" }
+libc.workspace = true
+landlock.workspace = true
+zeroize.workspace = true
+
+[features]
+# Lets the worker run where Landlock is off. Test builds only; the RPM never
+# enables it.
+unsandboxed = []

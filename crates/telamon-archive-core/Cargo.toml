@@ -1,0 +1,15 @@
+[package]
+name = "telamon-archive-core"
+description = "Telamon Archive without Qt and without a C parser: entry-path checks, names, limits, the worker protocol, the archive tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+log.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+zeroize.workspace = true
+libc.workspace = true

@@ -48,8 +48,8 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: |
-          image=ghcr.io/eternalcoder454/atlas-archive-dev
-          stamp=f44-$(cat ci/Containerfile packaging/atlas-archive.spec packaging/rpmfusion-nonfree.sh | sha256sum | cut -c1-16)-$(date -u +%G-%V)
+          image=ghcr.io/eternalcoder454/telamon-archive-dev
+          stamp=f44-$(cat ci/Containerfile packaging/telamon-archive.spec packaging/rpmfusion-nonfree.sh | sha256sum | cut -c1-16)-$(date -u +%G-%V)
           digest() {
             local d
             d=$(docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}') || return 1
@@ -117,7 +117,7 @@ jobs:
       - name: Probe
         id: probe
         run: |
-          image=ghcr.io/eternalcoder454/atlas-archive-dev
+          image=ghcr.io/eternalcoder454/telamon-archive-dev
           # The digest is checked by pulling its manifest back by it.
           if digest=$(timeout 60 docker buildx imagetools inspect "$image:f44" --format '{{.Manifest.Digest}}' 2>/dev/null) &&
               [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] &&
@@ -130,14 +130,14 @@ jobs:
           fi
 
   # atlas-framework's design rules (no default buttons, no QML file named
-  # like an Atlas.Ui type), at the release the crates are pinned to.
-  atlas:
-    name: Atlas app checks
-    uses: EternalCoder454/atlas-framework/.github/workflows/app-checks.yml@b9d72940fb94178f400c3f074fe8f9744b6c6f53 # v1.6.0
+  # like a Telamon.Ui type), at the release the crates are pinned to.
+  telamon:
+    name: Telamon app checks
+    uses: EternalCoder454/atlas-framework/.github/workflows/app-checks.yml@8e6a53569363aec3d7e42920875d03ca113ef3eb # v2.0.0
     with:
-      framework-ref: v1.6.0
+      framework-ref: v2.0.0
 
-  # Atlas.Ui (atlas-ui), which the app builds against, is in no repository:
+  # Telamon.Ui (telamon-ui), which the app builds against, is in no repository:
   # atlas-framework's RPMs at the release the crates are pinned to, built
   # once per release and Fedora Qt version and cached.
   framework:
@@ -172,10 +172,10 @@ jobs:
             echo "::error::atlas-framework has no tag $refs"; exit 1
           fi
           if ! grep -qF "app-checks.yml@$commit # $refs" .github/workflows/ci.yml || ! grep -qF "framework-ref: $refs" .github/workflows/ci.yml; then
-            echo "::error::the Atlas app checks job in ci.yml must use $refs: app-checks.yml@$commit # $refs and framework-ref: $refs"; exit 1
+            echo "::error::the Telamon app checks job in ci.yml must use $refs: app-checks.yml@$commit # $refs and framework-ref: $refs"; exit 1
           fi
           echo "ref=$refs" >> "$GITHUB_OUTPUT"
-      # atlas-ui needs the Qt minor it was built with: a Fedora Qt update
+      # telamon-ui needs the Qt minor it was built with: a Fedora Qt update
       # (today's metadata, loaded by the dnf install above) builds them again.
       - name: Fedora's Qt
         id: qt
@@ -188,7 +188,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: out
-          key: atlas-framework-rpms-f44-${{ steps.ref.outputs.ref }}-${{ steps.qt.outputs.qt }}
+          key: telamon-framework-rpms-f44-${{ steps.ref.outputs.ref }}-${{ steps.qt.outputs.qt }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.cache.outputs.cache-hit != 'true'
         with:
@@ -201,7 +201,7 @@ jobs:
         run: atlas-framework/packaging/build-rpm.sh "$GITHUB_WORKSPACE/out"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: atlas-framework-rpms
+          name: telamon-framework-rpms
           path: out/*.rpm
           if-no-files-found: error
           retention-days: 1
@@ -232,19 +232,19 @@ jobs:
         run: cargo fmt --all --check
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: atlas-framework-rpms
+          name: telamon-framework-rpms
           # In the container: runner.temp would be the host's path.
-          path: /tmp/atlas-framework-rpms
+          path: /tmp/telamon-framework-rpms
       - name: Build dependencies
         run: |
-          ATLAS_LOCAL_RPMS=/tmp/atlas-framework-rpms packaging/install-builddeps.sh clippy ccache 7zip bsdtar zip unzip
+          TELAMON_LOCAL_RPMS=/tmp/telamon-framework-rpms packaging/install-builddeps.sh clippy ccache 7zip bsdtar zip unzip
           packaging/rpmfusion-nonfree.sh unrar
-      # cxx-qt's build scripts compile against Qt and atlas-ui without
+      # cxx-qt's build scripts compile against Qt and telamon-ui without
       # watching their versions: a cache from another toolchain is not used.
       - name: Toolchain
         id: toolchain
         run: |
-          versions=$(rpm -q gcc-c++ qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami-devel atlas-ui)
+          versions=$(rpm -q gcc-c++ qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami-devel telamon-ui)
           echo "hash=$(sha256sum <<<"$versions" | cut -c1-16)" >> "$GITHUB_OUTPUT"
       # The crate downloads and the dependencies' build output (not the
       # workspace's own crates), keyed on Cargo.lock and the rustc version.
@@ -267,13 +267,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy (CLI with dev-worker)
-        run: cargo clippy -p atlas-archive-cli --all-targets --locked --features dev-worker -- -D warnings
+        run: cargo clippy -p telamon-archive-cli --all-targets --locked --features dev-worker -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
       # The CLI's integration tests point it at the test build's worker,
       # which only the dev-worker feature allows; without it they're skipped.
       - name: CLI integration tests
-        run: cargo test -p atlas-archive-cli --locked --features dev-worker
+        run: cargo test -p telamon-archive-cli --locked --features dev-worker
       - name: ccache statistics
         if: always()
         run: ccache -s || true
@@ -284,7 +284,7 @@ jobs:
           path: /github/home/.ccache
           key: ${{ steps.ccache.outputs.cache-primary-key }}
 
-  # The release build, as AtlasOS builds it. Its CMake build (Corrosion's cargo
+  # The release build, as Telamon OS builds it. Its CMake build (Corrosion's cargo
   # target in it) is cached, so it compiles only what changed.
   rpm:
     name: RPM
@@ -294,7 +294,7 @@ jobs:
     container: ${{ needs.devimage.outputs.image }}
     env:
       CARGO_HOME: /github/home/.cargo
-      ATLAS_BUILD_CACHE: /github/home/rpm-build
+      TELAMON_BUILD_CACHE: /github/home/rpm-build
     steps:
       - name: Tools for checkout and cache
         run: rpm -q git-core tar zstd >/dev/null || dnf -y install git-core tar zstd
@@ -303,9 +303,9 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: atlas-framework-rpms
+          name: telamon-framework-rpms
           # In the container: runner.temp would be the host's path.
-          path: /tmp/atlas-framework-rpms
+          path: /tmp/telamon-framework-rpms
       - name: Week
         id: week
         run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
@@ -322,10 +322,10 @@ jobs:
             /github/home/.cargo/registry
             /github/home/.cargo/git
             /github/home/rpm-build
-          key: rpm-f44-${{ needs.framework.outputs.ref }}-${{ steps.week.outputs.week }}-${{ hashFiles('Cargo.lock', 'packaging/atlas-archive.spec') }}
+          key: rpm-f44-${{ needs.framework.outputs.ref }}-${{ steps.week.outputs.week }}-${{ hashFiles('Cargo.lock', 'packaging/telamon-archive.spec') }}
           restore-keys: rpm-f44-${{ needs.framework.outputs.ref }}-${{ steps.week.outputs.week }}-
       - name: Build the RPM
-        run: ATLAS_LOCAL_RPMS=/tmp/atlas-framework-rpms packaging/build-rpm.sh "$GITHUB_WORKSPACE/out"
+        run: TELAMON_LOCAL_RPMS=/tmp/telamon-framework-rpms packaging/build-rpm.sh "$GITHUB_WORKSPACE/out"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: (github.event_name == 'push' || github.event_name == 'schedule') && steps.cache.outputs.cache-hit != 'true'
         with:
