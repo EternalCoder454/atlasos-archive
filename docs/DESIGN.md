@@ -682,10 +682,10 @@ that), since extraction is disk-bound.
 
 ## Look
 
-Atlas.Ui throughout (`AtlasWindow`, `AtlasHeaderBar`, `AtlasBreadcrumb`,
-`DataTable`, `StatusHero`, `Section`/`SectionRow`, `AtlasDialog`,
-`AtlasProgressBar`, `AtlasPasswordField`, `AtlasSegmentedControl`,
-`AtlasDropZone`, `ContextMenu`).
+Telamon.Ui throughout (`TelamonWindow`, `TelamonHeaderBar`, `TelamonBreadcrumb`,
+`DataTable`, `StatusHero`, `Section`/`SectionRow`, `TelamonDialog`,
+`TelamonProgressBar`, `TelamonPasswordField`, `TelamonSegmentedControl`,
+`TelamonDropZone`, `ContextMenu`).
 
 - **No archive open:** a centred hero ("Open an archive, or drop files here
   to compress them"), Open Archive… as the one accent button, Create
@@ -696,7 +696,7 @@ Atlas.Ui throughout (`AtlasWindow`, `AtlasHeaderBar`, `AtlasBreadcrumb`,
   table (Name, Size, Packed, Modified); an info and preview pane on the right
   toggles.
 - **Password needed:** the hero with a lock, the password field and Open.
-- **Job window** (Windows' copy dialog, drawn with Atlas.Ui): title ("Extracting
+- **Job window** (Windows' copy dialog, drawn with Telamon.Ui): title ("Extracting
   photos.zip"), progress, "1.2 GB of 3.4 GB · about 2 minutes left", Cancel;
   when done "Extracted to Photos" with Show Files (accent) and Close, and a
   details list of anything skipped or renamed.

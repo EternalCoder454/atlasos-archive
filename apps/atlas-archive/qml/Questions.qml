@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Templates as T
 import org.kde.kirigami as Kirigami
-import Atlas.Ui
+import Telamon.Ui
 
 // What a job asks, in plain words: a password, a safety limit, a name that is
 // already there. Each answer goes back to the parked job; a password is
@@ -12,7 +12,7 @@ Item {
 
     required property var backend
 
-    AtlasDialog {
+    TelamonDialog {
         id: password
         title: qsTr("Password Needed")
         showClose: false
@@ -42,13 +42,13 @@ Item {
                 onClicked: password.submit()
             }
         ]
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             text: questions.backend.questionText
         }
-        AtlasPasswordField {
+        TelamonPasswordField {
             id: field
             Layout.fillWidth: true
             placeholderText: qsTr("Password")
@@ -58,7 +58,7 @@ Item {
         }
     }
 
-    AtlasDialog {
+    TelamonDialog {
         id: limit
         title: qsTr("Safety Limit Reached")
         showClose: false
@@ -74,7 +74,7 @@ Item {
                 onClicked: questions.backend.answerLimit(true)
             }
         ]
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -82,7 +82,7 @@ Item {
         }
     }
 
-    AtlasDialog {
+    TelamonDialog {
         id: clash
         title: qsTr("Already Here")
         showClose: false
@@ -103,13 +103,13 @@ Item {
                 onClicked: questions.backend.answerClash(2, all.checked)
             }
         ]
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             text: qsTr("\"%1\" is already here. Do you want to replace it, skip it, or keep both?").arg(questions.backend.questionText)
         }
-        AtlasCheckBox {
+        TelamonCheckBox {
             id: all
             text: qsTr("Do this for all conflicts")
         }

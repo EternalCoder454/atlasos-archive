@@ -15,7 +15,7 @@ name = "atlas_archive"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-atlas-framework-ui.workspace = true
+telamon-framework-ui.workspace = true
 atlas-archive-core = { path = "../../crates/atlas-archive-core" }
 cxx = "1"
 cxx-qt = "0.10"

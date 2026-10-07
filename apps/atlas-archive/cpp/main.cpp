@@ -2,7 +2,7 @@
 // second launch (an archive double-clicked in Explorer, `atlas-archive
 // --extract-here <file>`) hands its arguments to this one and exits; they are
 // read in Rust (src/backend.rs), never here.
-#include <atlas/app.h>
+#include <telamon/app.h>
 
 #include <KDBusService>
 #include <KWindowSystem>
@@ -25,7 +25,7 @@
 #include <memory>
 
 // Defined in src/lib.rs.
-extern "C" void *atlas_backend_new();
+extern "C" void *telamon_backend_new();
 
 // Hands a launch's arguments (without the program name) to the backend.
 static void activate(QObject *backend, const QStringList &arguments, const QString &cwd)
@@ -86,7 +86,7 @@ static void raise(QQmlApplicationEngine *engine)
 
 int main(int argc, char *argv[])
 {
-    atlas_app_init();
+    telamon_app_init();
     // Drawn on the CPU like the other Atlas apps unless QT_QUICK_BACKEND says
     // otherwise (the P phase measures a 50k-row list both ways).
     if (qEnvironmentVariableIsEmpty("QT_QUICK_BACKEND")) {
@@ -94,7 +94,7 @@ int main(int argc, char *argv[])
     }
 
     QApplication app(argc, argv);
-    atlas_app_ready();
+    telamon_app_ready();
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("The archive manager of AtlasOS."));
@@ -120,7 +120,7 @@ int main(int argc, char *argv[])
 
     // The backend outlives the engine: the window's bindings read it until
     // the engine is gone.
-    std::unique_ptr<QObject> backend(static_cast<QObject *>(atlas_backend_new()));
+    std::unique_ptr<QObject> backend(static_cast<QObject *>(telamon_backend_new()));
     auto engine = std::make_unique<QQmlApplicationEngine>();
     QObject::connect(engine.get(), &QQmlApplicationEngine::objectCreationFailed, &app, [] { QCoreApplication::exit(1); }, Qt::QueuedConnection);
     engine->setInitialProperties({{QStringLiteral("backend"), QVariant::fromValue(backend.get())}});

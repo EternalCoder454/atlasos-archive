@@ -12,7 +12,7 @@ include(GNUInstallDirs)
 find_package(Qt6 6.11 REQUIRED COMPONENTS Core Gui DBus Qml Quick QuickControls2 Widgets)
 qt_policy(SET QTP0001 NEW)
 qt_policy(SET QTP0004 NEW)
-# atlas-framework-ui's startup code (single instance, window activation)
+# telamon-framework-ui's startup code (single instance, window activation)
 find_package(KF6DBusAddons REQUIRED)
 find_package(KF6WindowSystem REQUIRED)
 find_package(Corrosion REQUIRED)
@@ -34,7 +34,7 @@ if(ATLAS_ARCHIVE_FEATURES)
 endif()
 corrosion_set_env_vars(atlas_archive QMAKE=${QMAKE6})
 
-# The framework's C header (atlas/app.h) comes with the crate's sources,
+# The framework's C header (telamon/app.h) comes with the crate's sources,
 # wherever cargo put them (a git checkout in ~/.cargo).
 find_program(CARGO NAMES cargo REQUIRED)
 execute_process(
@@ -52,20 +52,20 @@ math(EXPR LAST_PACKAGE "${NPACKAGES} - 1")
 set(ATLAS_UI_CRATE_DIR "")
 foreach(i RANGE ${LAST_PACKAGE})
     string(JSON PKG_NAME GET "${CARGO_METADATA}" packages ${i} name)
-    if(PKG_NAME STREQUAL "atlas-framework-ui")
+    if(PKG_NAME STREQUAL "telamon-framework-ui")
         string(JSON PKG_MANIFEST GET "${CARGO_METADATA}" packages ${i} manifest_path)
         get_filename_component(ATLAS_UI_CRATE_DIR "${PKG_MANIFEST}" DIRECTORY)
     endif()
 endforeach()
-if(NOT EXISTS "${ATLAS_UI_CRATE_DIR}/include/atlas/app.h")
-    message(FATAL_ERROR "atlas-framework-ui's include/atlas/app.h not found (looked in '${ATLAS_UI_CRATE_DIR}')")
+if(NOT EXISTS "${ATLAS_UI_CRATE_DIR}/include/telamon/app.h")
+    message(FATAL_ERROR "telamon-framework-ui's include/telamon/app.h not found (looked in '${ATLAS_UI_CRATE_DIR}')")
 endif()
 
-# Atlas.Ui, the shared Atlas look, is installed like Kirigami (atlas-ui, from
+# Telamon.Ui, the shared Atlas look, is installed like Kirigami (telamon-ui, from
 # atlas-framework): QML imports it and nothing links it. qmlcachegen and
 # qmllint read its types from the installed copy.
-if(NOT EXISTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}/Atlas/Ui/qmldir")
-    message(FATAL_ERROR "Atlas.Ui is not installed: install atlas-ui (atlas-framework)")
+if(NOT EXISTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}/Telamon/Ui/qmldir")
+    message(FATAL_ERROR "Telamon.Ui is not installed: install telamon-ui (atlas-framework)")
 endif()
 
 qt_add_executable(atlas-archive-app cpp/main.cpp)

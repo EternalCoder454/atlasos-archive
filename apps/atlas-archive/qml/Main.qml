@@ -2,12 +2,12 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Dialogs
 import org.kde.kirigami as Kirigami
-import Atlas.Ui
+import Telamon.Ui
 
 // Atlas Archive's window: the centred hero with nothing open, the archive as
 // folders, or the job view; the questions a job asks are dialogs over any of
 // them (docs/DESIGN.md, "Look").
-AtlasWindow {
+TelamonWindow {
     id: root
 
     // The Rust backend (src/backend.rs); main.cpp sets it.
@@ -16,7 +16,7 @@ AtlasWindow {
     // The window shows only a job: it closes itself after a clean success.
     readonly property bool jobOnly: backend.jobOnly
 
-    title: AtlasApp.name
+    title: TelamonApp.name
     width: Kirigami.Units.gridUnit * 52
     height: Kirigami.Units.gridUnit * 34
     minimumWidth: Kirigami.Units.gridUnit * 24

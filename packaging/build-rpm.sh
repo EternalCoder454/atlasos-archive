@@ -4,7 +4,7 @@
 # The binary RPM (no source, no debuginfo) is copied to <out dir>.
 # Cargo needs network access.
 # ATLAS_LOCAL_RPMS=<dir> installs the RPMs in <dir> first: atlas-framework's
-# (atlas-ui), which the app builds against and no repository has.
+# (telamon-ui), which the app builds against and no repository has.
 set -euo pipefail
 
 main() {
@@ -44,7 +44,7 @@ main() {
         top=$cache/rpmbuild
         rm -rf "$top"
         toolchain=$(rpm -q rust cargo corrosion gcc-c++ cmake qt6-qtbase-devel qt6-qtdeclarative-devel \
-            kf6-kirigami-devel atlas-ui || true)
+            kf6-kirigami-devel telamon-ui || true)
         toolchain="atlas-archive-$version
 $toolchain"
         if [ "$(cat "$cache/toolchain" 2>/dev/null)" != "$toolchain" ]; then

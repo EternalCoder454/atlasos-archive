@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
-import Atlas.Ui
+import Telamon.Ui
 
 // The job window: "Extracting photos.zip", progress and Cancel; when done
 // "Extracted to Photos" with Show Files and Close, and what was skipped.
@@ -43,35 +43,35 @@ Item {
             Layout.preferredHeight: 0
         }
 
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
-            textStyle: AtlasLabel.Title
+            textStyle: TelamonLabel.Title
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
             text: view.state === "done" ? (view.backend.jobLeft > 0 ? qsTr("Extracted to %1, but %2 items were left out").arg(view.resultName).arg(view.backend.jobLeft) : qsTr("Extracted to %1").arg(view.resultName)) : view.state === "failed" ? qsTr("Couldn't Extract") : view.backend.jobTitle
         }
 
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             visible: view.state === "done"
-            textStyle: AtlasLabel.Caption
+            textStyle: TelamonLabel.Caption
             textFormat: Text.PlainText
             horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideMiddle
             text: view.backend.jobResultShown
         }
 
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             visible: text !== ""
-            textStyle: AtlasLabel.Caption
+            textStyle: TelamonLabel.Caption
             textFormat: Text.PlainText
             horizontalAlignment: Text.AlignHCenter
             text: view.backend.jobQueue
         }
 
-        AtlasProgressBar {
+        TelamonProgressBar {
             Layout.alignment: Qt.AlignHCenter
             Layout.fillWidth: true
             Layout.maximumWidth: Kirigami.Units.gridUnit * 28
@@ -80,7 +80,7 @@ Item {
             indeterminate: view.backend.jobFraction < 0
         }
 
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             visible: view.state === "running" && text !== ""
             textFormat: Text.PlainText
@@ -123,7 +123,7 @@ Item {
             ]
         }
 
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             visible: list.visible && list.currentIndex >= 0 && list.currentIndex < skipped.count
             textFormat: Text.PlainText
@@ -131,10 +131,10 @@ Item {
             text: list.currentIndex >= 0 && list.currentIndex < skipped.count ? skipped.get(list.currentIndex).reason : ""
         }
 
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             visible: list.visible && view.details.more > 0
-            textStyle: AtlasLabel.Caption
+            textStyle: TelamonLabel.Caption
             textFormat: Text.PlainText
             text: qsTr("And %1 more.").arg(view.details.more)
         }

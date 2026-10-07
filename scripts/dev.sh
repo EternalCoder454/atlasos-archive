@@ -9,10 +9,10 @@
 # test archives, fuzz corpora). Set CARGO_TARGET_DIR to /work/target/<name>
 # to keep one target dir per task.
 # The first run installs the build dependencies from the spec (cached after).
-# They include atlas-ui, which no repository has: that run needs
-# ATLAS_LOCAL_RPMS=<dir> holding atlas-framework's RPMs (atlas-ui and
-# atlas-symbols-fonts), one version only. Delete the image after changing the
-# spec's BuildRequires or to take a newer atlas-ui.
+# They include telamon-ui, which no repository has: that run needs
+# ATLAS_LOCAL_RPMS=<dir> holding atlas-framework's RPMs (telamon-ui and
+# telamon-symbols-fonts), one version only. Delete the image after changing the
+# spec's BuildRequires or to take a newer telamon-ui.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -26,8 +26,8 @@ if ! podman image exists "$image"; then
     # Only a dir of atlas-framework's RPMs, so a wrong value fails here
     # instead of halfway through the image build.
     if [ -n "$(find "$rpms" -mindepth 1 ! -name '*.rpm' -print -quit)" ] ||
-        ! compgen -G "$rpms/atlas-ui-[0-9]*.rpm" >/dev/null; then
-        echo "ATLAS_LOCAL_RPMS=$rpms must hold only atlas-framework's RPMs (atlas-ui-*.rpm and atlas-symbols-fonts-*.rpm)" >&2
+        ! compgen -G "$rpms/telamon-ui-[0-9]*.rpm" >/dev/null; then
+        echo "ATLAS_LOCAL_RPMS=$rpms must hold only atlas-framework's RPMs (telamon-ui-*.rpm and telamon-symbols-fonts-*.rpm)" >&2
         exit 1
     fi
     # No SELinux relabelling (:z/:Z) of host folders: it would lock other
@@ -48,7 +48,7 @@ if ! podman image exists "$image"; then
         dnf -y install dnf5-plugins rpm-build clippy rustfmt xorg-x11-server-Xvfb \
             dbus-daemon qt6-qtbase-gui kf6-qqc2-desktop-style breeze-icon-theme \
             ImageMagick xdotool 7zip bsdtar zip unzip strace \
-            /atlas-rpms/atlas-ui-[0-9]*.rpm /atlas-rpms/atlas-symbols-fonts-[0-9]*.rpm &&
+            /atlas-rpms/telamon-ui-[0-9]*.rpm /atlas-rpms/telamon-symbols-fonts-[0-9]*.rpm &&
         dnf -y builddep /packaging/atlas-archive.spec &&
         bash /packaging/rpmfusion-nonfree.sh unrar' >&2
     podman commit "$ctr" "$image" >/dev/null

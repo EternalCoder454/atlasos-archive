@@ -130,14 +130,14 @@ jobs:
           fi
 
   # atlas-framework's design rules (no default buttons, no QML file named
-  # like an Atlas.Ui type), at the release the crates are pinned to.
+  # like a Telamon.Ui type), at the release the crates are pinned to.
   atlas:
     name: Atlas app checks
     uses: EternalCoder454/atlas-framework/.github/workflows/app-checks.yml@b9d72940fb94178f400c3f074fe8f9744b6c6f53 # v1.6.0
     with:
-      framework-ref: v1.6.0
+      framework-ref: v2.0.0
 
-  # Atlas.Ui (atlas-ui), which the app builds against, is in no repository:
+  # Telamon.Ui (telamon-ui), which the app builds against, is in no repository:
   # atlas-framework's RPMs at the release the crates are pinned to, built
   # once per release and Fedora Qt version and cached.
   framework:
@@ -175,7 +175,7 @@ jobs:
             echo "::error::the Atlas app checks job in ci.yml must use $refs: app-checks.yml@$commit # $refs and framework-ref: $refs"; exit 1
           fi
           echo "ref=$refs" >> "$GITHUB_OUTPUT"
-      # atlas-ui needs the Qt minor it was built with: a Fedora Qt update
+      # telamon-ui needs the Qt minor it was built with: a Fedora Qt update
       # (today's metadata, loaded by the dnf install above) builds them again.
       - name: Fedora's Qt
         id: qt
@@ -239,12 +239,12 @@ jobs:
         run: |
           ATLAS_LOCAL_RPMS=/tmp/atlas-framework-rpms packaging/install-builddeps.sh clippy ccache 7zip bsdtar zip unzip
           packaging/rpmfusion-nonfree.sh unrar
-      # cxx-qt's build scripts compile against Qt and atlas-ui without
+      # cxx-qt's build scripts compile against Qt and telamon-ui without
       # watching their versions: a cache from another toolchain is not used.
       - name: Toolchain
         id: toolchain
         run: |
-          versions=$(rpm -q gcc-c++ qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami-devel atlas-ui)
+          versions=$(rpm -q gcc-c++ qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami-devel telamon-ui)
           echo "hash=$(sha256sum <<<"$versions" | cut -c1-16)" >> "$GITHUB_OUTPUT"
       # The crate downloads and the dependencies' build output (not the
       # workspace's own crates), keyed on Cargo.lock and the rustc version.

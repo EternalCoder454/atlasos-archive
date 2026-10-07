@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Layouts
 import QtQuick.Dialogs
 import org.kde.kirigami as Kirigami
-import Atlas.Ui
+import Telamon.Ui
 
 // An archive as folders: Back, Up and the breadcrumb, Extract All…, and the
 // folder's rows. Names and reasons come from the archive: always plain text.
@@ -78,7 +78,7 @@ Item {
                 enabled: view.backend.canUp
                 onClicked: view.backend.up()
             }
-            AtlasBreadcrumb {
+            TelamonBreadcrumb {
                 Layout.fillWidth: true
                 segments: view.crumbList
                 onActivated: index => view.backend.goTo(view.crumbList[index].id)
@@ -120,10 +120,10 @@ Item {
             }
         }
 
-        AtlasLabel {
+        TelamonLabel {
             Layout.fillWidth: true
             visible: view.total > rows.count
-            textStyle: AtlasLabel.Caption
+            textStyle: TelamonLabel.Caption
             textFormat: Text.PlainText
             text: qsTr("Showing the first %1 of %2 items in this folder.").arg(rows.count).arg(view.total)
         }
