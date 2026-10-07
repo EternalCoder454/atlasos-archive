@@ -1,4 +1,4 @@
-# The CI dev image, ghcr.io/eternalcoder454/atlas-archive-dev (public): Fedora
+# The CI dev image, ghcr.io/eternalcoder454/telamon-archive-dev (public): Fedora
 # 44 with everything CI installs, so its jobs skip dnf. telamon-ui is not in
 # it: each run installs the atlas-framework release Cargo.toml pins
 # (packaging/install-builddeps.sh), and installs with dnf whatever this image
@@ -6,15 +6,15 @@
 # changes. Nothing secret goes in: no build arguments, no secrets.
 FROM registry.fedoraproject.org/fedora:44
 LABEL org.opencontainers.image.source=https://github.com/EternalCoder454/atlasos-archive
-LABEL org.opencontainers.image.description="Atlas Archive CI build environment"
+LABEL org.opencontainers.image.description="Telamon Archive CI build environment"
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-COPY atlas-archive.spec rpmfusion-nonfree.sh /tmp/
+COPY telamon-archive.spec rpmfusion-nonfree.sh /tmp/
 # Then the spec's BuildRequires but telamon-ui; telamon-ui's own dependencies
 # (Kirigami, Qt Quick, the fonts) so that installing it needs no dnf.
 RUN dnf -y install git-core tar zstd gzip rpm-build dnf5-plugins cargo clippy rustfmt ccache 7zip bsdtar zip unzip \
         kf6-kirigami kf6-kconfig qt6-qtdeclarative ibm-plex-sans-fonts jetbrains-mono-fonts \
-    && rpmspec -q --buildrequires /tmp/atlas-archive.spec | grep -v '^telamon-ui[[:space:]]' | \
+    && rpmspec -q --buildrequires /tmp/telamon-archive.spec | grep -v '^telamon-ui[[:space:]]' | \
         xargs -r -d '\n' dnf -y install \
     && bash /tmp/rpmfusion-nonfree.sh unrar \
     && dnf clean all \
-    && rm -f /tmp/atlas-archive.spec /tmp/rpmfusion-nonfree.sh
+    && rm -f /tmp/telamon-archive.spec /tmp/rpmfusion-nonfree.sh

@@ -1,9 +1,9 @@
 #!/bin/bash
-# Install packages from RPM Fusion nonfree (unrar, which the AtlasOS image
+# Install packages from RPM Fusion nonfree (unrar, which the Telamon OS image
 # ships for encrypted RAR) in a Fedora container, as root.
 #   packaging/rpmfusion-nonfree.sh <package...>
 # Does nothing when they are all installed. Otherwise it adds the repo the
-# way the AtlasOS image does (build_files/packages.sh there): dnf doesn't
+# way the Telamon OS image does (build_files/packages.sh there): dnf doesn't
 # check the signature of a package given by URL, so the release package is
 # checked against RPM Fusion's key from Fedora's distribution-gpg-keys, in a
 # private rpm database holding only that key; the repo key it then adds is

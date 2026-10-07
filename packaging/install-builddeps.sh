@@ -1,10 +1,10 @@
 #!/bin/bash
-# Install what building Atlas Archive needs, as root in fedora:44: the spec's
+# Install what building Telamon Archive needs, as root in fedora:44: the spec's
 # BuildRequires, rpm-build and the packages named. dnf (and its metadata
 # download) runs only for what is missing, so the CI dev image, which has it
 # all, skips it.
 #   packaging/install-builddeps.sh [package ...]
-# ATLAS_LOCAL_RPMS=<dir> installs the RPMs in <dir> first: atlas-framework's
+# TELAMON_LOCAL_RPMS=<dir> (ATLAS_LOCAL_RPMS still works) installs the RPMs in <dir> first: atlas-framework's
 # (telamon-ui), which the app builds against and no repository has.
 set -euo pipefail
 
@@ -47,19 +47,20 @@ satisfied() {
 
 main() {
     here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-    spec=$here/atlas-archive.spec
+    spec=$here/telamon-archive.spec
 
     tools=(rpm-build dnf5-plugins tar gzip "$@")
     if [ -n "$(printf '%s\n' "${tools[@]}" | missing)" ]; then
         dnf -y install "${tools[@]}" >&2
     fi
 
-    if [ -n "${ATLAS_LOCAL_RPMS:-}" ]; then
+    TELAMON_LOCAL_RPMS=${TELAMON_LOCAL_RPMS:-${ATLAS_LOCAL_RPMS:-}}
+    if [ -n "$TELAMON_LOCAL_RPMS" ]; then
         # Telamon.Ui and its fonts, not the gallery. rpm puts these exact files
         # in place even when a build of the same (or a newer) version is
         # installed; dnf first brings their dependencies when rpm finds some
         # missing.
-        local_rpms=("$ATLAS_LOCAL_RPMS"/telamon-ui-[0-9]*.rpm "$ATLAS_LOCAL_RPMS"/telamon-symbols-fonts-[0-9]*.rpm)
+        local_rpms=("$TELAMON_LOCAL_RPMS"/telamon-ui-[0-9]*.rpm "$TELAMON_LOCAL_RPMS"/telamon-symbols-fonts-[0-9]*.rpm)
         if ! rpm -U --replacepkgs --replacefiles --oldpackage "${local_rpms[@]}" >&2; then
             echo "::warning::telamon-ui needs packages that are not installed (above); installing them with dnf" >&2
             dnf -y install "${local_rpms[@]}" >&2

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Telamon Archive</title>
+  <!-- A magenta box with its lid on and a silver zip down the front. Part of
+       the Telamon app icons: no tile, own hue, same corners, light and
+       shadow. -->
+  <defs>
+    <radialGradient id="shadow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#000000" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="body" gradientUnits="userSpaceOnUse" x1="0" y1="50" x2="0" y2="112">
+      <stop offset="0" stop-color="#C2449F"/>
+      <stop offset="1" stop-color="#8E2077"/>
+    </linearGradient>
+    <linearGradient id="lid" gradientUnits="userSpaceOnUse" x1="0" y1="26" x2="0" y2="54">
+      <stop offset="0" stop-color="#E06BC0"/>
+      <stop offset="1" stop-color="#B63B98"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(64 64) scale(1.06) translate(-64 -64)">
+    <ellipse cx="64" cy="114" rx="46" ry="6" fill="url(#shadow)"/>
+    <path fill="url(#body)" d="M20 48H108V102A9 9 0 0 1 99 111H29A9 9 0 0 1 20 102Z"/>
+    <rect x="20" y="50" width="88" height="6" fill="#000000" fill-opacity="0.16"/>
+    <rect x="14" y="28" width="100" height="24" rx="8" fill="url(#lid)"/>
+    <path fill="none" stroke="#F3A2DB" stroke-width="2.5" stroke-linecap="round" d="M23 30H105"/>
+    <rect x="59" y="28" width="10" height="24" fill="#7A1A66" fill-opacity="0.35"/>
+    <rect x="60" y="56" width="8" height="31" fill="#7A1A66" fill-opacity="0.35"/>
+    <g fill="#ECEDF3">
+      <rect x="60" y="56" width="5" height="3.5" rx="1"/>
+      <rect x="64" y="61" width="5" height="3.5" rx="1"/>
+      <rect x="60" y="66" width="5" height="3.5" rx="1"/>
+      <rect x="64" y="71" width="5" height="3.5" rx="1"/>
+      <rect x="60" y="76" width="5" height="3.5" rx="1"/>
+      <rect x="64" y="81" width="5" height="3.5" rx="1"/>
+    </g>
+    <rect x="55" y="84" width="18" height="21" rx="5" fill="#F4F5F9"/>
+    <rect x="60.5" y="90" width="7" height="9" rx="2.5" fill="#9A2582"/>
+  </g>
+</svg>

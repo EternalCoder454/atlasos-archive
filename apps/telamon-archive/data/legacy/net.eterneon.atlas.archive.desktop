@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+# The name this app had until 0.2.0 (Atlas Archive). Kept for one release:
+# the image's mimeapps.list defaults and Explorer (which reads the MimeType
+# list through KService to offer Extract) still name it. It starts the same
+# program and is not shown in menus; net.eterneon.telamon.archive.desktop
+# is the app. Drop it with data/legacy when they name the new one.
+Name=Telamon Archive
+Exec=telamon-archive -- %F
+Icon=net.eterneon.telamon.archive
+NoDisplay=true
+Terminal=false
+Categories=Qt;KDE;Utility;Archiving;Compression;
+MimeType=application/zip;application/x-7z-compressed;application/x-tar;application/x-compressed-tar;application/x-bzip2-compressed-tar;application/x-bzip-compressed-tar;application/x-xz-compressed-tar;application/x-zstd-compressed-tar;application/x-lz4-compressed-tar;application/gzip;application/x-xz;application/zstd;application/x-bzip2;application/x-bzip;application/x-lz4;application/vnd.rar;application/x-rar;application/vnd.ms-cab-compressed;application/x-cpio;application/x-archive;application/vnd.debian.binary-package;application/x-cd-image;application/x-iso9660-image;application/x-rpm;application/java-archive;
+StartupNotify=true
+X-KDE-StartupNotify=true

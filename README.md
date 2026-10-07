@@ -1,6 +1,6 @@
-# Atlas Archive
+# Telamon Archive
 
-The archive manager of [AtlasOS](https://github.com/EternalCoder454/AtlasOS).
+The archive manager of [Telamon OS](https://github.com/EternalCoder454/AtlasOS).
 It replaces KDE Ark.
 
 - Double-click an archive to browse it like a folder, preview what's inside

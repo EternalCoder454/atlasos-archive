@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+# The file this app's right-click actions had until 0.2.0 (Atlas Archive).
+# Kept for one release because the image still checks that it exists; the
+# actions are in net.eterneon.telamon.archive.desktop now, so this one has
+# none, and Explorer and Dolphin don't show them twice.
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+Hidden=true

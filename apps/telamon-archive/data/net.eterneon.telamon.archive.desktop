@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=Telamon Archive
+GenericName=Archive Manager
+Comment=Open, extract and create archives
+Exec=telamon-archive -- %F
+Icon=net.eterneon.telamon.archive
+Terminal=false
+Categories=Qt;KDE;Utility;Archiving;Compression;
+Keywords=zip;7z;rar;tar;gz;xz;zstd;extract;compress;unzip;archive;ark;
+# What Archive opens. Explorer reads this list to decide when to offer
+# Extract. ISO and RPM are listed but stay the defaults of Disks and the Store
+# (docs/DESIGN.md, "Mime types and defaults").
+MimeType=application/zip;application/x-7z-compressed;application/x-tar;application/x-compressed-tar;application/x-bzip2-compressed-tar;application/x-bzip-compressed-tar;application/x-xz-compressed-tar;application/x-zstd-compressed-tar;application/x-lz4-compressed-tar;application/gzip;application/x-xz;application/zstd;application/x-bzip2;application/x-bzip;application/x-lz4;application/vnd.rar;application/x-rar;application/vnd.ms-cab-compressed;application/x-cpio;application/x-archive;application/vnd.debian.binary-package;application/x-cd-image;application/x-iso9660-image;application/x-rpm;application/java-archive;
+Actions=ExtractHere;ExtractToFolder;
+StartupNotify=true
+X-KDE-StartupNotify=true
+
+[Desktop Action ExtractHere]
+Name=Extract Here
+Exec=telamon-archive --extract-here -- %F
+Icon=archive-extract
+
+[Desktop Action ExtractToFolder]
+Name=Extract to Folder
+Exec=telamon-archive --extract-to-folder -- %F
+Icon=archive-extract

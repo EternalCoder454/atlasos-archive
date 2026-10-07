@@ -1,0 +1,26 @@
+[package]
+name = "telamon-archive-cli"
+description = "Telamon Archive on the command line: list, extract, test, create, info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+telamon-archive-core = { path = "../../crates/telamon-archive-core" }
+log.workspace = true
+libc.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json = "1.0.151"
+
+[features]
+# `--worker PATH`: run any executable as the worker, unsandboxed. For the
+# integration tests only; never in a shipped build.
+dev-worker = []
+
+[[test]]
+name = "cli"
+required-features = ["dev-worker"]
