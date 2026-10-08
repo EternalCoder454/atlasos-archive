@@ -920,7 +920,9 @@ fn run(conn: &mut impl Conn, job: CreateJob) -> Result<String, String> {
     }
 
     // libarchive's 7z writer keeps its data in a temporary file first: in
-    // staging, the one place the worker may write.
+    // staging, the one place the worker may write. TMPDIR is process-wide:
+    // the worker runs one job and is single-threaded (the tests below take
+    // a lock, since they run many jobs in one process).
     // SAFETY: the worker is single-threaded here; the value is a fixed string.
     unsafe {
         std::env::set_var(
@@ -1032,6 +1034,11 @@ mod tests {
         level: Level,
     ) -> Fake {
         utf8_locale();
+        // One job at a time: `create` sets TMPDIR for the process, and a
+        // second job's descriptor number would be read by the first's
+        // writer (or reused by another test's file: ENOTDIR on close).
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
         let mut c = Fake { replies: vec![] };
         create(
             &mut c,
