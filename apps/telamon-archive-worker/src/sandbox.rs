@@ -2,7 +2,7 @@
 //! (docs/DESIGN.md, "The sandbox").
 
 use std::ffi::c_uint;
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
@@ -72,7 +72,7 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> Result<(), String> 
 /// outside), then the system call filter (`seccomp`).
 pub fn enter(
     staging: Option<BorrowedFd<'_>>,
-    reads: &[(BorrowedFd<'_>, bool)],
+    reads: impl IntoIterator<Item = (OwnedFd, bool)>,
 ) -> Result<(), String> {
     // SAFETY: plain prctl calls with integer arguments.
     unsafe {
@@ -103,7 +103,7 @@ pub fn enter(
 
 fn landlock(
     staging: Option<BorrowedFd<'_>>,
-    reads: &[(BorrowedFd<'_>, bool)],
+    reads: impl IntoIterator<Item = (OwnedFd, bool)>,
 ) -> Result<(), String> {
     let abi = ABI_TESTED;
     let fail = |e: landlock::RulesetError| format!("Couldn't set up the sandbox: {e}");
@@ -161,14 +161,14 @@ fn landlock(
     }
     // The sources of a Create job: each file or folder it was given, read
     // only (never run, never changed).
-    for &(fd, is_dir) in reads {
+    for (fd, is_dir) in reads {
         let access = if is_dir {
             AccessFs::from_read(abi) & !AccessFs::Execute
         } else {
             AccessFs::ReadFile.into()
         };
         ruleset = ruleset
-            .add_rule(PathBeneath::new(fd, access))
+            .add_rule(PathBeneath::new(&fd, access))
             .map_err(fail)?;
     }
     let status = ruleset.restrict_self().map_err(fail)?;
@@ -236,7 +236,10 @@ mod tests {
         let src_file = std::fs::File::open(dir.join("src-file")).unwrap();
         enter(
             Some(staging.as_fd()),
-            &[(src_dir.as_fd(), true), (src_file.as_fd(), false)],
+            [
+                (src_dir.try_clone().unwrap().into(), true),
+                (src_file.try_clone().unwrap().into(), false),
+            ],
         )
         .unwrap();
         assert_eq!(std::fs::read(dir.join("src-dir/in.txt")).unwrap(), b"in");

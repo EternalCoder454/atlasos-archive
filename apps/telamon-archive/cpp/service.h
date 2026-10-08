@@ -4,8 +4,10 @@
 // and events into properties, signals and calls.
 #pragma once
 
+#include <QAbstractListModel>
 #include <QHash>
 #include <QJsonObject>
+#include <QAtomicPointer>
 #include <QObject>
 #include <QStringList>
 #include <QTimer>
@@ -14,6 +16,26 @@
 #include <QWindow>
 
 class JobsService;
+class JobItem;
+
+// The jobs that have a window, as a model: a window is made when its row is
+// added and goes when it is removed, and nothing else touches it (a list that
+// is replaced would make every window again, and lose what is typed in them).
+class JobWindowsModel : public QAbstractListModel
+{
+    Q_OBJECT
+public:
+    enum Roles { JobRole = Qt::UserRole + 1 };
+    explicit JobWindowsModel(QObject *parent = nullptr);
+    int rowCount(const QModelIndex &parent = {}) const override;
+    QVariant data(const QModelIndex &index, int role) const override;
+    QHash<int, QByteArray> roleNames() const override;
+    // Takes the rows to `want` (sorted by id): removes the others, appends the new.
+    void sync(const QList<JobItem *> &want);
+
+private:
+    QList<JobItem *> m_list;
+};
 
 // One job, in the property names of the window's Backend (jobState, jobTitle,
 // question...) so JobView.qml and Questions.qml show it unchanged.
@@ -125,13 +147,15 @@ private:
     QString m_dialogError;
     bool m_dismissed = false;
     bool m_windowWanted = false;
+    // The service no longer has the job; the window is all that is left.
+    bool m_orphan = false;
 };
 
 class JobsService : public QObject
 {
     Q_OBJECT
-    // The jobs that have a window open (JobItem*), for an Instantiator.
-    Q_PROPERTY(QVariantList windows READ windows NOTIFY windowsChanged)
+    // The jobs that have a window open, for an Instantiator.
+    Q_PROPERTY(QObject *windowModel READ windowModel CONSTANT)
 
 public:
     explicit JobsService(QObject *parent = nullptr);
@@ -139,7 +163,9 @@ public:
 
     // Starts the Rust service; false if it was started already.
     bool start();
-    QVariantList windows() const;
+    QObject *windowModel() { return &m_model; }
+    // The item of a finished job whose object the service forgot (its window was still open).
+    void forget(JobItem *item);
     JobItem *item(uint id) const { return m_items.value(id); }
     bool idle() const;
     // Whether a window of a job is open (the app stays up for it).
@@ -192,5 +218,6 @@ private:
     void update();
 
     QHash<uint, JobItem *> m_items;
-    static JobsService *s_instance;
+    JobWindowsModel m_model;
+    static QAtomicPointer<JobsService> s_instance;
 };

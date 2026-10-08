@@ -650,7 +650,9 @@ other method.
 
 A password is never a D-Bus argument: when one is needed, the job's own
 window asks for it (the job is `waiting-for-user`, `Question` "password");
-there is no method on the job that takes one.
+there is no method on the job that takes one. A dialog nobody answers is
+cancelled after 10 minutes; a finished job's window stays until it is closed,
+longer than its D-Bus object.
 
 Job objects, `/net/eterneon/telamon/archive/job/<n>`, interface
 `net.eterneon.telamon.Archive1.Job` (the same jobs are objects under
@@ -693,8 +695,11 @@ type calls `ExtractEntries(archive, entries, folder, {})` with the `archive`
 URI and the tokens unchanged and `folder` the `file://` URI of the folder
 dropped on. The items must be in one folder of the archive (as a window shows
 them); each lands directly in `folder` (a folder with what is inside it), a
-taken name asks like Extract here, and the job's `results` are the placed
-items. Items the safety rules take out are listed in the job window.
+taken name asks like Extract here (every question is asked before the first
+item moves, so a Cancel there places nothing), and the job's `results` are
+the placed items. A link inside the items that names something not dragged
+along would point outside its new place, so it is left out; that and what the
+safety rules take out are listed in the job window.
 `text/uri-list` is not carried yet (nothing is extracted until the drop), so
 other targets get nothing from this drag.
 
@@ -758,7 +763,7 @@ a password). Stale staging is cleaned only by `extract`. The hidden
 `--worker PATH` exists only in builds with the `dev-worker` feature (the
 tests). Exit codes: 0 done, 1 failed, 2 bad usage, 3 needs a password (or
 `--password-fd` gave a wrong one), 4 a limit refused, 130 cancelled.
-`create` exits 2 until the writers land.
+`create` exits 2 until the CLI is wired to the writers (the worker has them since 0.3.0).
 
 The GUI takes `telamon-archive [--extract-here|--extract-to DIR|--extract-all|
 --compress-zip|--compress|--test] FILES…` (the Explorer actions without

@@ -34,7 +34,7 @@ pub use staging::{
 };
 pub use trash::Trash;
 
-use crate::audit::{self, Removed};
+use crate::audit::{self, MAX_REMOVED_LISTED, Removed};
 use crate::limits::{Exceeded, Kind, Limits, reserve_for};
 use crate::name::NameEncoding;
 use crate::proto::{
@@ -530,8 +530,19 @@ impl Worker {
             paths: placed.paths,
             left_out: placed.left_out,
             clash_all: placed.clash_all,
-            removed: audit.removed,
-            removed_more: audit.removed_more,
+            removed_more: audit.removed_more.saturating_add(
+                audit
+                    .removed
+                    .len()
+                    .saturating_add(placed.removed.len())
+                    .saturating_sub(MAX_REMOVED_LISTED),
+            ),
+            removed: {
+                let mut all = audit.removed;
+                all.extend(placed.removed);
+                all.truncate(MAX_REMOVED_LISTED);
+                all
+            },
             skipped: col.skipped,
             skipped_more: col.skipped_more,
             unconfirmed: placed.unconfirmed,
@@ -934,6 +945,7 @@ fn drive(
     // A Create job's totals: sent first, only growing, final once.
     let mut scanned: Option<(u64, u64, bool)> = None;
     let mut last_progress: Option<Instant> = None;
+    let mut pause_failed = false;
     let mut seen = (0u64, 0u64);
     let (mut frames, mut skip_frames, mut skip_calls, mut more_calls) = (0u64, 0u64, 0usize, 0u64);
     loop {
@@ -942,24 +954,27 @@ fn drive(
         {
             w.check(ceiling).map_err(Halt::Failed)?;
         }
-        if cancel.is_paused() && !cancel.is_cancelled() {
+        if cancel.is_paused() && !cancel.is_cancelled() && !pause_failed {
             // The user's Pause: the worker stands still, and the clocks with it.
-            if !running.pause() {
-                return Err(Halt::Failed(
-                    "Telamon Archive couldn't pause the archive reader.".into(),
-                ));
-            }
-            while cancel.is_paused() && !cancel.is_cancelled() {
-                std::thread::sleep(PAUSE_POLL);
-            }
-            if cancel.is_cancelled() {
-                // Left stopped: the kill that follows works on it.
-                return Err(Halt::Stop(Stop::Cancelled));
-            }
-            running.resume();
-            deadline = Instant::now() + timeout;
-            if let Some(w) = watch.as_mut() {
-                w.last = Instant::now();
+            if running.pause() {
+                while cancel.is_paused() && !cancel.is_cancelled() {
+                    std::thread::sleep(PAUSE_POLL);
+                }
+                if cancel.is_cancelled() {
+                    // Left stopped: the kill that follows works on it.
+                    return Err(Halt::Stop(Stop::Cancelled));
+                }
+                running.resume();
+                deadline = Instant::now() + timeout;
+                if let Some(w) = watch.as_mut() {
+                    w.last = Instant::now();
+                }
+            } else {
+                // The worker may have just finished: what it sent is read
+                // next, and a worker that really can't be stopped gets
+                // no second try.
+                log::warn!("The archive reader couldn't be paused.");
+                pause_failed = true;
             }
         }
         let tick = Some(

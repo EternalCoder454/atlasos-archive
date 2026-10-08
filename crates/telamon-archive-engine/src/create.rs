@@ -480,6 +480,12 @@ impl<'a> Walk<'a> {
         if self.path.len() > MAX_PATH {
             return v.skipped(&shown, "its path is too long");
         }
+        // Another job's staging folder (this one is skipped by its inode
+        // below) is not the user's: a project folder compressed beside an
+        // archive being made must not take its half-written file.
+        if is_staging_name(name) {
+            return Ok(());
+        }
         let st = match fstatat(parent.as_raw_fd(), name) {
             Ok(st) => st,
             Err(e) => return v.skipped(&shown, &why_unreadable(&e)),
@@ -552,6 +558,14 @@ impl<'a> Walk<'a> {
             _ => v.skipped(&shown, "it isn't a file, a folder or a link"),
         }
     }
+}
+
+/// `.<name>.telamon-partial-<hex>` (or the older `.atlas-partial-`).
+fn is_staging_name(name: &[u8]) -> bool {
+    name.first() == Some(&b'.')
+        && [&b".telamon-partial-"[..], b".atlas-partial-"]
+            .iter()
+            .any(|m| name.windows(m.len()).any(|w| w == *m))
 }
 
 /// `openat2` below `dir` that follows no link.

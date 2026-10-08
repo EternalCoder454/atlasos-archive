@@ -20,7 +20,7 @@ mod seccomp;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 
 use telamon_archive_core::compress::{CompressFormat, Level};
@@ -123,13 +123,9 @@ fn main() -> ExitCode {
     let staging = take(STAGING).filter(|s| kind_of(s) == Some(libc::S_IFDIR));
     // A Create job: its request, now, and what the sandbox may read.
     let mut create_job = None;
-    let mut reads = Vec::new();
     if !roots.is_empty() {
         match first_create(&mut conn, &roots) {
-            Ok(job) => {
-                reads = job.reads(&roots);
-                create_job = Some(job);
-            }
+            Ok(job) => create_job = Some(job),
             Err(reason) => {
                 let _ = conn.send(&Reply::Failed {
                     reason: reason.clone(),
@@ -139,9 +135,11 @@ fn main() -> ExitCode {
             }
         }
     }
-    let read_rules: Vec<(BorrowedFd<'_>, bool)> =
-        reads.iter().map(|r| (r.0.as_fd(), r.1)).collect();
-    if let Err(reason) = sandbox::enter(staging.as_ref().map(AsFd::as_fd), &read_rules) {
+    let sandboxed = match &create_job {
+        Some(job) => sandbox::enter(staging.as_ref().map(AsFd::as_fd), job.reads(&roots)),
+        None => sandbox::enter(staging.as_ref().map(AsFd::as_fd), std::iter::empty()),
+    };
+    if let Err(reason) = sandboxed {
         let _ = conn.send(&Reply::Failed {
             reason: reason.clone(),
         });
@@ -175,15 +173,12 @@ impl Creating {
     /// What the sandbox may read: each source folder or file, by an `O_PATH`
     /// descriptor made now, and whether it is a folder. Links and the rest are
     /// read by `readlinkat` and `fstatat`, which Landlock doesn't gate.
-    fn reads(&self, roots: &[OwnedFd]) -> Vec<(OwnedFd, bool)> {
-        let mut out = Vec::new();
-        for s in &self.sources {
-            let Some(root) = roots.get(s.root as usize) else {
-                continue;
-            };
-            let Ok(name) = std::ffi::CString::new(s.name.clone()) else {
-                continue;
-            };
+    /// Opened one at a time, as the sandbox takes each rule: thousands of
+    /// items must not need thousands of descriptors.
+    fn reads<'a>(&'a self, roots: &'a [OwnedFd]) -> impl Iterator<Item = (OwnedFd, bool)> + 'a {
+        self.sources.iter().filter_map(move |s| {
+            let root = roots.get(s.root as usize)?;
+            let name = std::ffi::CString::new(s.name.clone()).ok()?;
             // SAFETY: a valid folder descriptor and C string.
             let fd = unsafe {
                 libc::openat(
@@ -193,17 +188,16 @@ impl Creating {
                 )
             };
             if fd < 0 {
-                continue;
+                return None;
             }
             // SAFETY: a new descriptor we own.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             match kind_of(&fd) {
-                Some(libc::S_IFDIR) => out.push((fd, true)),
-                Some(libc::S_IFREG) => out.push((fd, false)),
-                _ => {}
+                Some(libc::S_IFDIR) => Some((fd, true)),
+                Some(libc::S_IFREG) => Some((fd, false)),
+                _ => None,
             }
-        }
-        out
+        })
     }
 }
 

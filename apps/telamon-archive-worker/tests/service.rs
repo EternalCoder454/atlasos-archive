@@ -1126,3 +1126,30 @@ with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=9) as
         ls(&e.src)
     );
 }
+
+#[test]
+fn pausing_waiting_jobs_does_not_make_room() {
+    let e = Env::with("flood", |c| c.max_running = 0);
+    let a = e.tar_gz("a.tar.gz", &[("a.txt", "a")]);
+    for _ in 0..16 {
+        let id = e.svc.test(&[e.u(&a)], opts()).unwrap();
+        assert!(e.svc.pause(id));
+        assert_eq!(e.svc.snapshot(id).unwrap().state, State::Paused);
+    }
+    let err = e.svc.test(&[e.u(&a)], opts()).unwrap_err();
+    assert_eq!(err.name(), "TooManyJobs");
+    e.svc.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn a_dialog_nobody_answers_gives_up() {
+    let e = Env::with("ttl", |c| c.dialog_ttl = Duration::from_millis(800));
+    let a = e.tar_gz("a.tar.gz", &[("a.txt", "a")]);
+    let id = e.svc.extract_all(&[e.u(&a)], opts()).unwrap();
+    assert_eq!(e.svc.snapshot(id).unwrap().state, State::WaitingForUser);
+    let s = e.done(id);
+    assert_eq!(s.state, State::Cancelled);
+    // And a late answer finds nothing to answer.
+    assert!(e.svc.confirm_extract_all(id, e.dest.clone()).is_err());
+    assert!(e.ls().is_empty());
+}

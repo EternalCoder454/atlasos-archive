@@ -31,6 +31,8 @@ pub use validate::FileId;
 pub const MAX_RUNNING: usize = 2;
 /// Jobs that may wait; past that a call fails with `TooManyJobs`.
 pub const MAX_WAITING: usize = 16;
+/// How long an Extract All or Compress dialog may stay unanswered.
+pub const DIALOG_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long a finished job's object stays for callers that come late.
 pub const LINGER: Duration = Duration::from_secs(60);
 /// The most archives or items one call names.
@@ -304,6 +306,8 @@ pub struct Config {
     pub max_running: usize,
     pub max_waiting: usize,
     pub linger: Duration,
+    /// How long a dialog may wait for its answer.
+    pub dialog_ttl: Duration,
 }
 
 impl Config {
@@ -313,6 +317,7 @@ impl Config {
             max_running: MAX_RUNNING,
             max_waiting: MAX_WAITING,
             linger: LINGER,
+            dialog_ttl: DIALOG_TTL,
         }
     }
 }
@@ -364,6 +369,7 @@ pub(crate) struct Data {
     pub queue_note: String,
     pub result_path: String,
     pub finished_at: Option<Instant>,
+    pub created: Instant,
     pub user_paused: bool,
     pub started: bool,
     pub work: Option<Work>,
@@ -664,8 +670,7 @@ impl Service {
                 dest_dir: folder.clone(),
             });
         }
-        self.start_dialog_job(&job, Work::Extract { items, here: false });
-        Ok(())
+        self.start_dialog_job(&job, Work::Extract { items, here: false })
     }
 
     /// `ExtractEntries`: the drop half of drag-out.
@@ -792,8 +797,7 @@ impl Service {
                 level: choice.level,
                 ask_on_clash: true,
             },
-        );
-        Ok(())
+        )
     }
 
     /// `Test`.
@@ -884,34 +888,7 @@ impl Service {
     /// Cancels: a waiting job ends at once; a running one is stopped, its
     /// staging removed, and ends when the thread is done.
     pub fn cancel(&self, id: u32) -> bool {
-        let Some(job) = self.job(id) else {
-            return false;
-        };
-        let ends_now = {
-            let mut d = job.lock();
-            if d.state.is_over() {
-                return false;
-            }
-            let ends_now = !d.started;
-            if ends_now {
-                d.state = State::Cancelled;
-                d.work = None;
-            }
-            ends_now
-        };
-        job.cancel.cancel();
-        if ends_now {
-            {
-                let mut reg = self.inner.reg();
-                reg.queue.retain(|&q| q != id);
-            }
-            let mut d = job.lock();
-            d.ask = None;
-            d.finished_at = Some(Instant::now());
-            drop(d);
-            self.inner.announce_end(&job);
-        }
-        true
+        self.inner.cancel(id)
     }
 
     /// The user's answer to a question. A password can only come from here
@@ -990,9 +967,15 @@ impl Service {
         Ok(job)
     }
 
-    fn start_dialog_job(&self, job: &Arc<Job>, work: Work) {
+    fn start_dialog_job(&self, job: &Arc<Job>, work: Work) -> Result<(), ApiError> {
         {
             let mut d = job.lock();
+            // A cancel may have come between the check and now.
+            if d.state != State::WaitingForUser || d.started || d.dialog.is_none() {
+                return Err(ApiError::InvalidArgs(
+                    "That job isn't waiting for an answer.".into(),
+                ));
+            }
             d.work = Some(work);
             d.dialog = None;
             d.ask = None;
@@ -1002,6 +985,7 @@ impl Service {
         self.inner.reg().queue.push_back(job.id);
         self.inner.changed(job);
         self.inner.schedule();
+        Ok(())
     }
 
     fn add(
@@ -1020,7 +1004,11 @@ impl Service {
                 .values()
                 .filter(|j| {
                     let d = j.lock();
-                    !d.started && matches!(d.state, State::Queued | State::WaitingForUser)
+                    !d.started
+                        && matches!(
+                            d.state,
+                            State::Queued | State::Paused | State::WaitingForUser
+                        )
                 })
                 .count();
             if waiting >= self.inner.cfg.max_waiting {
@@ -1060,6 +1048,7 @@ impl Service {
                     queue_note: String::new(),
                     result_path: String::new(),
                     finished_at: None,
+                    created: Instant::now(),
                     user_paused: false,
                     started: false,
                     work,
@@ -1084,8 +1073,58 @@ impl Service {
 }
 
 impl Inner {
-    /// Forgets the jobs that finished more than `linger` ago.
+    fn job(&self, id: u32) -> Option<Arc<Job>> {
+        self.reg().jobs.get(&id).cloned()
+    }
+
+    fn cancel(&self, id: u32) -> bool {
+        let Some(job) = self.job(id) else {
+            return false;
+        };
+        let ends_now = {
+            let mut d = job.lock();
+            if d.state.is_over() {
+                return false;
+            }
+            let ends_now = !d.started;
+            if ends_now {
+                d.state = State::Cancelled;
+                d.work = None;
+            }
+            ends_now
+        };
+        job.cancel.cancel();
+        if ends_now {
+            {
+                let mut reg = self.reg();
+                reg.queue.retain(|&q| q != id);
+            }
+            let mut d = job.lock();
+            d.ask = None;
+            d.finished_at = Some(Instant::now());
+            drop(d);
+            self.announce_end(&job);
+        }
+        true
+    }
+
+    /// Forgets the jobs that finished more than `linger` ago, and gives up on
+    /// dialogs nobody answered for `dialog_ttl`.
     fn sweep(&self) {
+        let stale: Vec<u32> = {
+            let reg = self.reg();
+            reg.jobs
+                .iter()
+                .filter(|(_, j)| {
+                    let d = j.lock();
+                    d.dialog.is_some() && !d.started && d.created.elapsed() >= self.cfg.dialog_ttl
+                })
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        for id in stale {
+            self.cancel(id);
+        }
         let gone: Vec<u32> = {
             let mut reg = self.reg();
             let ids: Vec<u32> = reg

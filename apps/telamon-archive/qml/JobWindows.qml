@@ -12,10 +12,10 @@ QtObject {
     required property var service
 
     readonly property Instantiator windows: Instantiator {
-        model: root.service.windows
+        // A window is made when its row is added (its `job` role fills the
+        // window's `job`) and goes when the row does.
+        model: root.service.windowModel
         delegate: JobWindow {
-            required property var modelData
-            job: modelData
             service: root.service
         }
     }

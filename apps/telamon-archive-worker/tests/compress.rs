@@ -546,3 +546,145 @@ fn selected_items_land_straight_in_the_destination() {
     // No hidden leftovers.
     assert!(!s.ls().iter().any(|n| n.starts_with('.')));
 }
+
+#[test]
+fn dragged_links_stay_inside_the_dragged_items_and_a_cancel_places_nothing() {
+    let s = Scratch::new("itemlinks");
+    std::fs::create_dir_all(s.src.join("Work/sub")).unwrap();
+    std::fs::write(s.src.join("Work/a.txt"), b"a").unwrap();
+    std::fs::write(s.src.join("Work/sub/b.txt"), b"b").unwrap();
+    symlink("b.txt", s.src.join("Work/sub/inside")).unwrap();
+    symlink("../a.txt", s.src.join("Work/sub/outward")).unwrap();
+    symlink("../../../etc", s.src.join("Work/sub/far")).unwrap();
+    let sources = [s.src.join("Work")];
+    let a = s
+        .worker()
+        .compress(
+            &request(&sources, &s.root, "Work.tar.gz", CompressFormat::TarGz),
+            &mut Rec::default(),
+            &Cancel::new(),
+        )
+        .unwrap();
+    let l = s
+        .worker()
+        .list(&a.path, None, &mut Rec::default(), &Cancel::new())
+        .unwrap();
+    let t = &l.tree;
+    let ids = [t.find(["Work", "sub"]).unwrap()];
+    let picked = t.pick(&ids).unwrap();
+    let run = |cancel: &Cancel, rec: &mut Rec| {
+        s.worker().extract(
+            &ExtractRequest {
+                archive: &a.path,
+                dest_dir: &s.dest,
+                mode: Mode::Items {
+                    dir: picked.dir.clone(),
+                    names: picked.names.clone(),
+                },
+                selection: Some(picked.entries.clone()),
+                encoding: NameEncoding::Utf8,
+                raw_name: "x".into(),
+                clash_all: None,
+            },
+            rec,
+            cancel,
+        )
+    };
+    let got = run(&Cancel::new(), &mut Rec::default()).unwrap();
+    assert_eq!(ls(&s.dest.join("sub")), ["b.txt", "inside"]);
+    assert_eq!(got.removed.len(), 1, "{:?}", got.removed);
+    assert!(got.removed.iter().any(|r| r.path.ends_with("outward")));
+    // Now the name is taken: a Cancel at the question places nothing and
+    // leaves what was there.
+    let cancel = Cancel::new();
+    let mut rec = Rec {
+        clash: Some(ClashAnswer {
+            action: Clash::Skip,
+            all: false,
+        }),
+        ..Rec::default()
+    };
+    rec.cancel_on_total = None;
+    struct CancelAtClash(Cancel);
+    impl Callbacks for CancelAtClash {
+        fn clash(&mut self, _: &str) -> ClashAnswer {
+            self.0.cancel();
+            ClashAnswer {
+                action: Clash::Skip,
+                all: false,
+            }
+        }
+    }
+    let e = s
+        .worker()
+        .extract(
+            &ExtractRequest {
+                archive: &a.path,
+                dest_dir: &s.dest,
+                mode: Mode::Items {
+                    dir: picked.dir.clone(),
+                    names: picked.names.clone(),
+                },
+                selection: Some(picked.entries.clone()),
+                encoding: NameEncoding::Utf8,
+                raw_name: "x".into(),
+                clash_all: None,
+            },
+            &mut CancelAtClash(cancel.clone()),
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(matches!(e, Error::Cancelled), "{e}");
+    assert_eq!(s.ls(), ["sub"]);
+    assert_eq!(ls(&s.dest.join("sub")), ["b.txt", "inside"]);
+    let _ = rec;
+}
+
+#[test]
+fn a_selection_of_hundreds_of_items_is_compressed() {
+    let s = Scratch::new("many");
+    std::fs::create_dir_all(s.src.join("many")).unwrap();
+    let mut sources = Vec::new();
+    for i in 0..600 {
+        let p = s.src.join("many").join(format!("file-{i:04}.txt"));
+        std::fs::write(&p, format!("number {i}\n")).unwrap();
+        sources.push(p);
+    }
+    let got = s
+        .worker()
+        .compress(
+            &request(&sources, &s.dest, "many.zip", CompressFormat::Zip),
+            &mut Rec::default(),
+            &Cancel::new(),
+        )
+        .unwrap();
+    assert!(got.skipped.is_empty(), "{:?}", got.skipped);
+    assert_eq!(bsdtar_list(&got.path).len(), 600);
+}
+
+#[test]
+fn another_jobs_hidden_staging_folder_is_not_compressed() {
+    let s = Scratch::new("staginglike");
+    std::fs::create_dir_all(
+        s.src
+            .join("proj/.proj.zip.telamon-partial-0123456789abcdef"),
+    )
+    .unwrap();
+    std::fs::write(
+        s.src
+            .join("proj/.proj.zip.telamon-partial-0123456789abcdef/archive.part"),
+        b"half",
+    )
+    .unwrap();
+    std::fs::write(s.src.join("proj/a.txt"), b"a").unwrap();
+    let sources = [s.src.join("proj")];
+    let got = s
+        .worker()
+        .compress(
+            &request(&sources, &s.dest, "proj.zip", CompressFormat::Zip),
+            &mut Rec::default(),
+            &Cancel::new(),
+        )
+        .unwrap();
+    assert_eq!(bsdtar_list(&got.path), ["proj/", "proj/a.txt"]);
+}

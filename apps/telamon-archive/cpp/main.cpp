@@ -298,6 +298,24 @@ int main(int argc, char *argv[])
         }
         activate(backend.get(), arguments, QString());
     });
+    // The desktop file's actions, for launchers that use D-Bus activation:
+    // the same as `--extract-here` and `--extract-to-folder` with the files.
+    QObject::connect(&service, &KDBusService::activateActionRequested, backend.get(), [&](const QString &action, const QVariant &parameterValue) {
+        const QVariantList parameter = parameterValue.toList();
+        const QString option = action == QLatin1String("ExtractHere") ? QStringLiteral("--extract-here") : action == QLatin1String("ExtractToFolder") ? QStringLiteral("--extract-to-folder") : QString();
+        QStringList arguments;
+        for (const QVariant &p : parameter.mid(0, 64)) {
+            arguments << p.toString();
+        }
+        if (option.isEmpty() || arguments.isEmpty()) {
+            raise(ensureMain());
+            return;
+        }
+        raise(ensureMain());
+        arguments.prepend(QStringLiteral("--"));
+        arguments.prepend(option);
+        activate(backend.get(), arguments, QString());
+    });
     // Archive1.Open: the archive window, over the caller's window.
     QObject::connect(&api, &Archive1Core::openRequested, backend.get(), [&](const QString &path, const QString &token, const QString &parent) {
         JobsService::useToken(token);

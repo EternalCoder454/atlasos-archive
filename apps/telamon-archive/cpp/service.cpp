@@ -13,7 +13,7 @@
 #include <algorithm>
 #include <cstring>
 
-JobsService *JobsService::s_instance = nullptr;
+QAtomicPointer<JobsService> JobsService::s_instance = nullptr;
 
 namespace
 {
@@ -221,7 +221,10 @@ void JobItem::closeJob()
     if (!m_dismissed) {
         m_dismissed = true;
         Q_EMIT dismissedChanged();
-        Q_EMIT m_owner->windowsChanged();
+        m_owner->update();
+        if (m_orphan) {
+            m_owner->forget(this);
+        }
     }
 }
 
@@ -328,12 +331,13 @@ bool JobItem::answerLimitBus(bool goOn)
 JobsService::JobsService(QObject *parent)
     : QObject(parent)
 {
-    s_instance = this;
+    s_instance.storeRelease(this);
 }
 
 JobsService::~JobsService()
 {
-    s_instance = nullptr;
+    // Events that come now are dropped.
+    s_instance.storeRelease(nullptr);
 }
 
 bool JobsService::start()
@@ -343,27 +347,54 @@ bool JobsService::start()
 
 void JobsService::event(int kind, uint id, const char *arg)
 {
-    JobsService *self = s_instance;
+    JobsService *self = s_instance.loadAcquire();
     if (!self) {
         return;
     }
     QMetaObject::invokeMethod(self, "handle", Qt::QueuedConnection, Q_ARG(int, kind), Q_ARG(uint, id), Q_ARG(QByteArray, arg ? QByteArray(arg) : QByteArray()));
 }
 
-QVariantList JobsService::windows() const
+// ---- JobWindowsModel ----
+
+JobWindowsModel::JobWindowsModel(QObject *parent)
+    : QAbstractListModel(parent)
 {
-    QList<JobItem *> list;
-    for (JobItem *it : m_items) {
-        if (it->windowWanted() && !it->dismissed()) {
-            list << it;
+}
+
+int JobWindowsModel::rowCount(const QModelIndex &parent) const
+{
+    return parent.isValid() ? 0 : int(m_list.size());
+}
+
+QVariant JobWindowsModel::data(const QModelIndex &index, int role) const
+{
+    if (!index.isValid() || index.row() >= m_list.size() || role != JobRole) {
+        return {};
+    }
+    return QVariant::fromValue(m_list.at(index.row()));
+}
+
+QHash<int, QByteArray> JobWindowsModel::roleNames() const
+{
+    return {{JobRole, "job"}};
+}
+
+void JobWindowsModel::sync(const QList<JobItem *> &want)
+{
+    for (int i = int(m_list.size()) - 1; i >= 0; --i) {
+        if (!want.contains(m_list.at(i))) {
+            beginRemoveRows({}, i, i);
+            m_list.removeAt(i);
+            endRemoveRows();
         }
     }
-    std::sort(list.begin(), list.end(), [](JobItem *a, JobItem *b) { return a->id() < b->id(); });
-    QVariantList out;
-    for (JobItem *it : std::as_const(list)) {
-        out << QVariant::fromValue(it);
+    for (JobItem *it : want) {
+        if (!m_list.contains(it)) {
+            beginInsertRows({}, int(m_list.size()), int(m_list.size()));
+            m_list.append(it);
+            endInsertRows();
+        }
     }
-    return out;
 }
 
 bool JobsService::hasWindows() const
@@ -383,7 +414,24 @@ void JobsService::shutdown(int ms)
 
 void JobsService::update()
 {
+    QList<JobItem *> want;
+    for (JobItem *it : std::as_const(m_items)) {
+        if (it->windowWanted() && !it->dismissed()) {
+            want << it;
+        }
+    }
+    std::sort(want.begin(), want.end(), [](JobItem *a, JobItem *b) { return a->id() < b->id(); });
+    m_model.sync(want);
     Q_EMIT windowsChanged();
+}
+
+void JobsService::forget(JobItem *item)
+{
+    if (m_items.value(item->id()) == item) {
+        m_items.remove(item->id());
+    }
+    update();
+    item->deleteLater();
 }
 
 void JobsService::useToken(const QString &token)
@@ -456,10 +504,16 @@ void JobsService::handle(int kind, uint id, const QByteArray &arg)
         break;
     case TaRemoved:
         if (it) {
+            // The D-Bus objects go; a window still showing the result stays
+            // until it is closed.
             Q_EMIT jobRemoved(id);
-            m_items.remove(id);
-            it->deleteLater();
-            update();
+            if (it->windowWanted() && !it->dismissed()) {
+                it->m_orphan = true;
+            } else {
+                m_items.remove(id);
+                it->deleteLater();
+                update();
+            }
         }
         break;
     default:
