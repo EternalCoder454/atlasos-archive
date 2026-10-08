@@ -623,6 +623,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "telamon-archive-service"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "log",
+ "telamon-archive-core",
+ "zeroize",
+]
+
+[[package]]
 name = "telamon-archive-worker"
 version = "0.2.0"
 dependencies = [
@@ -630,6 +640,7 @@ dependencies = [
  "libc",
  "telamon-archive-core",
  "telamon-archive-engine",
+ "telamon-archive-service",
  "zeroize",
 ]
 

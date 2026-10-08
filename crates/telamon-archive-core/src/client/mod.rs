@@ -213,6 +213,12 @@ pub trait Callbacks {
     }
 }
 
+/// A front end that answers nothing and shows nothing: the safe defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoCallbacks;
+
+impl Callbacks for NoCallbacks {}
+
 /// The result of `list`.
 #[derive(Debug)]
 pub struct Listing {

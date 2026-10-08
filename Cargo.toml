@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/telamon-archive-core",
     "crates/telamon-archive-engine",
+    "crates/telamon-archive-service",
     "apps/telamon-archive-worker",
     "apps/telamon-archive-cli",
     "apps/telamon-archive",
