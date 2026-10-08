@@ -8,6 +8,7 @@
 //! Nothing here touches archive bytes: that is the worker's, through
 //! `telamon_archive_core::client`.
 
+mod json;
 mod run;
 pub mod uri;
 pub mod validate;
@@ -23,6 +24,7 @@ use telamon_archive_core::compress::{CompressFormat, Level};
 use telamon_archive_core::name;
 use zeroize::Zeroizing;
 
+pub use json::string as json_string;
 pub use validate::FileId;
 
 /// Jobs that run at once; the rest wait (extraction is disk-bound).
@@ -522,6 +524,9 @@ impl Inner {
                 match result {
                     Ok(()) => d.state = State::Done,
                     Err(client::Error::Cancelled) => d.state = State::Cancelled,
+                    // A question cut short by Cancel ends the job some other
+                    // way; the caller asked for a cancel, so that is what it was.
+                    Err(_) if job.cancel.is_cancelled() => d.state = State::Cancelled,
                     Err(e) => {
                         d.state = State::Failed;
                         d.error = run::words(&e);

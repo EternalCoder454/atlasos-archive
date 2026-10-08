@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=net.eterneon.telamon.archive
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/telamon-archive --service

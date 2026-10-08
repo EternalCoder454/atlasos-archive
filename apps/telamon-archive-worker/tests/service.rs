@@ -605,7 +605,7 @@ fn passwords_are_asked_in_the_window_never_over_the_bus() {
     // Giving up fails the job and leaves nothing.
     let id = e
         .svc
-        .extract_to(&[e.u(&a)], &e.u(&e.dest.join("..").join("dest")), opts());
+        .extract_to(&[e.u(&a)], &e.u(e.dest.join("..").join("dest")), opts());
     assert!(id.is_err(), "a path with .. is refused");
     let id = e.svc.extract_to(&[e.u(&a)], &e.u(&e.src), opts()).unwrap();
     e.wait(id, "the question", |s| s.state == State::WaitingForUser);
@@ -654,10 +654,18 @@ fn every_argument_is_checked_before_a_job_exists() {
     assert!(e.svc.extract_here(&vec![ua.clone(); 65], opts()).is_err());
     // A folder is no archive; a file is no folder.
     assert!(e.svc.extract_here(&[e.u(&e.dest)], opts()).is_err());
-    assert!(e.svc.extract_to(&[ua.clone()], &ua, opts()).is_err());
     assert!(
         e.svc
-            .extract_to(&[ua.clone()], &e.u(e.root.join("missing")), opts())
+            .extract_to(std::slice::from_ref(&ua), &ua, opts())
+            .is_err()
+    );
+    assert!(
+        e.svc
+            .extract_to(
+                std::slice::from_ref(&ua),
+                &e.u(e.root.join("missing")),
+                opts()
+            )
             .is_err()
     );
     // Devices and pipes are no archives.

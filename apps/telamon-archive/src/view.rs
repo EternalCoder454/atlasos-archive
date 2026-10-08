@@ -207,7 +207,10 @@ pub fn folder_json(tree: &Tree, id: u32) -> String {
         if n > 0 {
             out.push(',');
         }
-        out.push_str(&format!("{{\"id\":{c},\"name\":"));
+        out.push_str(&format!(
+            "{{\"id\":{c},\"token\":\"{}\",\"name\":",
+            tree.token(*c)
+        ));
         json_str(&mut out, &clean(&k.name.display));
         let (icon, size) = match k.kind {
             Kind::Dir => ("folder", count_words(k.children.len())),

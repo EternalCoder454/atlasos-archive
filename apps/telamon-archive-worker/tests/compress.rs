@@ -353,7 +353,7 @@ fn unreadable_and_odd_items_are_left_out_and_reported() {
     std::fs::write(s.src.join("Work/locked"), b"x").unwrap();
     std::fs::set_permissions(
         s.src.join("Work/locked"),
-        std::os::unix::fs::PermissionsExt::from_mode(0),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
     )
     .unwrap();
     let sources = [s.src.join("Work")];

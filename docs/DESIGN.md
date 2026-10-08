@@ -24,10 +24,10 @@ Telamon Archive replaces KDE Ark on Telamon OS. It is as simple as Windows 11's
 
 | Format | List and extract | Create | Edit (add, rename, delete) | Backend |
 |---|---|---|---|---|
-| zip (deflate, deflate64, bzip2, lzma, xz, zstd, store; ZipCrypto and WinZip AES-256 read; AES-256 write; non-UTF-8 names) | yes | yes | yes, unchanged entries raw-copied | `zip` crate |
-| 7z (solid, LZMA/LZMA2/PPMd/BCJ) | yes | yes | yes | libarchive to read; `7z` to create and edit |
+| zip (deflate, deflate64, bzip2, lzma, xz, zstd, store; ZipCrypto and WinZip AES-256 read; AES-256 write; non-UTF-8 names) | yes | yes (deflate or store since 0.3.0; AES-256 later) | yes, unchanged entries raw-copied | `zip` crate; libarchive writes (0.3.0) |
+| 7z (solid, LZMA/LZMA2/PPMd/BCJ) | yes | yes (LZMA2 or copy since 0.3.0, no passwords yet) | yes | libarchive to read and (0.3.0) to create; `7z` to edit |
 | 7z encrypted (AES-256, encrypted headers) | yes | yes | yes | `7z` |
-| tar, tar.gz/.bz2/.xz/.zst/.lz4 | yes | yes | yes, by rewriting | libarchive |
+| tar, tar.gz/.bz2/.xz/.zst/.lz4 | yes | yes (tar.gz, tar.xz, tar.zst since 0.3.0) | yes, by rewriting | libarchive |
 | gz, xz, zst, bz2, lz4 (one file) | yes | yes | no (one file) | libarchive |
 | rar 4 and 5, multi-volume | yes | no | no | libarchive |
 | rar encrypted (data or names) | yes | no | no | `unrar` (RPM Fusion nonfree, shipped in the Telamon OS image) |
@@ -74,8 +74,12 @@ Backends, vetted 2026-10-05:
   the worker protocol (both ends), the archive tree (an arena of entries, the
   model behind every view), the job model, the format table.
 - `crates/telamon-archive-engine`: runs only in the worker. libarchive FFI, the
-  zip and 7z/unrar drivers, the joined split-volume reader, and the
-  extraction writer (`openat2` below the staging folder).
+  zip and 7z/unrar drivers, the joined split-volume reader, the
+  extraction writer (`openat2` below the staging folder) and the archive
+  writer (`create.rs`).
+- `crates/telamon-archive-service`: no Qt. The Archive1 API's logic: argument
+  checks, the job queue, each job's state and questions, driven through the
+  client.
 - `apps/telamon-archive-worker`: the sandboxed process (`/usr/libexec/telamon-archive/telamon-archive-worker`, `client::SYSTEM_WORKER`).
 - `apps/telamon-archive-cli`: `telamon-archive-cli`, no Qt.
 - `apps/telamon-archive`: the GUI. CXX-Qt backend in `src/`, `cpp/main.cpp`
@@ -216,6 +220,33 @@ test, preview, create, edit) runs in a fresh `telamon-archive-worker` process:
    folder passed through it is refused. Writes to the worker never raise `SIGPIPE`
    (blocked on the writing thread), so a host that doesn't ignore it can't
    be killed by a worker that closed its end.
+
+**Creating an archive (0.3.0)** is a job of the same worker, with `Create`
+as its one request. It has no archive on descriptor 3, the staging folder on
+4 (the archive is written there, as `archive.part`), and the folders its items
+are in on 5 and up (`proto::ROOT_FD`, at most 64 and 10,000 items). The client
+opens each parent folder and checks each item is there; the worker reads the
+request before the sandbox goes up (the client wrote it; it holds no archive
+byte) so that Landlock gets one read rule for each item given, a file or a
+folder beneath it, and nothing else: it can't read the item's neighbours, run
+anything, or write outside staging. Items are read through those descriptors
+with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`,
+a link is stored as a link and never followed, devices, FIFOs and sockets are
+left out and reported, and the staging folder itself is skipped if an item
+contains it. A first pass counts the bytes and items (`Reply::Scanned`, so
+the client has a total; its clock sees it grow) and a second writes through
+libarchive's writer (zip, 7z, pax tar with a gzip, xz or zstd filter) with the
+levels Store, Fast, Normal and Best; names must be UTF-8 (others are
+reported and left out), owners are not stored, modes are `0777` and times are
+kept. libarchive's 7z writer keeps its data in a temporary file: the worker
+points `TMPDIR` into staging (`/proc/self/fd/4`), the only place it may write. The
+client watches the free space of staging's drive as for extraction, kills the worker
+on a cancel, checks that staging holds one plain file, gives it the user's
+mode, and moves it out with `renameat2(RENAME_NOREPLACE)`: a taken name is
+numbered (`name (2).zip`) when the caller didn't choose it, and asked about
+(Replace through the Trash, Skip, Keep Both) when it did. Pause and Resume
+are `SIGSTOP` and `SIGCONT` to the worker and its group, taken at the
+client's next look (100 ms).
 
 Passwords reach the worker over its request pipe, never through argv, the
 environment or a file, and `7z`/`unrar` get them on stdin. In Rust
@@ -552,7 +583,7 @@ either:
 | package `atlas-archive` | `telamon-archive` | `Obsoletes:` and `Provides: atlas-archive` |
 | `net.eterneon.atlas.archive.desktop` | `net.eterneon.telamon.archive.desktop` | the old file stays, hidden (`NoDisplay=true`), with the same `MimeType=` list (Explorer reads it) and `Exec=telamon-archive`, so mimeapps defaults that name it still open the app |
 | `kio/servicemenus/net.eterneon.atlas.archive.desktop` | `.../net.eterneon.telamon.archive.desktop` | the old file stays with no actions, so the right-click actions are not shown twice |
-| D-Bus `net.eterneon.atlas.archive` at `/net/eterneon/atlas/archive` | `net.eterneon.telamon.archive` at `/net/eterneon/telamon/archive` | the running instance owns both names; `org.freedesktop.Application` answers on both (`cpp/main.cpp`). The `Archive1` interface below is served as `net.eterneon.atlas.Archive1` too when it lands, with the same objects (`.../atlas/archive/job/<n>`, `net.eterneon.atlas.Archive1.Job`) and error names |
+| D-Bus `net.eterneon.atlas.archive` at `/net/eterneon/atlas/archive` | `net.eterneon.telamon.archive` at `/net/eterneon/telamon/archive` | the running instance owns both names; `org.freedesktop.Application` answers on both (`cpp/main.cpp`). The `Archive1` interface below is served as `net.eterneon.atlas.Archive1` too (since 0.3.0), with the same jobs as objects of their own (`.../atlas/archive/job/<n>`, `net.eterneon.atlas.Archive1.Job`) and the error names under `net.eterneon.atlas.Archive1.Error.`; `net.eterneon.atlas.archive` also has its own bus activation file |
 | drag type `application/x-atlas-archive-entries` | `application/x-telamon-archive-entries` | a drop carrying either is accepted, and a drag carries both |
 | `atlas-archive:` KIO worker (not built yet) | `telamon-archive:` | the old scheme is registered with it |
 | `~/.config/atlas-archiverc` | `telamon-archiverc` | copied once by the framework (`[Atlas]` becomes `[Telamon]`) |
@@ -565,56 +596,123 @@ new ones.
 
 ### D-Bus: `net.eterneon.telamon.Archive1` at `/net/eterneon/telamon/archive`
 
-Every method takes `file://` URIs (absolute, local, no NUL; others are
-refused with `net.eterneon.telamon.Archive1.Error.InvalidArgs`) and an
-`a{sv}` of options. Known options: `activation_token` (s, for focus),
+Served by the app itself (0.3.0): the methods hang off the object that
+`KDBusService` exports, so `org.freedesktop.Application` and `Archive1` share
+a path; the old names have theirs (`/net/eterneon/atlas/archive`). The logic
+is `crates/telamon-archive-service` (no Qt: arguments, queue, jobs, state), the
+bus is `cpp/archive1.cpp`, the windows are `qml/JobWindow.qml`.
+
+**Activation.** The RPM installs `dbus-1/services/net.eterneon.telamon.archive.service`
+(and one for `net.eterneon.atlas.archive`) with `Exec=/usr/bin/telamon-archive --service`.
+`--service` starts the program with no window: the archive window is made
+only when something asks for it (`Open`, `org.freedesktop.Application`, a
+launch with files), and job windows only when a job has something to show.
+The program exits when it has no visible window and no job (a finished job
+is kept for 60 s for its caller) for 5 s. It owns its names before it reads
+a call, so a caller's call waits on the bus until it can be answered.
+
+Every method takes `file://` URIs (absolute, local, no NUL, no `.` or `..`
+parts, at most 8 KiB; others are refused with
+`net.eterneon.telamon.Archive1.Error.InvalidArgs`) and an `a{sv}` of options.
+Known options: `activation_token` (s, for focus: `xdg-activation` on Wayland),
 `parent_window` (s, `wayland:<xdg-foreign handle>` or `x11:<hex id>`, so our
-dialogs stack on the caller's window), `show_progress` (b, default true;
-Explorer passes false and shows the job in its own queue). Unknown keys are
-ignored. A call returns as soon as the job is queued; at most 16 jobs wait at
-once, and past that a call fails with
-`net.eterneon.telamon.Archive1.Error.TooManyJobs` (Explorer says "Archive is
-busy, try again when a job finishes" and doesn't retry by itself).
+windows stack on the caller's window; anything else is dropped),
+`show_progress` (b, default true; Explorer passes false for jobs and shows
+them in its own queue; our window still comes up for a question). Unknown
+keys are ignored, and so is a value of the wrong type or a token that isn't
+printable ASCII. Arguments are checked before a job exists: archives must be
+regular files that can be read (a link to one is the archive; the file's
+device and inode are remembered, and a job that finds another file under the
+name when its turn comes stops), folders must be folders that can be written,
+items to compress must exist (a link counts as itself), `Compress` refuses two
+items of one name, an unknown format, a destination that is a folder or one
+of the items. At most 64 archives or 10,000 items in a call. A call returns
+as soon as the job exists; **at most 2 jobs run and 16 wait** (queued, or a
+dialog waiting for its answer), and past that a call fails with
+`net.eterneon.telamon.Archive1.Error.TooManyJobs` ("Archive is busy. Try
+again when a job finishes."; Explorer doesn't retry by itself).
 
 | Method | Does |
 |---|---|
-| `ExtractHere(as archives, a{sv}) → o job` | Extract here, as above |
+| `ExtractHere(as archives, a{sv}) → o job` | Extract here, as above, one archive after another in one job |
 | `ExtractTo(as archives, s folder, a{sv}) → o job` | Extract each to `<folder>/<name>/`; `folder` empty means next to the archive ("Extract to <name>/") |
-| `ExtractAll(as archives, a{sv})` | The Extract All dialog: asks once where, defaults to `<name>/` next to it |
-| `ExtractEntries(s archive, as entries, s folder, a{sv}) → o job` | The drop half of drag-out |
-| `Compress(as files, s format, s destination, a{sv}) → o job` | `format`: `zip`, `7z`, `tar.gz`, `tar.xz`, `tar.zst`, at Normal level, no password. `destination` empty: `<name>.<ext>` next to the first item, `Archive.<ext>` for several, ` (2)` on a clash |
-| `CompressDialog(as files, a{sv})` | The Compress… dialog: name, place, format, level, password, split size |
-| `Test(as archives, a{sv}) → o job` | Integrity test with a result window |
+| `ExtractAll(as archives, a{sv}) → o job` | The Extract All dialog: asks once where, defaults to the archive's own folder (`<name>/` goes in it). The job exists at once in `waiting-for-user` with `Question` "dialog"; OK in the dialog starts it, Cancel in the dialog (or `Cancel()`) ends it as `cancelled` |
+| `ExtractEntries(s archive, as entries, s folder, a{sv}) → o job` | The drop half of drag-out (below) |
+| `Compress(as files, s format, s destination, a{sv}) → o job` | `format`: `zip`, `7z`, `tar.gz`, `tar.xz`, `tar.zst`, at Normal level, no password. `destination` empty: `<name>.<ext>` next to the first item, where `<name>` is a folder's name or a file's name without its extension (`report.pdf` becomes `report.zip`), `Archive.<ext>` for several, ` (2)` on a clash. A destination is used as given (the format's extension is added if it lacks it) and a clash asks |
+| `CompressDialog(as files, a{sv}) → o job` | The Compress… dialog: name, place, format, level; like `ExtractAll`, the job waits in `waiting-for-user` (`Question` "dialog") until the dialog is answered. (Password and split size are not offered yet.) |
+| `Test(as archives, a{sv}) → o job` | Integrity test; the job window is the result window |
 | `Open(s archive, a{sv})` | The Archive window |
 
+Before 0.3.0 `ExtractAll` and `CompressDialog` returned nothing; a caller that
+ignores their return still works, and one that follows the job gets
+progress, Pause/Resume/Cancel and the `results` to select, as for every
+other method.
+
 A password is never a D-Bus argument: when one is needed, the job's own
-window asks for it.
+window asks for it (the job is `waiting-for-user`, `Question` "password");
+there is no method on the job that takes one.
 
 Job objects, `/net/eterneon/telamon/archive/job/<n>`, interface
-`net.eterneon.telamon.Archive1.Job`:
+`net.eterneon.telamon.Archive1.Job` (the same jobs are objects under
+`/net/eterneon/atlas/archive/job/<n>` with `net.eterneon.atlas.Archive1.Job`):
 
-- properties (with `PropertiesChanged`, at most 10 a second): `Title` (s),
-  `State` (s: `queued`, `running`, `paused`, `waiting-for-user`, `done`,
-  `failed`, `cancelled`), `ProcessedBytes` (t), `TotalBytes` (t, 0 unknown),
-  `ProcessedItems` (u), `TotalItems` (u, 0 unknown), `Error` (s, plain words; it can hold archive names, with paths escaped, so it is plain text and every front end shows it with `Text.PlainText`)
-- methods: `Pause()`, `Resume()` (`SIGSTOP`/`SIGCONT` to the worker),
-  `Cancel()`
+- properties (with `PropertiesChanged`, at most 10 a second per job, the last
+  change always sent before `Finished`): `Title` (s), `State` (s: `queued`,
+  `running`, `paused`, `waiting-for-user`, `done`, `failed`, `cancelled`),
+  `ProcessedBytes` (t), `TotalBytes` (t, 0 unknown), `ProcessedItems` (u),
+  `TotalItems` (u, 0 unknown), `Error` (s, plain words; it can hold archive
+  names, so it is plain text and every front end shows it with
+  `Text.PlainText`), and, new in 0.3.0, `Kind` (s: `extract`,
+  `extract-entries`, `compress`, `test`), `Question` (s: "" for none,
+  `password`, `limit`, `conflict`, `dialog`), `QuestionText` (s) and
+  `Results` (as, the URIs made so far)
+- methods: `Pause()`, `Resume()` (`SIGSTOP`/`SIGCONT` to the worker's group;
+  a queued job is held back; progress doesn't move while paused), `Cancel()`
+  (the worker is killed and nothing is left in the destination), and, new,
+  `AnswerConflict(s action, b all) → b` (`replace`, `skip` or `keep-both`;
+  Replace moves the old item to the Trash) and `AnswerLimit(b go_on) → b` for
+  a caller that can answer a question without our window (`true` when the
+  job took the answer; the window can answer too, whoever is first). A
+  question always brings our window up as well, so a caller that can't
+  answer loses nothing.
 - signal: `Finished(s state, as results)`, `results` being the URIs of what
-  was made (for Explorer to select)
+  was made (for Explorer to select): an extraction's folders or items, the
+  archive. Sent once, after the last property change. Programs that listen
+  for it from before the call don't miss a job that ends quickly.
 
-Job objects disappear 60 s after they finish.
+Job objects disappear 60 s after they finish. The app only exits after that.
+
+**Drag-out and `ExtractEntries`.** Archive's window starts a drag with
+`application/x-telamon-archive-entries` (and the same bytes as
+`application/x-atlas-archive-entries`) holding JSON:
+`{"version":1,"archive":"file:///path/photos.zip","entries":["12-1a2b3c4d","15-0d9e8f7a"]}`.
+Each entry is an opaque token naming one item shown in the window (a node of
+the archive's tree and a hash of its path, so a token from another listing,
+or after the archive changed, names nothing). A receiver that understands the
+type calls `ExtractEntries(archive, entries, folder, {})` with the `archive`
+URI and the tokens unchanged and `folder` the `file://` URI of the folder
+dropped on. The items must be in one folder of the archive (as a window shows
+them); each lands directly in `folder` (a folder with what is inside it), a
+taken name asks like Extract here, and the job's `results` are the placed
+items. Items the safety rules take out are listed in the job window.
+`text/uri-list` is not carried yet (nothing is extracted until the drop), so
+other targets get nothing from this drag.
+
+Where a call is waiting on the user: Explorer saw `waiting-for-user` and says
+once "Telamon Archive needs an answer from you".
 
 How Explorer uses it (agreed with the Explorer session, 2026-10-05): it
 always passes `activation_token` and `parent_window` and `show_progress`
-false, and drives Pause, Resume and Cancel through the Job interface;
-"Extract To…" is `ExtractAll` (our dialog, no picker of its own); drops of
-`application/x-telamon-archive-entries` on a local folder, tab, breadcrumb
-segment or sidebar place call `ExtractEntries(archive, ids, folder, {})`
-with the entry ids kept opaque, `text/uri-list` being the fallback for
-other targets. A later `List(s archive, s inner_path)` for Quick Look on an
-archive (a top-level listing capped at 200 entries plus a total count) is
-wanted but low priority; changing a signature here means telling Explorer
-first.
+false for jobs, and drives Pause, Resume and Cancel through the Job
+interface; "Extract To…" is `ExtractAll` (our dialog, no picker of its own;
+the returned job is followed for progress and the result is selected);
+drops of `application/x-telamon-archive-entries` on a local folder, tab,
+breadcrumb segment or sidebar place call `ExtractEntries(archive, ids,
+folder, {})` with the entry tokens kept opaque, `text/uri-list` being the
+fallback for other targets. A later `List(s archive, s inner_path)` for Quick
+Look on an archive (a top-level listing capped at 200 entries plus a total
+count) is wanted but low priority; changing a signature here means telling
+Explorer first.
 
 ### CLI: `telamon-archive-cli`
 
@@ -701,8 +799,11 @@ The GUI thread never blocks. Each job has one thread that drives its worker
 over the pipes; listing results are folded into the tree on that thread and
 handed to the GUI with `qt_thread().queue` in batches (every 50 ms or 5,000
 entries). Questions (password, limits, name clashes) park the job thread on a
-channel until the GUI answers. Two jobs at once by default (queue beyond
-that), since extraction is disk-bound.
+channel until the GUI answers. Two jobs at once (the rest wait, at most 16 of them), since
+extraction is disk-bound. API jobs run in the job service
+(`crates/telamon-archive-service`) on threads of their own and tell the GUI
+thread through events; the window's own extraction (`src/job.rs`) is the
+same client with the same worker.
 
 ## Look
 

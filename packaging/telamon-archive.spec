@@ -12,7 +12,7 @@
 %endif
 
 Name:           telamon-archive
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Telamon Archive, the archive manager of Telamon OS
 License:        MIT
@@ -67,8 +67,8 @@ Requires:       7zip
 
 %description
 Telamon Archive opens archives as folders you can browse, preview and drag
-files out of, extracts them with one click and creates ZIP (with AES-256), 7z
-and tar archives. It reads RAR, ISO, cab, cpio, deb and rpm files too. Every
+files out of, extracts them with one click and creates ZIP, 7z and tar
+archives. It reads RAR, ISO, cab, cpio, deb and rpm files too. Every
 archive is parsed in a sandboxed worker that can only write into the folder
 being extracted to.
 
@@ -151,6 +151,13 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/net.eterneon.atlas.ar
 [ "$(grep '^MimeType=' %{buildroot}%{_datadir}/applications/net.eterneon.atlas.archive.desktop)" = \
   "$(grep '^MimeType=' %{buildroot}%{_datadir}/applications/net.eterneon.telamon.archive.desktop)" ]
 ! grep -q '^Actions=' %{buildroot}%{_datadir}/kio/servicemenus/net.eterneon.atlas.archive.desktop
+# The bus starts the program for an API call, headless, under both names.
+for n in net.eterneon.telamon.archive net.eterneon.atlas.archive; do
+    f=%{buildroot}%{_datadir}/dbus-1/services/$n.service
+    [ "$(grep '^Name=' $f)" = "Name=$n" ]
+    [ "$(grep '^Exec=' $f)" = "Exec=%{_bindir}/telamon-archive --service" ]
+done
+grep -q '^DBusActivatable=true' %{buildroot}%{_datadir}/applications/net.eterneon.telamon.archive.desktop
 appstream-util validate-relax --nonet \
     %{buildroot}%{_datadir}/metainfo/net.eterneon.telamon.archive.metainfo.xml
 
@@ -162,6 +169,7 @@ appstream-util validate-relax --nonet \
 %{_libexecdir}/telamon-archive/telamon-archive-worker
 %{_datadir}/applications/net.eterneon.telamon.archive.desktop
 %{_datadir}/kio/servicemenus/net.eterneon.telamon.archive.desktop
+%{_datadir}/dbus-1/services/net.eterneon.telamon.archive.service
 %{_datadir}/metainfo/net.eterneon.telamon.archive.metainfo.xml
 %{_datadir}/icons/hicolor/scalable/apps/net.eterneon.telamon.archive.svg
 # Until 0.2.0's names, for one release (data/legacy)
@@ -169,8 +177,20 @@ appstream-util validate-relax --nonet \
 %{_bindir}/atlas-archive-cli
 %{_datadir}/applications/net.eterneon.atlas.archive.desktop
 %{_datadir}/kio/servicemenus/net.eterneon.atlas.archive.desktop
+%{_datadir}/dbus-1/services/net.eterneon.atlas.archive.service
 
 %changelog
+* Thu Oct 08 2026 EternalHell <77252745+EternalCoder454@users.noreply.github.com> - 0.3.0-1
+- The Archive1 D-Bus API (net.eterneon.telamon.Archive1, and the old
+  net.eterneon.atlas.Archive1): ExtractHere, ExtractTo, ExtractAll,
+  ExtractEntries, Compress, CompressDialog, Test and Open, with job objects
+  that report progress and take Pause, Resume and Cancel
+- The bus starts the program without a window for an API call (new
+  dbus-1 service files); it exits when it is idle
+- Compress to ZIP, 7z, TAR.GZ, TAR.XZ and TAR.ZST through the sandboxed
+  worker, and the Extract All and Compress dialogs
+- Archive's window starts a drag with application/x-telamon-archive-entries
+
 * Wed Oct 07 2026 EternalHell <77252745+EternalCoder454@users.noreply.github.com> - 0.2.0-1
 - Renamed to Telamon Archive (telamon-archive, net.eterneon.telamon.archive),
   on Telamon.Ui 2.0.0; replaces atlas-archive

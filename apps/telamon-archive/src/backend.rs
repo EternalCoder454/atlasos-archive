@@ -88,6 +88,10 @@ pub mod qobject {
         #[cxx_name = "goTo"]
         fn go_to(self: Pin<&mut Backend>, id: i32);
 
+        /// Forgets the open archive and the job: the window closed.
+        #[qinvokable]
+        fn reset(self: Pin<&mut Backend>);
+
         /// Extracts the whole archive into `<folder>/<name>/`.
         #[qinvokable]
         #[cxx_name = "extractAll"]
@@ -292,6 +296,34 @@ impl qobject::Backend {
                 }
             }
         }
+    }
+
+    pub fn reset(mut self: Pin<&mut Self>) {
+        if let Some(c) = self.as_mut().rust_mut().control.take() {
+            c.cancel.cancel();
+        }
+        {
+            let mut r = self.as_mut().rust_mut();
+            // Whatever the stopped job reports is dropped.
+            r.generation = r.generation.wrapping_add(1);
+            r.tree = None;
+            r.archive = None;
+            r.secret = None;
+            r.current = ROOT;
+            r.history.clear();
+            r.queue.clear();
+            r.clash_all = None;
+        }
+        self.as_mut().set_view(QString::default());
+        self.as_mut().set_job_state(QString::default());
+        self.as_mut().set_question(QString::default());
+        self.as_mut().set_open_error(QString::default());
+        self.as_mut().set_notice(QString::default());
+        self.as_mut().set_broken(QString::default());
+        self.as_mut().set_folder(QString::default());
+        self.as_mut().set_job_only(false);
+        self.as_mut().set_archive_path(QString::default());
+        self.as_mut().set_archive_name(QString::default());
     }
 
     pub fn open_archive(self: Pin<&mut Self>, location: &QString) {
