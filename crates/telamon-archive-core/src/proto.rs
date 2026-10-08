@@ -31,6 +31,13 @@ pub const MAX_LISTING: u64 = 256 * 1024 * 1024;
 pub const MAX_STRING: usize = 64 * 1024;
 /// The most entry indices one Extract request may select (what the tree holds).
 pub const MAX_SELECTED: usize = 1_000_000;
+/// The most top-level items one Create request names.
+pub const MAX_SOURCES: usize = 10_000;
+/// The most source folders one Create request is given (one descriptor each,
+/// from `ROOT_FD` up).
+pub const MAX_ROOTS: usize = 64;
+/// The first descriptor of a Create job's source folders.
+pub const ROOT_FD: i32 = 5;
 /// The longest password the client accepts, in bytes: far under `MAX_FRAME`,
 /// so a password always fits its request.
 pub const MAX_PASSWORD: usize = 64 * 1024;
@@ -256,6 +263,16 @@ impl<'a> Dec<'a> {
 
 // ---- requests: client to worker ----
 
+/// One item to compress: a name in one of the source folders (the folder
+/// descriptors are passed from `ROOT_FD` up, `root` counting from 0). The
+/// name is the item's own, one component; it is also the first component of
+/// its path inside the archive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub root: u32,
+    pub name: Vec<u8>,
+}
+
 /// What the client asks of the worker. The archive and staging descriptors
 /// were passed when it started.
 #[derive(Clone, PartialEq, Eq)]
@@ -274,6 +291,16 @@ pub enum Request {
     },
     /// Read every entry and check it, writing nothing.
     Test,
+    /// Make an archive from the sources, into a file `out_name` in the
+    /// staging folder.
+    Create {
+        /// `CompressFormat::label`.
+        format: String,
+        /// `Level::tag`.
+        level: u8,
+        out_name: String,
+        sources: Vec<Source>,
+    },
     /// The password the worker asked for.
     Password(Zeroizing<Vec<u8>>),
     /// The answer to `Reply::Limit`: go on past it, or stop.
@@ -295,6 +322,17 @@ impl fmt::Debug for Request {
                 .field("raw_name", raw_name)
                 .finish(),
             Request::Test => f.write_str("Test"),
+            Request::Create {
+                format,
+                level,
+                sources,
+                ..
+            } => f
+                .debug_struct("Create")
+                .field("format", format)
+                .field("level", level)
+                .field("sources", &sources.len())
+                .finish(),
             Request::Password(_) => f.write_str("Password(<redacted>)"),
             Request::GoOn(v) => f.debug_tuple("GoOn").field(v).finish(),
         }
@@ -349,6 +387,18 @@ impl Request {
             Request::Test => {
                 e.u8(3);
             }
+            Request::Create {
+                format,
+                level,
+                out_name,
+                sources,
+            } => {
+                e.u8(6).text(format).u8(*level).text(out_name);
+                e.u32(sources.len() as u32);
+                for s in sources {
+                    e.u32(s.root).bytes(&s.name);
+                }
+            }
             Request::Password(p) => {
                 // Sized up front so the password is never copied by a
                 // growing Vec into memory that isn't wiped.
@@ -395,6 +445,32 @@ impl Request {
                 }
             }
             3 => Request::Test,
+            6 => {
+                let format = d.text()?;
+                let level = d.u8()?;
+                let out_name = d.text()?;
+                let n = d.count(8)?;
+                if n > MAX_SOURCES {
+                    return Err(ProtoError::TooLarge);
+                }
+                let mut sources = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let root = d.u32()?;
+                    if root as usize >= MAX_ROOTS {
+                        return Err(ProtoError::TooLarge);
+                    }
+                    sources.push(Source {
+                        root,
+                        name: d.bytes()?.to_vec(),
+                    });
+                }
+                Request::Create {
+                    format,
+                    level,
+                    out_name,
+                    sources,
+                }
+            }
             4 => {
                 // No length cap but the frame's: a password is not a name.
                 let len = d.u32()? as usize;
@@ -545,6 +621,15 @@ pub enum Reply {
     SkippedMore {
         count: u64,
     },
+    /// What a Create job found to compress, once it has looked at everything:
+    /// the bytes of file data and the number of items. Sent first, and
+    /// repeated while the worker is still looking (`done` false, the figures
+    /// only grow), so the client's clock sees it advance.
+    Scanned {
+        bytes: u64,
+        items: u64,
+        done: bool,
+    },
     /// The job finished. `written`: the top-level names it wrote in staging.
     Done {
         written: Vec<Vec<u8>>,
@@ -615,6 +700,9 @@ impl Reply {
             Reply::Failed { reason } => {
                 e.u8(9).text(reason);
             }
+            Reply::Scanned { bytes, items, done } => {
+                e.u8(11).u64(*bytes).u64(*items).bool(*done);
+            }
         }
         e.0
     }
@@ -674,6 +762,11 @@ impl Reply {
             }
             9 => Reply::Failed { reason: d.text()? },
             10 => Reply::SkippedMore { count: d.u64()? },
+            11 => Reply::Scanned {
+                bytes: d.u64()?,
+                items: d.u64()?,
+                done: d.bool()?,
+            },
             t => return Err(ProtoError::BadTag(t)),
         };
         d.end()?;
@@ -737,6 +830,11 @@ mod tests {
             },
             Reply::Failed { reason: "x".into() },
             Reply::SkippedMore { count: u64::MAX },
+            Reply::Scanned {
+                bytes: 5,
+                items: 6,
+                done: true,
+            },
         ]
     }
 
@@ -817,12 +915,48 @@ mod tests {
                 raw_name: String::new(),
             },
             Request::Test,
+            Request::Create {
+                format: "zip".into(),
+                level: 2,
+                out_name: "out.part".into(),
+                sources: vec![
+                    Source {
+                        root: 0,
+                        name: b"a b".to_vec(),
+                    },
+                    Source {
+                        root: 63,
+                        name: b"\xff".to_vec(),
+                    },
+                ],
+            },
             Request::Password(Zeroizing::new(b"hunter2".to_vec())),
             Request::Password(Zeroizing::new(vec![])),
             Request::GoOn(true),
         ] {
             assert_eq!(Request::decode(&r.encode()).unwrap(), r);
         }
+    }
+
+    #[test]
+    fn a_create_request_is_bounded() {
+        let frame = |roots: &[u32]| {
+            let mut e = Enc::default();
+            e.u8(6).text("zip").u8(2).text("o").u32(roots.len() as u32);
+            roots.iter().for_each(|&r| {
+                e.u32(r).bytes(b"x");
+            });
+            e.0
+        };
+        assert!(Request::decode(&frame(&[0, 63])).is_ok());
+        assert!(Request::decode(&frame(&[64])).is_err());
+        // Too many sources for one request, far under a frame's bytes.
+        let many = vec![0u32; MAX_SOURCES + 1];
+        assert!(Request::decode(&frame(&many)).is_err());
+        assert!(Request::decode(&frame(&many[..MAX_SOURCES])).is_ok());
+        let mut cut = frame(&[0]);
+        cut.pop();
+        assert!(Request::decode(&cut).is_err());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 pub mod audit;
 pub mod client;
+pub mod compress;
 pub mod limits;
 pub mod link;
 pub mod name;

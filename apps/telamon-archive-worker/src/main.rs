@@ -7,6 +7,12 @@
 //! `Extract` (during which `GoOn` answers a `Limit`). The last reply is
 //! always `Listed`, `Done`, `NeedPassword` or `Failed`; anything else means
 //! the worker died, and the client says so.
+//!
+//! A job that makes an archive (`Create`) has no archive on 3. It gets the
+//! staging folder on 4 and the folders its sources are in on 5 and up
+//! (`proto::ROOT_FD`). Its one request names those sources; the client wrote
+//! it (it is no archive byte), so it is read before the sandbox goes up, to
+//! give Landlock a read rule for each source and nothing else.
 
 mod sandbox;
 mod seccomp;
@@ -14,12 +20,14 @@ mod seccomp;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 
+use telamon_archive_core::compress::{CompressFormat, Level};
 use telamon_archive_core::limits::Limits;
 use telamon_archive_core::name::NameEncoding;
-use telamon_archive_core::proto::{Reply, Request};
+use telamon_archive_core::proto::{MAX_ROOTS, ROOT_FD, Reply, Request, Source};
+use telamon_archive_engine::create::{self, CreateJob};
 use telamon_archive_engine::extract::read_umask;
 use telamon_archive_engine::job::{self, Conn, ExtractJob, Pipes};
 use telamon_archive_engine::log_line;
@@ -44,6 +52,19 @@ fn take(fd: RawFd) -> Option<OwnedFd> {
     }
 }
 
+/// The source folders of a Create job: the open descriptors from `ROOT_FD`
+/// up, as far as they run without a gap.
+fn take_roots() -> Vec<OwnedFd> {
+    let mut roots = Vec::new();
+    for fd in ROOT_FD..ROOT_FD + MAX_ROOTS as RawFd {
+        match take(fd) {
+            Some(r) => roots.push(r),
+            None => break,
+        }
+    }
+    roots
+}
+
 fn is_tty(fd: RawFd) -> bool {
     // SAFETY: isatty only inspects the descriptor.
     unsafe { libc::isatty(fd) == 1 }
@@ -66,7 +87,14 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     // Before anything else: nothing inherited past the contract stays open.
-    sandbox::close_others(STAGING + 1);
+    let roots_open = (ROOT_FD..ROOT_FD + MAX_ROOTS as RawFd)
+        .take_while(|&fd| {
+            // SAFETY: F_GETFD takes no pointer.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+        })
+        .count();
+    sandbox::close_others(ROOT_FD + roots_open as RawFd);
+    let roots = take_roots();
     let (Some(requests), Some(replies)) = (take(REQUESTS), take(REPLIES)) else {
         log_line!("no request or reply pipe");
         return ExitCode::from(2);
@@ -93,14 +121,38 @@ fn main() -> ExitCode {
     // Only a folder: a rule for anything else would give Landlock rights
     // it can't apply.
     let staging = take(STAGING).filter(|s| kind_of(s) == Some(libc::S_IFDIR));
-    if let Err(reason) = sandbox::enter(staging.as_ref().map(AsFd::as_fd)) {
+    // A Create job: its request, now, and what the sandbox may read.
+    let mut create_job = None;
+    let mut reads = Vec::new();
+    if !roots.is_empty() {
+        match first_create(&mut conn, &roots) {
+            Ok(job) => {
+                reads = job.reads(&roots);
+                create_job = Some(job);
+            }
+            Err(reason) => {
+                let _ = conn.send(&Reply::Failed {
+                    reason: reason.clone(),
+                });
+                log_line!("{reason}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let read_rules: Vec<(BorrowedFd<'_>, bool)> =
+        reads.iter().map(|r| (r.0.as_fd(), r.1)).collect();
+    if let Err(reason) = sandbox::enter(staging.as_ref().map(AsFd::as_fd), &read_rules) {
         let _ = conn.send(&Reply::Failed {
             reason: reason.clone(),
         });
         log_line!("{reason}");
         return ExitCode::from(2);
     }
-    match run(&mut conn, archive, staging) {
+    let ran = match create_job {
+        Some(job) => run_create(&mut conn, job, roots, staging),
+        None => run(&mut conn, archive, staging),
+    };
+    match ran {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // A broken pipe or a bad frame: the client has gone or is not
@@ -109,6 +161,105 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A Create request, checked.
+struct Creating {
+    format: CompressFormat,
+    level: Level,
+    out_name: String,
+    sources: Vec<Source>,
+}
+
+impl Creating {
+    /// What the sandbox may read: each source folder or file, by an `O_PATH`
+    /// descriptor made now, and whether it is a folder. Links and the rest are
+    /// read by `readlinkat` and `fstatat`, which Landlock doesn't gate.
+    fn reads(&self, roots: &[OwnedFd]) -> Vec<(OwnedFd, bool)> {
+        let mut out = Vec::new();
+        for s in &self.sources {
+            let Some(root) = roots.get(s.root as usize) else {
+                continue;
+            };
+            let Ok(name) = std::ffi::CString::new(s.name.clone()) else {
+                continue;
+            };
+            // SAFETY: a valid folder descriptor and C string.
+            let fd = unsafe {
+                libc::openat(
+                    root.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                continue;
+            }
+            // SAFETY: a new descriptor we own.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            match kind_of(&fd) {
+                Some(libc::S_IFDIR) => out.push((fd, true)),
+                Some(libc::S_IFREG) => out.push((fd, false)),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// Reads the one request of a Create job and checks it against what was
+/// passed. Before the sandbox: the client wrote it.
+fn first_create(conn: &mut impl Conn, roots: &[OwnedFd]) -> Result<Creating, String> {
+    let bad = || "The request to make an archive wasn't valid.".to_string();
+    let Some(Request::Create {
+        format,
+        level,
+        out_name,
+        sources,
+    }) = conn.recv().map_err(|_| bad())?
+    else {
+        return Err(bad());
+    };
+    let (Some(format), Some(level)) = (CompressFormat::from_label(&format), Level::from_tag(level))
+    else {
+        return Err(bad());
+    };
+    if sources.is_empty()
+        || sources
+            .iter()
+            .any(|s| s.root as usize >= roots.len() || !create::good_name(&s.name))
+        || !create::good_name(out_name.as_bytes())
+    {
+        return Err(bad());
+    }
+    Ok(Creating {
+        format,
+        level,
+        out_name,
+        sources,
+    })
+}
+
+fn run_create(
+    conn: &mut impl Conn,
+    job: Creating,
+    roots: Vec<OwnedFd>,
+    staging: Option<OwnedFd>,
+) -> io::Result<()> {
+    let Some(staging) = staging else {
+        return fail(conn, "No folder was given to make the archive in.");
+    };
+    create::create(
+        conn,
+        CreateJob {
+            roots,
+            sources: job.sources,
+            staging,
+            out_name: job.out_name,
+            format: job.format,
+            level: job.level,
+        },
+    )
 }
 
 fn fail(conn: &mut impl Conn, reason: &str) -> io::Result<()> {
@@ -186,6 +337,8 @@ fn run(conn: &mut impl Conn, archive: Option<OwnedFd>, staging: Option<OwnedFd>)
                 },
             )
         }
-        Request::Password(_) | Request::GoOn(_) => fail(conn, "The request came out of turn."),
+        Request::Password(_) | Request::GoOn(_) | Request::Create { .. } => {
+            fail(conn, "The request came out of turn.")
+        }
     }
 }

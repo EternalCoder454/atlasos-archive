@@ -526,6 +526,7 @@ impl<'a> Job<'a> {
             match &req.mode {
                 Mode::ExtractHere => "here".to_string(),
                 Mode::ExtractTo { name } => format!("folder {}", term::safe(name)),
+                Mode::Items { .. } => "selected items".to_string(),
             },
             req.selection
                 .as_ref()

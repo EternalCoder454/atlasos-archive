@@ -71,19 +71,19 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 const BATCH_BYTES: usize = 256 * 1024;
 /// The most entries one listing holds: what the client's tree holds.
 const MAX_LISTED: usize = telamon_archive_core::tree::MAX_NODES;
-const OUT_OF_TURN: &str = "The request came out of turn.";
+pub(crate) const OUT_OF_TURN: &str = "The request came out of turn.";
 /// Per-entry errors logged in one job; the rest are counted.
 const MAX_LOGGED: u32 = 50;
 
 /// The progress clock: `due` is true at most every `PROGRESS_EVERY`.
-struct Clock(Instant);
+pub(crate) struct Clock(Instant);
 
 impl Clock {
-    fn new() -> Clock {
+    pub(crate) fn new() -> Clock {
         Clock(Instant::now())
     }
 
-    fn due(&mut self) -> bool {
+    pub(crate) fn due(&mut self) -> bool {
         #[cfg(test)]
         let every = EVERY_FOR_TESTS.with(std::cell::Cell::get);
         #[cfg(not(test))]
@@ -104,7 +104,7 @@ thread_local! {
 }
 
 /// Sends `Progress`; a request nobody asked for fails the job.
-fn progress(conn: &mut impl Conn, bytes: u64, items: u64) -> io::Result<()> {
+pub(crate) fn progress(conn: &mut impl Conn, bytes: u64, items: u64) -> io::Result<()> {
     if conn.unexpected_request()? {
         return Err(io::Error::new(io::ErrorKind::InvalidData, OUT_OF_TURN));
     }
@@ -546,13 +546,18 @@ fn stop_reply(stop: Stop) -> Reply {
 /// can't make the worker (or the client) handle a million of them. The rest
 /// are counted and sent as one `SkippedMore`.
 #[derive(Default)]
-struct SkipOut {
+pub(crate) struct SkipOut {
     sent: usize,
     more: u64,
 }
 
 impl SkipOut {
-    fn send(&mut self, conn: &mut impl Conn, index: u32, reason: String) -> io::Result<()> {
+    pub(crate) fn send(
+        &mut self,
+        conn: &mut impl Conn,
+        index: u32,
+        reason: String,
+    ) -> io::Result<()> {
         if self.sent < MAX_SKIPPED {
             self.sent += 1;
             conn.send(&Reply::Skipped { index, reason })
@@ -562,7 +567,7 @@ impl SkipOut {
         }
     }
 
-    fn finish(self, conn: &mut impl Conn, more: u64) -> io::Result<()> {
+    pub(crate) fn finish(self, conn: &mut impl Conn, more: u64) -> io::Result<()> {
         let count = self.more.saturating_add(more);
         if count > 0 {
             conn.send(&Reply::SkippedMore { count })?;

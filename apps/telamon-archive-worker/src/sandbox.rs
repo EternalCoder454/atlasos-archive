@@ -67,10 +67,13 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> Result<(), String> 
 }
 
 /// Locks the process down: no new privileges, no core dumps, resource
-/// limits, the C.UTF-8 locale, Landlock (read `/usr`; write only below
+/// limits, the C.UTF-8 locale, Landlock (read `/usr` and `reads`; write only below
 /// `staging`; run nothing; no network, no signals or abstract sockets
 /// outside), then the system call filter (`seccomp`).
-pub fn enter(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
+pub fn enter(
+    staging: Option<BorrowedFd<'_>>,
+    reads: &[(BorrowedFd<'_>, bool)],
+) -> Result<(), String> {
     // SAFETY: plain prctl calls with integer arguments.
     unsafe {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -94,11 +97,14 @@ pub fn enter(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     // /usr only, so it is read now, while it can be.
     // SAFETY: tzset takes no arguments; the worker is single-threaded here.
     unsafe { tzset() };
-    landlock(staging)?;
+    landlock(staging, reads)?;
     crate::seccomp::install()
 }
 
-fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
+fn landlock(
+    staging: Option<BorrowedFd<'_>>,
+    reads: &[(BorrowedFd<'_>, bool)],
+) -> Result<(), String> {
     let abi = ABI_TESTED;
     let fail = |e: landlock::RulesetError| format!("Couldn't set up the sandbox: {e}");
     // A kernel without Landlock, or with too old a Landlock, fails while the
@@ -151,6 +157,18 @@ fn landlock(staging: Option<BorrowedFd<'_>>) -> Result<(), String> {
     if let Some(dir) = staging {
         ruleset = ruleset
             .add_rule(PathBeneath::new(dir, write))
+            .map_err(fail)?;
+    }
+    // The sources of a Create job: each file or folder it was given, read
+    // only (never run, never changed).
+    for &(fd, is_dir) in reads {
+        let access = if is_dir {
+            AccessFs::from_read(abi) & !AccessFs::Execute
+        } else {
+            AccessFs::ReadFile.into()
+        };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, access))
             .map_err(fail)?;
     }
     let status = ruleset.restrict_self().map_err(fail)?;
@@ -213,7 +231,39 @@ mod tests {
             )
         };
         assert_eq!(pty, 0, "openpty");
-        enter(Some(staging.as_fd())).unwrap();
+        // The sources of a Create job: one folder, one file.
+        let src_dir = std::fs::File::open(dir.join("src-dir")).unwrap();
+        let src_file = std::fs::File::open(dir.join("src-file")).unwrap();
+        enter(
+            Some(staging.as_fd()),
+            &[(src_dir.as_fd(), true), (src_file.as_fd(), false)],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(dir.join("src-dir/in.txt")).unwrap(), b"in");
+        assert_eq!(std::fs::read(dir.join("src-file")).unwrap(), b"file");
+        assert!(std::fs::read_dir(dir.join("src-dir")).is_ok());
+        let denied0 =
+            |r: std::io::Result<()>| matches!(r, Err(e) if e.raw_os_error() == Some(libc::EACCES));
+        assert!(
+            denied0(std::fs::read(dir.join("sibling")).map(drop)),
+            "read a sibling"
+        );
+        assert!(
+            denied0(std::fs::write(dir.join("src-dir/in.txt"), b"x")),
+            "write a source"
+        );
+        assert!(
+            denied0(std::fs::write(dir.join("src-dir/new"), b"x")),
+            "add to a source"
+        );
+        assert!(
+            denied0(std::fs::write(dir.join("src-file"), b"x")),
+            "write a source file"
+        );
+        assert!(
+            denied0(std::fs::remove_file(dir.join("src-dir/in.txt"))),
+            "remove from a source"
+        );
         // Inside staging: allowed.
         std::fs::write(dir.join("staging/ok"), b"ok").unwrap();
         std::os::unix::fs::symlink("ok", dir.join("staging/link")).unwrap();
@@ -353,6 +403,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("staging")).unwrap();
         std::fs::write(dir.join("secret"), b"s").unwrap();
+        std::fs::create_dir_all(dir.join("src-dir")).unwrap();
+        std::fs::write(dir.join("src-dir/in.txt"), b"in").unwrap();
+        std::fs::write(dir.join("src-file"), b"file").unwrap();
+        std::fs::write(dir.join("sibling"), b"sib").unwrap();
         let out = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

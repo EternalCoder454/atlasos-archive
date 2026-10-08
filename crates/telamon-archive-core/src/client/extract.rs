@@ -2,6 +2,7 @@
 //! rules"): where it goes, what it is called, what happens on a clash.
 
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use super::staging::Staging;
@@ -11,6 +12,52 @@ use super::{Callbacks, Cancel, Clash, Error, Mode, cause, fail, io_words};
 use crate::audit::Audit;
 use crate::name::{self, MAX_COMPONENT_BYTES};
 use crate::proto::Kind;
+
+/// What the destination folder is for, in the words of its errors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Extract,
+    Compress,
+}
+
+/// Opens the folder a job writes into and checks it is the user's own: not
+/// writable by others (unless sticky), no access list that lets others write.
+/// Returns the descriptor and the folder's absolute path.
+pub fn open_destination(dest_dir: &Path, purpose: Purpose) -> Result<(OwnedFd, PathBuf), Error> {
+    let into = match purpose {
+        Purpose::Extract => "extract into",
+        Purpose::Compress => "make the archive in",
+    };
+    let dest = sys::open_dir(dest_dir).map_err(|e| {
+        let words = match e.raw_os_error() {
+            Some(libc::ENOENT) => format!("The folder to {into} isn't there."),
+            Some(libc::EACCES | libc::EPERM) => {
+                format!("Telamon Archive isn't allowed to open the folder to {into}.")
+            }
+            Some(libc::ENOTDIR) => format!("The place to {into} isn't a folder."),
+            _ => format!("The folder to {into} couldn't be opened."),
+        };
+        fail(words, format!("{}: {e}", sys::log_path(dest_dir)))
+    })?;
+    let dest_st = sys::fstat(sys::bfd(&dest)).map_err(|e| io_words("look at the folder", &e))?;
+    // An access list that can't be read counts as shared, like a malformed one.
+    if super::staging::dest_is_shared(&dest_st)
+        || super::staging::acl_is_shared(sys::bfd(&dest)).unwrap_or(true)
+    {
+        let doing = match purpose {
+            Purpose::Extract => "extracting into it",
+            Purpose::Compress => "making an archive in it",
+        };
+        return Err(fail(
+            format!(
+                "Other users can change this folder, so {doing} isn't safe. Pick a folder of your own."
+            ),
+            format!("{} is writable by others", sys::log_path(dest_dir)),
+        ));
+    }
+    let dest_abs = std::path::absolute(dest_dir).map_err(|e| io_words("find the folder", &e))?;
+    Ok((dest, dest_abs))
+}
 
 /// How many numbered names (`name (2)`...) are tried before giving up.
 const MAX_TRIES: u32 = 1000;
@@ -74,6 +121,9 @@ fn single_component(name: &str) -> bool {
 /// Where the result went.
 pub struct Placed {
     pub path: PathBuf,
+    /// Every item that was moved into the destination (one for most modes;
+    /// the selected items for `Mode::Items`).
+    pub paths: Vec<PathBuf>,
     /// Nothing was moved: the user chose Skip.
     pub left_out: bool,
     /// The answer given with "do this for all conflicts".
@@ -83,6 +133,7 @@ pub struct Placed {
 }
 
 /// What `move_out` needs besides the audit.
+#[derive(Clone, Copy)]
 pub struct MoveOut<'a> {
     pub dest_path: &'a Path,
     pub mode: &'a Mode,
@@ -116,9 +167,11 @@ pub fn move_out(
     let (name, here) = match job.mode {
         Mode::ExtractTo { name } => (clean_name(name)?, false),
         Mode::ExtractHere => (job.default_name.to_string(), true),
+        Mode::Items { dir, names } => return move_items(staging, dir, names, job, cb),
     };
     let placed = |final_name: &str| Placed {
         path: job.dest_path.join(final_name),
+        paths: vec![job.dest_path.join(final_name)],
         left_out: false,
         clash_all: job.clash_all,
         unconfirmed: None,
@@ -336,6 +389,56 @@ fn resolve_clash(
     job: &MoveOut<'_>,
     cb: &mut dyn Callbacks,
 ) -> Result<Placed, Error> {
+    let from = staging
+        .fd_owned()
+        .try_clone()
+        .map_err(|e| move_failed(&e))?;
+    let (outcome, clash_all) = match clash_item(&from, staging, item, is_dir, job, cb) {
+        Ok(r) => r,
+        Err(Error::Cancelled) => {
+            finish_staging(staging);
+            return Err(Error::Cancelled);
+        }
+        Err(e) => return Err(e),
+    };
+    finish_staging(staging);
+    Ok(match outcome {
+        Clashed::At(got) => Placed {
+            path: job.dest_path.join(&got),
+            paths: vec![job.dest_path.join(&got)],
+            left_out: false,
+            clash_all,
+            unconfirmed: None,
+        },
+        Clashed::Skipped => Placed {
+            path: job.dest_path.to_path_buf(),
+            paths: Vec::new(),
+            left_out: true,
+            clash_all,
+            unconfirmed: None,
+        },
+    })
+}
+
+/// What came of one item whose name was taken.
+enum Clashed {
+    /// Placed in the destination under this name.
+    At(String),
+    /// The user chose Skip.
+    Skipped,
+}
+
+/// Asks what to do about `item` (in the folder `from`, which is staging or a
+/// folder below it) when its name is taken in the destination, and does it.
+/// The second value is the standing answer ("do this for all conflicts").
+fn clash_item(
+    from: &OwnedFd,
+    staging: &mut Staging,
+    item: &str,
+    is_dir: bool,
+    job: &MoveOut<'_>,
+    cb: &mut dyn Callbacks,
+) -> Result<(Clashed, Option<Clash>), Error> {
     let mut clash_all = job.clash_all;
     let action = match clash_all {
         Some(a) => a,
@@ -344,7 +447,6 @@ fn resolve_clash(
             if job.cancel.is_cancelled() {
                 // The answer is a guess made because the question was cut
                 // short: nothing is placed, and staging goes.
-                finish_staging(staging);
                 return Err(Error::Cancelled);
             }
             if answer.all {
@@ -353,35 +455,14 @@ fn resolve_clash(
             answer.action
         }
     };
-    let at = |got: &str| Placed {
-        path: job.dest_path.join(got),
-        left_out: false,
-        clash_all,
-        unconfirmed: None,
-    };
+    let src = sys::bfd(from);
     match action {
-        Clash::Skip => {
-            finish_staging(staging);
-            Ok(Placed {
-                path: job.dest_path.to_path_buf(),
-                left_out: true,
-                clash_all,
-                unconfirmed: None,
-            })
-        }
+        Clash::Skip => Ok((Clashed::Skipped, clash_all)),
         Clash::KeepBoth => {
             for n in 2..=MAX_TRIES {
                 let cand = numbered_name(item, n, is_dir);
-                match sys::rename_noreplace(
-                    staging.fd(),
-                    item.as_bytes(),
-                    staging.dest(),
-                    cand.as_bytes(),
-                ) {
-                    Ok(()) => {
-                        finish_staging(staging);
-                        return Ok(at(&cand));
-                    }
+                match sys::rename_noreplace(src, item.as_bytes(), staging.dest(), cand.as_bytes()) {
+                    Ok(()) => return Ok((Clashed::At(cand), clash_all)),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(move_failed(&e)),
                 }
@@ -398,16 +479,8 @@ fn resolve_clash(
             let trashed = trash
                 .trash_item(staging.dest(), job.dest_path, item)
                 .map_err(|e| not_replaced(&shown, &e.to_string(), cause(&e)))?;
-            match sys::rename_noreplace(
-                staging.fd(),
-                item.as_bytes(),
-                staging.dest(),
-                item.as_bytes(),
-            ) {
-                Ok(()) => {
-                    finish_staging(staging);
-                    Ok(at(item))
-                }
+            match sys::rename_noreplace(src, item.as_bytes(), staging.dest(), item.as_bytes()) {
+                Ok(()) => Ok((Clashed::At(item.to_string()), clash_all)),
                 Err(e) => {
                     // The old item is in the Trash and the new one didn't
                     // get its place: put the old one back.
@@ -430,6 +503,103 @@ fn resolve_clash(
             }
         }
     }
+}
+
+/// `Mode::Items`: the selected items, which sit in the folder `dir` below
+/// staging (disk names from the archive's top), move into the destination
+/// one by one, each asking on a clash. What the audit took out is not there
+/// to move: the audit reported it.
+fn move_items(
+    staging: &mut Staging,
+    dir: &[String],
+    names: &[String],
+    job: &MoveOut<'_>,
+    cb: &mut dyn Callbacks,
+) -> Result<Placed, Error> {
+    let bad = |what: &str| {
+        fail(
+            "The extracted files couldn't be checked, so nothing was kept.",
+            format!("a selected item's name is not one component: {what}"),
+        )
+    };
+    if names.is_empty() {
+        return Err(Error::Failed("No items were selected.".into()));
+    }
+    let mut from = staging
+        .fd_owned()
+        .try_clone()
+        .map_err(|e| move_failed(&e))?;
+    for c in dir {
+        if !single_component(c) {
+            return Err(bad(c));
+        }
+        from = match sys::open_subdir(sys::bfd(&from), c.as_bytes()) {
+            Ok(fd) => fd,
+            // The audit removed the folder (or the worker never made it):
+            // nothing of the selection is there.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                finish_staging(staging);
+                return Ok(Placed {
+                    path: job.dest_path.to_path_buf(),
+                    paths: Vec::new(),
+                    left_out: true,
+                    clash_all: job.clash_all,
+                    unconfirmed: None,
+                });
+            }
+            Err(e) => return Err(move_failed(&e)),
+        };
+    }
+    let mut clash_all = job.clash_all;
+    let mut paths = Vec::new();
+    let mut skipped_any = false;
+    for item in names {
+        if !single_component(item) {
+            return Err(bad(item));
+        }
+        let st = match sys::lstatat(sys::bfd(&from), item.as_bytes()) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(move_failed(&e)),
+        };
+        let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        match sys::rename_noreplace(
+            sys::bfd(&from),
+            item.as_bytes(),
+            staging.dest(),
+            item.as_bytes(),
+        ) {
+            Ok(()) => paths.push(job.dest_path.join(item)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let one = MoveOut { clash_all, ..*job };
+                let (outcome, all) = match clash_item(&from, staging, item, is_dir, &one, cb) {
+                    Ok(r) => r,
+                    Err(Error::Cancelled) => {
+                        finish_staging(staging);
+                        return Err(Error::Cancelled);
+                    }
+                    Err(e) => return Err(e),
+                };
+                clash_all = all;
+                match outcome {
+                    Clashed::At(got) => paths.push(job.dest_path.join(got)),
+                    Clashed::Skipped => skipped_any = true,
+                }
+            }
+            Err(e) => return Err(move_failed(&e)),
+        }
+    }
+    finish_staging(staging);
+    Ok(Placed {
+        path: paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| job.dest_path.to_path_buf()),
+        left_out: paths.is_empty() && skipped_any,
+        paths,
+        clash_all,
+        unconfirmed: None,
+    })
 }
 
 fn not_replaced(shown: &str, why: &str, cause: Option<&str>) -> Error {

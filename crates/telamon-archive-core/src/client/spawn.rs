@@ -74,6 +74,9 @@ pub struct Cancel {
 #[derive(Debug)]
 struct CancelInner {
     flag: AtomicBool,
+    /// Asked to stand still: the job thread stops the worker (SIGSTOP) at its
+    /// next look and goes on (SIGCONT) when this is cleared.
+    paused: AtomicBool,
     /// Wakes the job thread out of `poll`; without one (no descriptors left)
     /// the job notices within `SLICE`.
     event: Option<OwnedFd>,
@@ -96,6 +99,7 @@ impl Cancel {
         Cancel {
             inner: Arc::new(CancelInner {
                 flag: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
                 event,
             }),
         }
@@ -114,6 +118,21 @@ impl Cancel {
 
     pub fn is_cancelled(&self) -> bool {
         self.inner.flag.load(Ordering::SeqCst)
+    }
+
+    /// Asks the job to stand still: its worker is stopped within a moment and
+    /// stays so until `resume` (or `cancel`, which ends it).
+    pub fn pause(&self) {
+        self.inner.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets a paused job go on.
+    pub fn resume(&self) {
+        self.inner.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.inner.paused.load(Ordering::SeqCst)
     }
 
     fn fd(&self) -> Option<RawFd> {
@@ -267,7 +286,9 @@ pub fn open_archive(path: &Path) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
-/// Starts `exe` with the archive on 3 and, when given, the staging folder on 4.
+/// Starts `exe` with the archive on 3 (none for a job that makes one) and,
+/// when given, the staging folder on 4 and the source folders of a Create job
+/// on 5 and up.
 ///
 /// The worker gets `PR_SET_PDEATHSIG`: it dies with the *thread* that started
 /// it, so the calling thread must live until the job returns. A program that
@@ -275,8 +296,9 @@ pub fn open_archive(path: &Path) -> io::Result<File> {
 pub fn spawn(
     exe: &Path,
     timeout: Duration,
-    archive: &File,
+    archive: Option<&File>,
     staging: Option<&OwnedFd>,
+    roots: &[OwnedFd],
 ) -> io::Result<Running> {
     // SAFETY: sigaction with a null new action only reads the current one.
     let ignored = unsafe {
@@ -293,9 +315,40 @@ pub fn spawn(
     // Copies above the target range first: the pipes std makes for 0 to 2 can
     // be any numbers, and placing one descriptor must never overwrite another
     // still to come.
-    let a = dup_high(archive.as_fd())?;
+    if roots.len() > crate::proto::MAX_ROOTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many source folders",
+        ));
+    }
+    let a = archive.map(|a| dup_high(a.as_fd())).transpose()?;
     let s = staging.map(|s| dup_high(s.as_fd())).transpose()?;
-    let (a_raw, s_raw) = (a.as_raw_fd(), s.as_ref().map(AsRawFd::as_raw_fd));
+    let r: Vec<OwnedFd> = roots
+        .iter()
+        .map(|r| dup_high(r.as_fd()))
+        .collect::<io::Result<_>>()?;
+    let (a_raw, s_raw) = (
+        a.as_ref().map(AsRawFd::as_raw_fd),
+        s.as_ref().map(AsRawFd::as_raw_fd),
+    );
+    let r_raw: Vec<RawFd> = r.iter().map(AsRawFd::as_raw_fd).collect();
+    // The copies must not sit on a target number, or placing one would close
+    // another (only possible with almost no descriptors to spare).
+    if r_raw
+        .iter()
+        .any(|&fd| fd < crate::proto::ROOT_FD + roots.len() as RawFd)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "too few descriptors to start the archive reader",
+        ));
+    }
+    // Some descriptor of ours for the holds below.
+    let anchor = archive
+        .map(AsFd::as_fd)
+        .or_else(|| staging.map(AsFd::as_fd))
+        .or_else(|| roots.first().map(AsFd::as_fd))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "nothing to give the worker"))?;
 
     // std's pipe that reports a failed exec takes the lowest free number in
     // the child. Were that 3 or 4, the `dup2` below would close it and a failed
@@ -304,8 +357,8 @@ pub fn spawn(
     // 3 up for the duration of the spawn, so the pipe lands above 4. Best
     // effort: with no descriptor to spare, the spawn goes on without them.
     let holds = [
-        sys::dup_above(archive.as_fd(), 3).ok(),
-        sys::dup_above(archive.as_fd(), 3).ok(),
+        sys::dup_above(anchor, 3).ok(),
+        sys::dup_above(anchor, 3).ok(),
     ];
     // SAFETY: getpid takes no arguments and cannot fail.
     let parent = unsafe { libc::getpid() };
@@ -349,8 +402,20 @@ pub fn spawn(
             if libc::getppid() != parent {
                 return Err(io::Error::from_raw_os_error(libc::ESRCH));
             }
-            if libc::dup2(a_raw, ARCHIVE_FD) < 0 {
-                return Err(io::Error::last_os_error());
+            match a_raw {
+                Some(a) => {
+                    if libc::dup2(a, ARCHIVE_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                None => {
+                    libc::close(ARCHIVE_FD);
+                }
+            }
+            for (i, &r) in r_raw.iter().enumerate() {
+                if libc::dup2(r, crate::proto::ROOT_FD + i as RawFd) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             match s_raw {
                 Some(s) => {
@@ -368,7 +433,7 @@ pub fn spawn(
             // that reports a failed exec must live until then. It is numbered
             // above 4 because of the holds in `spawn`, bar a thread of the
             // program freeing a low descriptor at that very moment.)
-            let first_extra: libc::c_uint = 5;
+            let first_extra: libc::c_uint = (crate::proto::ROOT_FD as usize + r_raw.len()) as _;
             let r = libc::syscall(
                 libc::SYS_close_range,
                 first_extra,
@@ -385,7 +450,7 @@ pub fn spawn(
         });
     }
     let spawned = cmd.spawn();
-    drop((a, s, holds));
+    drop((a, s, r, holds));
     let mut child = spawned?;
     let pid = child.id() as libc::pid_t;
     // Right away: the child is not reaped (only we reap it), so the number
