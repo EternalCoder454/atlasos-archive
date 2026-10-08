@@ -477,9 +477,10 @@ void JobsService::prepareWindow(QWindow *w, JobItem *job)
         bool ok = false;
         const WId id = parent.mid(4).toULongLong(&ok, 16);
         if (ok && id != 0) {
-            if (QWindow *foreign = QWindow::fromWinId(id)) {
-                w->setTransientParent(foreign);
-            }
+            // WM_TRANSIENT_FOR, set on the window that exists: Qt's own
+            // transient parent logic keeps a window with a foreign parent
+            // from showing at all.
+            KWindowSystem::setMainWindow(w, id);
         }
     } else if (parent.startsWith(QLatin1String("wayland:"))) {
         // The xdg-foreign handle of the caller's window.

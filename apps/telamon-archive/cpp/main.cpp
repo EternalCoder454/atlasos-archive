@@ -306,10 +306,14 @@ int main(int argc, char *argv[])
             bool ok = false;
             const WId id = parent.mid(4).toULongLong(&ok, 16);
             if (ok && id != 0) {
-                w->setTransientParent(QWindow::fromWinId(id));
+                raise(w);
+                KWindowSystem::setMainWindow(w, id);
+                w = nullptr;
             }
         } else if (w && parent.startsWith(QLatin1String("wayland:"))) {
+            raise(w);
             KWindowSystem::setMainWindow(w, parent.mid(8));
+            w = nullptr;
         }
         raise(w);
         activate(backend.get(), {QStringLiteral("--"), QUrl::fromLocalFile(path).toString(QUrl::FullyEncoded)}, QString());

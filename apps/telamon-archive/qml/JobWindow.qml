@@ -29,9 +29,11 @@ TelamonWindow {
     LayoutMirroring.childrenInherit: true
 
     Component.onCompleted: {
-        // Over the caller's window, with its activation token, before it shows.
-        win.service.prepareWindow(win, win.job);
+        // The window shows, then goes over the caller's window (which the
+        // window system wants of a window that exists), and takes the focus
+        // with the activation token it was given.
         win.visible = true;
+        win.service.prepareWindow(win, win.job);
         win.raise();
         win.requestActivate();
     }
