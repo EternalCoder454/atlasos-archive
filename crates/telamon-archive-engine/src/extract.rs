@@ -35,7 +35,7 @@ struct OpenHow {
 }
 
 /// `openat2` below `dir` with the writer's resolve flags. `path` is relative.
-fn openat2(dir: &OwnedFd, path: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
+pub(crate) fn openat2(dir: &OwnedFd, path: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
     let c = cstr(if path.is_empty() { "." } else { path })?;
     let how = OpenHow {
         flags: (flags | libc::O_CLOEXEC) as u64,

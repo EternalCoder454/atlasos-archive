@@ -4,6 +4,7 @@
 //! in this process: the sandboxed worker does that (docs/DESIGN.md).
 
 mod backend;
+mod ffi;
 mod job;
 mod view;
 

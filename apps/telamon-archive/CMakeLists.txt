@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(telamon-archive VERSION 0.2.0 LANGUAGES CXX)
+project(telamon-archive VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -68,9 +68,9 @@ if(NOT EXISTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}/Telamon/Ui/qmldir")
     message(FATAL_ERROR "Telamon.Ui is not installed: install telamon-ui (atlas-framework)")
 endif()
 
-qt_add_executable(telamon-archive-app cpp/main.cpp)
+qt_add_executable(telamon-archive-app cpp/main.cpp cpp/service.cpp cpp/service.h cpp/archive1.cpp cpp/archive1.h cpp/ffi.h)
 set_target_properties(telamon-archive-app PROPERTIES OUTPUT_NAME telamon-archive)
-target_include_directories(telamon-archive-app PRIVATE "${TELAMON_UI_CRATE_DIR}/include")
+target_include_directories(telamon-archive-app PRIVATE "${TELAMON_UI_CRATE_DIR}/include" ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
 
 # qmlcachegen compiles every QML file to C++ at build time; the app reads no
 # .qml from disk at run time.
@@ -81,6 +81,8 @@ qt_add_qml_module(telamon-archive-app
         qml/Main.qml
         qml/ArchiveView.qml
         qml/JobView.qml
+        qml/JobWindow.qml
+        qml/JobWindows.qml
         qml/Questions.qml
 )
 
@@ -99,6 +101,12 @@ install(FILES data/net.eterneon.telamon.archive.desktop
 install(FILES data/net.eterneon.telamon.archive.servicemenu.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/kio/servicemenus
         RENAME net.eterneon.telamon.archive.desktop)
+# Archive1 on the session bus (docs/DESIGN.md, "The API other apps call"): the
+# bus starts the program without a window, and it leaves when it is idle.
+configure_file(data/net.eterneon.telamon.archive.service.in
+        ${CMAKE_CURRENT_BINARY_DIR}/net.eterneon.telamon.archive.service @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/net.eterneon.telamon.archive.service
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/services)
 install(FILES data/net.eterneon.telamon.archive.metainfo.xml
         DESTINATION ${CMAKE_INSTALL_DATADIR}/metainfo)
 install(FILES data/net.eterneon.telamon.archive.svg
@@ -120,6 +128,11 @@ install(CODE "
 #   the old desktop file (hidden, same MimeType list and the same program),
 install(FILES data/legacy/net.eterneon.atlas.archive.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+#   the old bus name (net.eterneon.atlas.archive starts the same program),
+configure_file(data/legacy/net.eterneon.atlas.archive.service.in
+        ${CMAKE_CURRENT_BINARY_DIR}/net.eterneon.atlas.archive.service @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/net.eterneon.atlas.archive.service
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/services)
 #   and the old service menu file, empty so the actions aren't shown twice.
 install(FILES data/legacy/net.eterneon.atlas.archive.servicemenu.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/kio/servicemenus

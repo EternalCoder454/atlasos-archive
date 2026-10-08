@@ -178,6 +178,24 @@ pub struct Tree {
     links: HashMap<u32, PendingLink>,
 }
 
+/// What `Tree::pick` found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picked {
+    /// Archive indices to extract.
+    pub entries: Vec<u32>,
+    /// The folder the items are in: disk names from the top (empty at the top).
+    pub dir: Vec<String>,
+    /// The items' disk names.
+    pub names: Vec<String>,
+}
+
+/// FNV-1a: a short check against a stale name, not a defence.
+fn fnv32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
+}
+
 /// What `Tree::add` did with an entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Added {
@@ -670,6 +688,85 @@ impl Tree {
         parts.join("/")
     }
 
+    /// A name for node `id` that checks itself: the node number and a hash of
+    /// its path. A caller that holds it across another listing of the same
+    /// archive (drag-out, `ExtractEntries`) gets the node back with
+    /// `resolve_token`, or nothing if the archive has changed since.
+    pub fn token(&self, id: u32) -> String {
+        format!("{id}-{:08x}", fnv32(self.disk_path(id).as_bytes()))
+    }
+
+    /// The node a `token` names, if this tree is the one it came from.
+    pub fn resolve_token(&self, token: &str) -> Option<u32> {
+        let (id, hash) = token.split_once('-')?;
+        if id.len() > 10 || hash.len() != 8 || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let id: u32 = id.parse().ok()?;
+        let hash = u32::from_str_radix(hash, 16).ok()?;
+        (id != ROOT
+            && (id as usize) < self.nodes.len()
+            && fnv32(self.disk_path(id).as_bytes()) == hash)
+            .then_some(id)
+    }
+
+    /// What extracting the nodes `ids` takes: the entry indices of each node
+    /// and everything below it, the folder (disk names from the root) the
+    /// chosen items are in, and their names. `None` unless the items that
+    /// are not inside another chosen item all have one parent.
+    pub fn pick(&self, ids: &[u32]) -> Option<Picked> {
+        let chosen: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        let in_chosen = |mut id: u32| {
+            while id != ROOT {
+                id = self.nodes[id as usize].parent;
+                if chosen.contains(&id) {
+                    return true;
+                }
+            }
+            false
+        };
+        let tops: Vec<u32> = {
+            let mut t: Vec<u32> = chosen
+                .iter()
+                .copied()
+                .filter(|&i| i != ROOT && !in_chosen(i))
+                .collect();
+            t.sort_unstable();
+            t
+        };
+        let first = *tops.first()?;
+        let parent = self.nodes[first as usize].parent;
+        if tops
+            .iter()
+            .any(|&t| self.nodes[t as usize].parent != parent)
+        {
+            return None;
+        }
+        let mut entries = Vec::new();
+        let mut stack = tops.clone();
+        while let Some(at) = stack.pop() {
+            let n = &self.nodes[at as usize];
+            entries.extend(n.entry);
+            stack.extend(n.children.iter().copied());
+        }
+        entries.sort_unstable();
+        entries.dedup();
+        let dir = self
+            .ancestry(parent)
+            .into_iter()
+            .map(|i| self.nodes[i as usize].name.disk.clone())
+            .collect();
+        let names = tops
+            .iter()
+            .map(|&t| self.nodes[t as usize].name.disk.clone())
+            .collect();
+        Some(Picked {
+            entries,
+            dir,
+            names,
+        })
+    }
+
     /// A node's path from the root, in display form.
     pub fn display_path(&self, id: u32) -> String {
         let parts: Vec<&str> = self
@@ -1069,5 +1166,53 @@ mod tests {
         let took = start.elapsed();
         assert_eq!(t.files, 50_000);
         assert!(took.as_millis() < 2000, "{took:?}");
+    }
+
+    #[test]
+    fn tokens_check_themselves_and_picks_find_the_folder() {
+        let t = Tree::build(
+            fmt(),
+            &[
+                e(0, "top/", Kind::Dir),
+                e(1, "top/a.txt", Kind::File),
+                e(2, "top/sub/", Kind::Dir),
+                e(3, "top/sub/b.txt", Kind::File),
+                e(4, "other.txt", Kind::File),
+            ],
+            None,
+        );
+        let a = t.find(["top", "a.txt"]).unwrap();
+        let sub = t.find(["top", "sub"]).unwrap();
+        let b = t.find(["top", "sub", "b.txt"]).unwrap();
+        let tok = t.token(a);
+        assert_eq!(t.resolve_token(&tok), Some(a));
+        // Another path under the same number, a bad shape, the root.
+        assert_eq!(t.resolve_token(&format!("{a}-00000000")), None);
+        for bad in [
+            "",
+            "-",
+            "1",
+            "1-2",
+            "x-12345678",
+            "1-1234567g",
+            "-1-12345678",
+            "99999-12345678",
+        ] {
+            assert_eq!(t.resolve_token(bad), None, "{bad}");
+        }
+        assert_eq!(t.resolve_token(&format!("0-{:08x}", fnv32(b""))), None);
+        // A file and a folder with its content, in one folder.
+        let p = t.pick(&[a, sub, b]).unwrap();
+        assert_eq!(p.dir, ["top"]);
+        assert_eq!(p.names, ["a.txt", "sub"]);
+        assert_eq!(p.entries, [1, 2, 3]);
+        // Items from different folders: no single place for them.
+        let other = t.find(["other.txt"]).unwrap();
+        assert!(t.pick(&[a, other]).is_none());
+        assert!(t.pick(&[]).is_none());
+        // At the top.
+        let p = t.pick(&[other]).unwrap();
+        assert!(p.dir.is_empty());
+        assert_eq!(p.entries, [4]);
     }
 }

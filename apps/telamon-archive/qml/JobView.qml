@@ -10,6 +10,17 @@ Item {
 
     required property var backend
 
+    // The words of the job: an extraction by default (the archive window's own
+    // job); the job windows set them for the other kinds.
+    property string doneText: qsTr("Extracted to %1")
+    property string doneLeftText: qsTr("Extracted to %1, but %2 items were left out")
+    property string failedText: qsTr("Couldn't Extract")
+    property string leftBanner: qsTr("Some items could not be extracted. The list below says why.")
+    property string notDoneHeader: qsTr("Not Extracted")
+    // Pause and Resume, for jobs that offer them (the backend then has
+    // `paused`, `pauseJob` and `resumeJob`).
+    property bool canPause: false
+
     readonly property string state: view.backend.jobState
     readonly property var details: JSON.parse(view.backend.jobDetails || "{\"rows\":[],\"more\":0}")
     readonly property string resultName: {
@@ -49,12 +60,12 @@ Item {
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             horizontalAlignment: Text.AlignHCenter
-            text: view.state === "done" ? (view.backend.jobLeft > 0 ? qsTr("Extracted to %1, but %2 items were left out").arg(view.resultName).arg(view.backend.jobLeft) : qsTr("Extracted to %1").arg(view.resultName)) : view.state === "failed" ? qsTr("Couldn't Extract") : view.backend.jobTitle
+            text: view.state === "done" ? (view.backend.jobLeft > 0 ? view.doneLeftText.arg(view.resultName).arg(view.backend.jobLeft) : view.doneText.arg(view.resultName)) : view.state === "failed" ? view.failedText : view.backend.jobTitle
         }
 
         TelamonLabel {
             Layout.fillWidth: true
-            visible: view.state === "done"
+            visible: view.state === "done" && text !== ""
             textStyle: TelamonLabel.Caption
             textFormat: Text.PlainText
             horizontalAlignment: Text.AlignHCenter
@@ -98,7 +109,7 @@ Item {
         InfoBanner {
             Layout.fillWidth: true
             type: "warning"
-            text: qsTr("Some items could not be extracted. The list below says why.")
+            text: view.leftBanner
             shown: view.state === "done" && view.backend.jobLeft > 0
         }
 
@@ -118,7 +129,7 @@ Item {
             selectionMode: DataTable.SingleSelection
             Accessible.name: qsTr("Items that were not extracted")
             columns: [
-                { title: qsTr("Not Extracted"), role: "name", fill: true, sortable: false },
+                { title: view.notDoneHeader, role: "name", fill: true, sortable: false },
                 { title: qsTr("Why"), role: "reason", width: 22, sortable: false }
             ]
         }
@@ -143,6 +154,11 @@ Item {
             Layout.alignment: Qt.AlignHCenter
             spacing: Kirigami.Units.largeSpacing
 
+            SecondaryButton {
+                visible: view.state === "running" && view.canPause
+                text: view.backend.paused ? qsTr("Resume") : qsTr("Pause")
+                onClicked: view.backend.paused ? view.backend.resumeJob() : view.backend.pauseJob()
+            }
             SecondaryButton {
                 visible: view.state === "running"
                 text: qsTr("Cancel")

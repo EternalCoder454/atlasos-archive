@@ -10,6 +10,7 @@
 //! here; paths go through `Tree`; staging is audited after the worker is
 //! killed and reaped, and only the audited top level is moved out.
 
+mod compress;
 mod extract;
 mod spawn;
 mod staging;
@@ -18,12 +19,13 @@ mod trash;
 
 use std::fmt;
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+pub use compress::{ClashPolicy, CompressRequest, Compressed};
 pub use extract::{default_name, numbered_name};
 pub use spawn::Cancel;
 pub use staging::{
@@ -32,7 +34,7 @@ pub use staging::{
 };
 pub use trash::Trash;
 
-use crate::audit::{self, Removed};
+use crate::audit::{self, MAX_REMOVED_LISTED, Removed};
 use crate::limits::{Exceeded, Kind, Limits, reserve_for};
 use crate::name::NameEncoding;
 use crate::proto::{
@@ -60,6 +62,8 @@ const MAX_FRAMES: u64 = 4_000_000;
 const MAX_SKIP_FRAMES: u64 = 1_000_000;
 /// The most `Callbacks::skipped_more` calls in one job.
 const MAX_SKIP_MORE_CALLBACKS: u64 = 1_000;
+/// How often a job looks at its Pause, at least.
+const PAUSE_POLL: Duration = Duration::from_millis(100);
 /// How often the staging folder's drive is looked at, at least.
 const WATCH_EVERY: Duration = Duration::from_millis(250);
 /// Progress is passed on at most this often.
@@ -177,6 +181,10 @@ pub trait Callbacks {
     fn progress(&mut self, _bytes: u64, _items: u64) {}
     /// What the archive is, as soon as the worker says.
     fn format(&mut self, _format: &Format) {}
+    /// A job that makes an archive has looked at everything it will read:
+    /// this many bytes of file data in this many items. Once, before the
+    /// first progress; the figures are the worker's word and only a guide.
+    fn total(&mut self, _bytes: u64, _items: u64) {}
     /// A batch of the listing, as the worker sends it.
     fn entries(&mut self, _batch: &[Entry]) {}
     /// An entry that won't be extracted, with the reason. `index` comes from
@@ -204,6 +212,12 @@ pub trait Callbacks {
         }
     }
 }
+
+/// A front end that answers nothing and shows nothing: the safe defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoCallbacks;
+
+impl Callbacks for NoCallbacks {}
 
 /// The result of `list`.
 #[derive(Debug)]
@@ -240,6 +254,13 @@ pub enum Mode {
     /// One item at the top comes out as it is, anything else goes into a
     /// folder named like the archive.
     ExtractHere,
+    /// Selected items, straight into the destination (drag-out): `names` are
+    /// the items' disk names, all in the archive's folder `dir` (disk names
+    /// from the top). Each asks on a clash, like `ExtractHere`.
+    Items {
+        dir: Vec<String>,
+        names: Vec<String>,
+    },
 }
 
 /// One extraction.
@@ -270,6 +291,9 @@ pub struct Extracted {
     /// The folder or item made, for "Show Files". The destination itself when
     /// nothing was moved (`left_out`).
     pub path: PathBuf,
+    /// Every item moved into the destination: `path` alone for most modes,
+    /// the selected items for `Mode::Items`.
+    pub paths: Vec<PathBuf>,
     /// The user chose Skip for the one clashing item.
     pub left_out: bool,
     /// Set when the user said "do this for all conflicts".
@@ -367,6 +391,7 @@ impl Worker {
             Op::List,
             archive,
             None,
+            &[],
             &Request::List,
             cancel,
             cb,
@@ -403,6 +428,7 @@ impl Worker {
             Op::Test,
             archive,
             None,
+            &[],
             &Request::Test,
             cancel,
             cb,
@@ -426,31 +452,7 @@ impl Worker {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let dest = sys::open_dir(req.dest_dir).map_err(|e| {
-            let words = match e.raw_os_error() {
-                Some(libc::ENOENT) => "The folder to extract into isn't there.",
-                Some(libc::EACCES | libc::EPERM) => {
-                    "Telamon Archive isn't allowed to open the folder to extract into."
-                }
-                Some(libc::ENOTDIR) => "The place to extract into isn't a folder.",
-                _ => "The folder to extract into couldn't be opened.",
-            };
-            fail(words, format!("{}: {e}", sys::log_path(req.dest_dir)))
-        })?;
-        let dest_st =
-            sys::fstat(sys::bfd(&dest)).map_err(|e| io_words("look at the folder", &e))?;
-        // An access list that can't be read counts as shared, like a
-        // malformed one.
-        if staging::dest_is_shared(&dest_st)
-            || staging::acl_is_shared(sys::bfd(&dest)).unwrap_or(true)
-        {
-            return Err(fail(
-                "Other users can change this folder, so extracting into it isn't safe. Pick a folder of your own.",
-                format!("{} is writable by others", sys::log_path(req.dest_dir)),
-            ));
-        }
-        let dest_abs =
-            std::path::absolute(req.dest_dir).map_err(|e| io_words("find the folder", &e))?;
+        let (dest, dest_abs) = extract::open_destination(req.dest_dir, extract::Purpose::Extract)?;
         let file_name = req
             .archive
             .file_name()
@@ -478,6 +480,7 @@ impl Worker {
             Op::Extract,
             req.archive,
             Some(&staging),
+            &[],
             &request,
             cancel,
             cb,
@@ -524,10 +527,22 @@ impl Worker {
         )?;
         Ok(Extracted {
             path: placed.path,
+            paths: placed.paths,
             left_out: placed.left_out,
             clash_all: placed.clash_all,
-            removed: audit.removed,
-            removed_more: audit.removed_more,
+            removed_more: audit.removed_more.saturating_add(
+                audit
+                    .removed
+                    .len()
+                    .saturating_add(placed.removed.len())
+                    .saturating_sub(MAX_REMOVED_LISTED),
+            ),
+            removed: {
+                let mut all = audit.removed;
+                all.extend(placed.removed);
+                all.truncate(MAX_REMOVED_LISTED);
+                all
+            },
             skipped: col.skipped,
             skipped_more: col.skipped_more,
             unconfirmed: placed.unconfirmed,
@@ -541,6 +556,7 @@ impl Worker {
         op: Op,
         archive: &Path,
         staging: Option<&Staging>,
+        roots: &[OwnedFd],
         request: &Request,
         cancel: &Cancel,
         cb: &mut dyn Callbacks,
@@ -563,6 +579,7 @@ impl Worker {
                 op,
                 archive,
                 staging,
+                roots,
                 password: password.as_ref(),
                 request,
                 size_ceiling: self.size_ceiling,
@@ -592,24 +609,29 @@ impl Worker {
     ) -> Result<Final, Error> {
         // Before the archive is opened, which can itself wait on a dead drive.
         spawn::check_capacity().map_err(|e| fail(spawn::TOO_MANY_STUCK, e))?;
-        let file = spawn::open_archive(a.archive).map_err(|e| {
-            if e.kind() == io::ErrorKind::InvalidInput {
-                Error::Failed(e.to_string())
-            } else {
-                let words = match e.kind() {
-                    io::ErrorKind::NotFound => "The archive isn't there.",
-                    io::ErrorKind::PermissionDenied => "The archive can't be read.",
-                    _ => "The archive couldn't be opened.",
-                };
-                fail(words, e)
-            }
-        })?;
+        let file = if a.op == Op::Create {
+            None
+        } else {
+            Some(spawn::open_archive(a.archive).map_err(|e| {
+                if e.kind() == io::ErrorKind::InvalidInput {
+                    Error::Failed(e.to_string())
+                } else {
+                    let words = match e.kind() {
+                        io::ErrorKind::NotFound => "The archive isn't there.",
+                        io::ErrorKind::PermissionDenied => "The archive can't be read.",
+                        _ => "The archive couldn't be opened.",
+                    };
+                    fail(words, e)
+                }
+            })?)
+        };
         let mut col_hung = false;
         let mut running = spawn::spawn(
             &self.exe,
             self.timeout,
-            &file,
+            file.as_ref(),
             a.staging.map(|s| s.fd_owned()),
+            a.roots,
         )
         .map_err(|e| {
             let words = if e.kind() == io::ErrorKind::NotFound {
@@ -687,6 +709,7 @@ enum Op {
     List,
     Test,
     Extract,
+    Create,
 }
 
 impl Op {
@@ -695,6 +718,7 @@ impl Op {
             Op::List => "listing",
             Op::Test => "test",
             Op::Extract => "extraction",
+            Op::Create => "compression",
         }
     }
 }
@@ -703,6 +727,8 @@ struct Attempt<'a> {
     op: Op,
     archive: &'a Path,
     staging: Option<&'a Staging>,
+    /// The source folders of a Create job.
+    roots: &'a [OwnedFd],
     password: Option<&'a Zeroizing<Vec<u8>>>,
     request: &'a Request,
     /// The most that may be written before the user said yes to more.
@@ -867,18 +893,28 @@ fn drive(
 ) -> Result<Final, Halt> {
     let watch = a
         .staging
-        .filter(|_| a.op == Op::Extract)
+        .filter(|_| matches!(a.op, Op::Extract | Op::Create))
         .map(|s| SpaceWatch::new(s.fd()));
     // Fail closed: no figures, no extraction (and the worker is not asked).
     let mut watch = match watch {
         Some(Err(e)) => {
             return Err(Halt::Failed(if e.kind() == io::ErrorKind::Unsupported {
-                "This drive doesn't report its free space, so Telamon Archive can't extract here safely."
-                    .into()
+                if a.op == Op::Create {
+                    "This drive doesn't report its free space, so Telamon Archive can't make an archive here safely."
+                        .into()
+                } else {
+                    "This drive doesn't report its free space, so Telamon Archive can't extract here safely."
+                        .into()
+                }
             } else {
                 let why = cause(&e).unwrap_or("of an unexpected error");
                 format!(
-                    "Telamon Archive couldn't check the free space on this drive because {why}, so it can't extract here safely."
+                    "Telamon Archive couldn't check the free space on this drive because {why}, so it can't {} here safely.",
+                    if a.op == Op::Create {
+                        "make an archive"
+                    } else {
+                        "extract"
+                    }
                 )
             }));
         }
@@ -905,8 +941,11 @@ fn drive(
     let mut asked: Vec<Kind> = Vec::new();
     // What the job may write: the worker's total limit, or no ceiling once
     // the user went past it. The free-space floor applies either way.
-    let mut ceiling = Some(a.size_ceiling);
+    let mut ceiling = (a.op != Op::Create).then_some(a.size_ceiling);
+    // A Create job's totals: sent first, only growing, final once.
+    let mut scanned: Option<(u64, u64, bool)> = None;
     let mut last_progress: Option<Instant> = None;
+    let mut pause_failed = false;
     let mut seen = (0u64, 0u64);
     let (mut frames, mut skip_frames, mut skip_calls, mut more_calls) = (0u64, 0u64, 0usize, 0u64);
     loop {
@@ -915,7 +954,34 @@ fn drive(
         {
             w.check(ceiling).map_err(Halt::Failed)?;
         }
-        let tick = watch.as_ref().map(|_| WATCH_EVERY);
+        if cancel.is_paused() && !cancel.is_cancelled() && !pause_failed {
+            // The user's Pause: the worker stands still, and the clocks with it.
+            if running.pause() {
+                while cancel.is_paused() && !cancel.is_cancelled() {
+                    std::thread::sleep(PAUSE_POLL);
+                }
+                if cancel.is_cancelled() {
+                    // Left stopped: the kill that follows works on it.
+                    return Err(Halt::Stop(Stop::Cancelled));
+                }
+                running.resume();
+                deadline = Instant::now() + timeout;
+                if let Some(w) = watch.as_mut() {
+                    w.last = Instant::now();
+                }
+            } else {
+                // The worker may have just finished: what it sent is read
+                // next, and a worker that really can't be stopped gets
+                // no second try.
+                log::warn!("The archive reader couldn't be paused.");
+                pause_failed = true;
+            }
+        }
+        let tick = Some(
+            watch
+                .as_ref()
+                .map_or(PAUSE_POLL, |_| WATCH_EVERY.min(PAUSE_POLL)),
+        );
         let Some((reply, frame_len)) = running.recv(cancel, deadline, tick)? else {
             continue;
         };
@@ -968,6 +1034,28 @@ fn drive(
                 }
                 return Ok(Final::Finished);
             }
+            Reply::Scanned { bytes, items, done } if a.op == Op::Create => {
+                match scanned {
+                    Some((_, _, true)) => return Err(Halt::Bad("a count after the final count")),
+                    Some((b, i, _)) if bytes < b || items < i => {
+                        return Err(Halt::Bad("the count went backwards"));
+                    }
+                    Some((b, i, _)) if bytes > b || items > i => {
+                        deadline = Instant::now() + timeout;
+                    }
+                    None => deadline = Instant::now() + timeout,
+                    _ => {}
+                }
+                scanned = Some((bytes, items, done));
+                if done {
+                    cb.total(bytes, items);
+                }
+            }
+            Reply::Progress { .. }
+                if a.op == Op::Create && !matches!(scanned, Some((_, _, true))) =>
+            {
+                return Err(Halt::Bad("progress before the count was done"));
+            }
             Reply::Progress { bytes, items } => {
                 if bytes < seen.0 || items < seen.1 {
                     return Err(Halt::Bad("the progress went backwards"));
@@ -994,9 +1082,12 @@ fn drive(
             Reply::NeedPassword { .. } if a.op == Op::List && !col.entries.is_empty() => {
                 return Err(Halt::Bad("a password was asked for after entries"));
             }
+            Reply::NeedPassword { .. } if a.op == Op::Create => {
+                return Err(Halt::Bad("a password for a new archive"));
+            }
             Reply::NeedPassword { wrong } => return Ok(Final::NeedPassword(wrong)),
             // A test meters bytes like an extraction, so a bomb asks there too.
-            Reply::Limit(e) if a.op != Op::List => {
+            Reply::Limit(e) if matches!(a.op, Op::Test | Op::Extract) => {
                 if asked.contains(&e.kind) {
                     return Err(Halt::Bad("the same limit was asked twice"));
                 }
@@ -1070,6 +1161,9 @@ fn drive(
             Reply::Done { written } if a.op != Op::List => {
                 if written.len() > MAX_ENTRIES {
                     return Err(Halt::Bad("too many names written"));
+                }
+                if a.op == Op::Create && !matches!(scanned, Some((_, _, true))) {
+                    return Err(Halt::Bad("done before the count was"));
                 }
                 col.written = written;
                 return Ok(Final::Finished);

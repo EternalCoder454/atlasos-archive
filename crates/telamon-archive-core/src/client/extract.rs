@@ -2,6 +2,7 @@
 //! rules"): where it goes, what it is called, what happens on a clash.
 
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use super::staging::Staging;
@@ -11,6 +12,52 @@ use super::{Callbacks, Cancel, Clash, Error, Mode, cause, fail, io_words};
 use crate::audit::Audit;
 use crate::name::{self, MAX_COMPONENT_BYTES};
 use crate::proto::Kind;
+
+/// What the destination folder is for, in the words of its errors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Extract,
+    Compress,
+}
+
+/// Opens the folder a job writes into and checks it is the user's own: not
+/// writable by others (unless sticky), no access list that lets others write.
+/// Returns the descriptor and the folder's absolute path.
+pub fn open_destination(dest_dir: &Path, purpose: Purpose) -> Result<(OwnedFd, PathBuf), Error> {
+    let into = match purpose {
+        Purpose::Extract => "extract into",
+        Purpose::Compress => "make the archive in",
+    };
+    let dest = sys::open_dir(dest_dir).map_err(|e| {
+        let words = match e.raw_os_error() {
+            Some(libc::ENOENT) => format!("The folder to {into} isn't there."),
+            Some(libc::EACCES | libc::EPERM) => {
+                format!("Telamon Archive isn't allowed to open the folder to {into}.")
+            }
+            Some(libc::ENOTDIR) => format!("The place to {into} isn't a folder."),
+            _ => format!("The folder to {into} couldn't be opened."),
+        };
+        fail(words, format!("{}: {e}", sys::log_path(dest_dir)))
+    })?;
+    let dest_st = sys::fstat(sys::bfd(&dest)).map_err(|e| io_words("look at the folder", &e))?;
+    // An access list that can't be read counts as shared, like a malformed one.
+    if super::staging::dest_is_shared(&dest_st)
+        || super::staging::acl_is_shared(sys::bfd(&dest)).unwrap_or(true)
+    {
+        let doing = match purpose {
+            Purpose::Extract => "extracting into it",
+            Purpose::Compress => "making an archive in it",
+        };
+        return Err(fail(
+            format!(
+                "Other users can change this folder, so {doing} isn't safe. Pick a folder of your own."
+            ),
+            format!("{} is writable by others", sys::log_path(dest_dir)),
+        ));
+    }
+    let dest_abs = std::path::absolute(dest_dir).map_err(|e| io_words("find the folder", &e))?;
+    Ok((dest, dest_abs))
+}
 
 /// How many numbered names (`name (2)`...) are tried before giving up.
 const MAX_TRIES: u32 = 1000;
@@ -74,15 +121,21 @@ fn single_component(name: &str) -> bool {
 /// Where the result went.
 pub struct Placed {
     pub path: PathBuf,
+    /// Every item that was moved into the destination (one for most modes;
+    /// the selected items for `Mode::Items`).
+    pub paths: Vec<PathBuf>,
     /// Nothing was moved: the user chose Skip.
     pub left_out: bool,
     /// The answer given with "do this for all conflicts".
     pub clash_all: Option<Clash>,
     /// The move went through but couldn't be confirmed (see `unconfirmed`).
     pub unconfirmed: Option<String>,
+    /// Links taken out on the way (`Mode::Items` only).
+    pub removed: Vec<crate::audit::Removed>,
 }
 
 /// What `move_out` needs besides the audit.
+#[derive(Clone, Copy)]
 pub struct MoveOut<'a> {
     pub dest_path: &'a Path,
     pub mode: &'a Mode,
@@ -116,12 +169,17 @@ pub fn move_out(
     let (name, here) = match job.mode {
         Mode::ExtractTo { name } => (clean_name(name)?, false),
         Mode::ExtractHere => (job.default_name.to_string(), true),
+        Mode::Items { dir, names } => {
+            return move_items(staging, &audit.tree, dir, names, job, cb);
+        }
     };
     let placed = |final_name: &str| Placed {
         path: job.dest_path.join(final_name),
+        paths: vec![job.dest_path.join(final_name)],
         left_out: false,
         clash_all: job.clash_all,
         unconfirmed: None,
+        removed: Vec::new(),
     };
 
     match lone {
@@ -336,52 +394,87 @@ fn resolve_clash(
     job: &MoveOut<'_>,
     cb: &mut dyn Callbacks,
 ) -> Result<Placed, Error> {
-    let mut clash_all = job.clash_all;
-    let action = match clash_all {
-        Some(a) => a,
-        None => {
-            let answer = cb.clash(&name::display_text(item));
-            if job.cancel.is_cancelled() {
-                // The answer is a guess made because the question was cut
-                // short: nothing is placed, and staging goes.
-                finish_staging(staging);
-                return Err(Error::Cancelled);
-            }
-            if answer.all {
-                clash_all = Some(answer.action);
-            }
-            answer.action
-        }
-    };
-    let at = |got: &str| Placed {
-        path: job.dest_path.join(got),
-        left_out: false,
-        clash_all,
-        unconfirmed: None,
-    };
-    match action {
-        Clash::Skip => {
+    let from = staging
+        .fd_owned()
+        .try_clone()
+        .map_err(|e| move_failed(&e))?;
+    let (action, clash_all) = match ask_clash(item, job, job.clash_all, cb) {
+        Ok(r) => r,
+        Err(Error::Cancelled) => {
             finish_staging(staging);
-            Ok(Placed {
-                path: job.dest_path.to_path_buf(),
-                left_out: true,
-                clash_all,
-                unconfirmed: None,
-            })
+            return Err(Error::Cancelled);
         }
+        Err(e) => return Err(e),
+    };
+    let outcome = apply_clash(&from, staging, item, is_dir, action, job)?;
+    finish_staging(staging);
+    Ok(match outcome {
+        Clashed::At(got) => Placed {
+            path: job.dest_path.join(&got),
+            paths: vec![job.dest_path.join(&got)],
+            left_out: false,
+            clash_all,
+            unconfirmed: None,
+            removed: Vec::new(),
+        },
+        Clashed::Skipped => Placed {
+            path: job.dest_path.to_path_buf(),
+            paths: Vec::new(),
+            left_out: true,
+            clash_all,
+            unconfirmed: None,
+            removed: Vec::new(),
+        },
+    })
+}
+
+/// What came of one item whose name was taken.
+enum Clashed {
+    /// Placed in the destination under this name.
+    At(String),
+    /// The user chose Skip.
+    Skipped,
+}
+
+/// Asks what to do about `item` when its name is taken in the destination,
+/// unless a standing answer says. The second value is the (new) standing
+/// answer ("do this for all conflicts").
+fn ask_clash(
+    item: &str,
+    job: &MoveOut<'_>,
+    clash_all: Option<Clash>,
+    cb: &mut dyn Callbacks,
+) -> Result<(Clash, Option<Clash>), Error> {
+    if let Some(a) = clash_all {
+        return Ok((a, clash_all));
+    }
+    let answer = cb.clash(&name::display_text(item));
+    if job.cancel.is_cancelled() {
+        // The answer is a guess made because the question was cut short:
+        // nothing is placed, and staging goes.
+        return Err(Error::Cancelled);
+    }
+    Ok((answer.action, answer.all.then_some(answer.action)))
+}
+
+/// Does what was answered about `item` (in the folder `from`, which is
+/// staging or a folder below it), whose name is taken in the destination.
+fn apply_clash(
+    from: &OwnedFd,
+    staging: &mut Staging,
+    item: &str,
+    is_dir: bool,
+    action: Clash,
+    job: &MoveOut<'_>,
+) -> Result<Clashed, Error> {
+    let src = sys::bfd(from);
+    match action {
+        Clash::Skip => Ok(Clashed::Skipped),
         Clash::KeepBoth => {
             for n in 2..=MAX_TRIES {
                 let cand = numbered_name(item, n, is_dir);
-                match sys::rename_noreplace(
-                    staging.fd(),
-                    item.as_bytes(),
-                    staging.dest(),
-                    cand.as_bytes(),
-                ) {
-                    Ok(()) => {
-                        finish_staging(staging);
-                        return Ok(at(&cand));
-                    }
+                match sys::rename_noreplace(src, item.as_bytes(), staging.dest(), cand.as_bytes()) {
+                    Ok(()) => return Ok(Clashed::At(cand)),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(move_failed(&e)),
                 }
@@ -398,16 +491,8 @@ fn resolve_clash(
             let trashed = trash
                 .trash_item(staging.dest(), job.dest_path, item)
                 .map_err(|e| not_replaced(&shown, &e.to_string(), cause(&e)))?;
-            match sys::rename_noreplace(
-                staging.fd(),
-                item.as_bytes(),
-                staging.dest(),
-                item.as_bytes(),
-            ) {
-                Ok(()) => {
-                    finish_staging(staging);
-                    Ok(at(item))
-                }
+            match sys::rename_noreplace(src, item.as_bytes(), staging.dest(), item.as_bytes()) {
+                Ok(()) => Ok(Clashed::At(item.to_string())),
                 Err(e) => {
                     // The old item is in the Trash and the new one didn't
                     // get its place: put the old one back.
@@ -430,6 +515,199 @@ fn resolve_clash(
             }
         }
     }
+}
+
+/// What a link inside the dragged items may name: only what is dragged too.
+/// A link that names something else would point outside the new place, so it
+/// is taken out (by descriptor, below staging) and reported.
+fn drop_outward_links(
+    staging: &Staging,
+    tree: &crate::tree::Tree,
+    dir: &[String],
+    names: &[String],
+) -> Vec<crate::audit::Removed> {
+    let mut removed = Vec::new();
+    let inside = |path: &[String]| {
+        path.len() > dir.len()
+            && path[..dir.len()] == *dir
+            && names.iter().any(|n| *n == path[dir.len()])
+    };
+    for (id, node) in tree.nodes.iter().enumerate() {
+        let (Kind::Symlink, Some(target)) = (node.kind, &node.symlink) else {
+            continue;
+        };
+        let path: Vec<String> = tree
+            .disk_path(id as u32)
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        if !inside(&path) || inside(&target.resolved) {
+            continue;
+        }
+        // Its folder below staging, then the link itself.
+        let mut folder = match staging.fd_owned().try_clone() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut ok = true;
+        for c in &path[..path.len() - 1] {
+            match sys::open_subdir(sys::bfd(&folder), c.as_bytes()) {
+                Ok(f) => folder = f,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        let gone = ok
+            && path
+                .last()
+                .is_some_and(|l| sys::unlinkat(sys::bfd(&folder), l.as_bytes(), 0).is_ok());
+        if gone {
+            removed.push(crate::audit::Removed {
+                path: name::display_text(&tree.display_path(id as u32)),
+                reason: "The link points to something that isn't being copied with it, so it was left out."
+                    .into(),
+            });
+        } else {
+            log::warn!("A link that points outside the dragged items couldn't be removed.");
+        }
+    }
+    removed
+}
+
+/// `Mode::Items`: the selected items, which sit in the folder `dir` below
+/// staging (disk names from the archive's top), move into the destination.
+/// Every clash is asked first, so a Cancel there places nothing; then each
+/// item moves. What the audit took out is not there to move: the audit
+/// reported it, and links that would point outside the items are taken out.
+fn move_items(
+    staging: &mut Staging,
+    tree: &crate::tree::Tree,
+    dir: &[String],
+    names: &[String],
+    job: &MoveOut<'_>,
+    cb: &mut dyn Callbacks,
+) -> Result<Placed, Error> {
+    let bad = |what: &str| {
+        fail(
+            "The extracted files couldn't be checked, so nothing was kept.",
+            format!("a selected item's name is not one component: {what}"),
+        )
+    };
+    if names.is_empty() {
+        return Err(Error::Failed("No items were selected.".into()));
+    }
+    for c in dir.iter().chain(names) {
+        if !single_component(c) {
+            return Err(bad(c));
+        }
+    }
+    let removed = drop_outward_links(staging, tree, dir, names);
+    let nothing = |removed| Placed {
+        path: job.dest_path.to_path_buf(),
+        paths: Vec::new(),
+        left_out: true,
+        clash_all: job.clash_all,
+        unconfirmed: None,
+        removed,
+    };
+    let mut from = staging
+        .fd_owned()
+        .try_clone()
+        .map_err(|e| move_failed(&e))?;
+    for c in dir {
+        from = match sys::open_subdir(sys::bfd(&from), c.as_bytes()) {
+            Ok(fd) => fd,
+            // The audit removed the folder (or the worker never made it):
+            // nothing of the selection is there.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                finish_staging(staging);
+                return Ok(nothing(removed));
+            }
+            Err(e) => return Err(move_failed(&e)),
+        };
+    }
+    // First everything that has to be asked.
+    struct Item {
+        name: String,
+        is_dir: bool,
+        action: Option<Clash>,
+    }
+    let mut items = Vec::new();
+    let mut clash_all = job.clash_all;
+    for name in names {
+        let st = match sys::lstatat(sys::bfd(&from), name.as_bytes()) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(move_failed(&e)),
+        };
+        let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        let taken = match sys::lstatat(staging.dest(), name.as_bytes()) {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(move_failed(&e)),
+        };
+        let action = if taken {
+            match ask_clash(name, job, clash_all, cb) {
+                Ok((a, all)) => {
+                    clash_all = all;
+                    Some(a)
+                }
+                Err(Error::Cancelled) => {
+                    finish_staging(staging);
+                    return Err(Error::Cancelled);
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
+        items.push(Item {
+            name: name.clone(),
+            is_dir,
+            action,
+        });
+    }
+    // Then they move.
+    let mut paths = Vec::new();
+    let mut skipped_any = false;
+    for it in &items {
+        let placed = match it.action {
+            None => {
+                match sys::rename_noreplace(
+                    sys::bfd(&from),
+                    it.name.as_bytes(),
+                    staging.dest(),
+                    it.name.as_bytes(),
+                ) {
+                    Ok(()) => Clashed::At(it.name.clone()),
+                    // Taken since it was looked at: keep both, never replace.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        apply_clash(&from, staging, &it.name, it.is_dir, Clash::KeepBoth, job)?
+                    }
+                    Err(e) => return Err(move_failed(&e)),
+                }
+            }
+            Some(a) => apply_clash(&from, staging, &it.name, it.is_dir, a, job)?,
+        };
+        match placed {
+            Clashed::At(got) => paths.push(job.dest_path.join(got)),
+            Clashed::Skipped => skipped_any = true,
+        }
+    }
+    finish_staging(staging);
+    Ok(Placed {
+        path: paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| job.dest_path.to_path_buf()),
+        left_out: paths.is_empty() && skipped_any,
+        paths,
+        clash_all,
+        unconfirmed: None,
+        removed,
+    })
 }
 
 fn not_replaced(shown: &str, why: &str, cause: Option<&str>) -> Error {

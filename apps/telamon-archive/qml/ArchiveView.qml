@@ -100,23 +100,59 @@ Item {
             shown: view.backend.broken !== ""
         }
 
-        DataTable {
+        // The rows, and the drag out of them: a drag carries
+        // `application/x-telamon-archive-entries` (docs/DESIGN.md, "Archives as
+        // folders, drag-out"), which Files turns into an ExtractEntries call
+        // on the folder it is dropped on.
+        Item {
+            id: tableBox
             Layout.fillWidth: true
             Layout.fillHeight: true
-            model: rows
-            selectionMode: DataTable.SingleSelection
-            placeholderText: qsTr("This folder is empty")
-            Accessible.name: qsTr("Archive contents")
-            columns: [
-                { title: qsTr("Name"), role: "name", fill: true, iconRole: "icon", sortable: false },
-                { title: qsTr("Size"), role: "size", width: 7, align: Qt.AlignRight, sortable: false },
-                { title: qsTr("Modified"), role: "mtime", width: 11, sortable: false, text: v => v > 0 ? Qt.formatDateTime(new Date(v), "yyyy-MM-dd HH:mm") : "" }
-            ]
-            onActivated: row => {
-                const r = rows.get(row);
-                if (r && r.dir) {
-                    view.backend.enter(r.id);
+
+            DataTable {
+                id: table
+                anchors.fill: parent
+                model: rows
+                selectionMode: DataTable.MultiSelection
+                placeholderText: qsTr("This folder is empty")
+                Accessible.name: qsTr("Archive contents")
+                columns: [
+                    { title: qsTr("Name"), role: "name", fill: true, iconRole: "icon", sortable: false },
+                    { title: qsTr("Size"), role: "size", width: 7, align: Qt.AlignRight, sortable: false },
+                    { title: qsTr("Modified"), role: "mtime", width: 11, sortable: false, text: v => v > 0 ? Qt.formatDateTime(new Date(v), "yyyy-MM-dd HH:mm") : "" }
+                ]
+                onActivated: row => {
+                    const r = rows.get(row);
+                    if (r && r.dir) {
+                        view.backend.enter(r.id);
+                    }
                 }
+            }
+
+            // What a drag of the selected rows carries.
+            readonly property string payload: {
+                const tokens = table.selectedRows.map(r => rows.get(r)).filter(r => r).map(r => r.token);
+                const archive = "file://" + view.backend.archivePath.split("/").map(encodeURIComponent).join("/");
+                return JSON.stringify({ "version": 1, "archive": archive, "entries": tokens });
+            }
+
+            Item {
+                id: dragSource
+                width: 1
+                height: 1
+                Drag.dragType: Drag.Automatic
+                Drag.supportedActions: Qt.CopyAction
+                Drag.mimeData: ({
+                        "application/x-telamon-archive-entries": tableBox.payload,
+                        "application/x-atlas-archive-entries": tableBox.payload
+                    })
+                Drag.active: dragOut.active
+            }
+            DragHandler {
+                id: dragOut
+                target: null
+                acceptedButtons: Qt.LeftButton
+                enabled: table.selectedRows.length > 0
             }
         }
 

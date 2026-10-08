@@ -17,11 +17,16 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 telamon-framework-ui.workspace = true
 telamon-archive-core = { path = "../../crates/telamon-archive-core" }
+telamon-archive-service = { path = "../../crates/telamon-archive-service" }
 cxx = "1"
 cxx-qt = "0.10"
 cxx-qt-lib = "0.10"
 log.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+zbus = "5"
+serde = "1"
 
 [build-dependencies]
 cxx-qt-build = "0.10"

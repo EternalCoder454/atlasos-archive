@@ -6,7 +6,7 @@
   <name>Telamon Archive</name>
   <summary>Open, extract and create archives</summary>
   <description>
-    <p>Telamon Archive is the archive manager of Telamon OS. Double-click an archive to browse it like a folder, preview what is inside and drag files out, or extract it all with one click. It reads and writes ZIP (with AES-256 encryption), 7z and tar archives, and opens RAR, ISO, cab, cpio, deb and rpm files.</p>
+    <p>Telamon Archive is the archive manager of Telamon OS. Double-click an archive to browse it like a folder, preview what is inside and drag files out, or extract it all with one click. It reads and writes ZIP, 7z and tar archives, and opens RAR, ISO, cab, cpio, deb and rpm files.</p>
     <p>Every archive is opened in a sandbox that can only write into the folder you extract to, and nothing an archive holds can land outside it. Archives built to fill your disk are caught before they do.</p>
   </description>
   <replaces>
@@ -34,6 +34,11 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.3.0" date="2026-10-08">
+      <description>
+        <p>Other apps can ask Archive to extract, compress and test through the Archive1 D-Bus API, with progress, Pause, Resume and Cancel. Compress… and Extract All… open their dialogs, and Archive can make ZIP, 7z and tar archives.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-07">
       <description>
         <p>Renamed to Telamon Archive. Your settings and the leftovers of unfinished jobs carry over.</p>

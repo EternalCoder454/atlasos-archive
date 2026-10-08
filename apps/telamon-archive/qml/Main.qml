@@ -27,7 +27,10 @@ TelamonWindow {
     LayoutMirroring.childrenInherit: true
 
     // Closing the window cancels the job; the client removes its staging.
-    onClosing: root.backend.cancelJob()
+    onClosing: {
+        root.backend.cancelJob();
+        root.backend.reset();
+    }
 
     // A file dropped on the window opens, unless a job is running.
     DropArea {

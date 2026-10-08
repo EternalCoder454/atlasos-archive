@@ -1,0 +1,5 @@
+[D-BUS Service]
+# The name this app had until 0.2.0 (Atlas Archive). Kept for one release with
+# the rest of data/legacy: callers that still use it start the same program.
+Name=net.eterneon.atlas.archive
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/telamon-archive --service

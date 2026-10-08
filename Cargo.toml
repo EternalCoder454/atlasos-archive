@@ -3,13 +3,14 @@ resolver = "3"
 members = [
     "crates/telamon-archive-core",
     "crates/telamon-archive-engine",
+    "crates/telamon-archive-service",
     "apps/telamon-archive-worker",
     "apps/telamon-archive-cli",
     "apps/telamon-archive",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/EternalCoder454/atlasos-archive"
