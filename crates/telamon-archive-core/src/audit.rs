@@ -241,6 +241,31 @@ fn chmod_fd(fd: BorrowedFd<'_>, mode: u32, modes_kept: bool) -> io::Result<()> {
     }
 }
 
+/// `chown` of the group by the handle, to the group of staging. A compromised
+/// worker could hand its files to any group the user belongs to (wheel,
+/// docker, libvirt), and the move out would then leave them readable, or
+/// writable, by that group's other members. Best effort: the worker cannot
+/// change a group itself any more (its filter denies it), so a file whose group
+/// is not staging's was made so by something honest (a setgid destination
+/// folder the user is not in), and a refusal is no error. Where the file
+/// system keeps no owners a refusal is no error either, as for modes.
+fn chgrp_fd(fd: BorrowedFd<'_>, gid: libc::gid_t, modes_kept: bool) -> io::Result<()> {
+    // SAFETY: a C string; uid -1 leaves the owner alone.
+    let r = check(unsafe { libc::chown(proc_path(fd).as_ptr(), libc::uid_t::MAX, gid) });
+    match r {
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EPERM | libc::ENOTSUP | libc::EINVAL)
+            ) =>
+        {
+            let _ = modes_kept;
+            Ok(())
+        }
+        r => r,
+    }
+}
+
 /// The audit was cancelled (`stop` said so): not a failure of the files.
 fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "the audit was cancelled")
@@ -907,6 +932,7 @@ fn audit_fd(
         .collect();
     fix.sort_by_key(|&i| found[i].parent);
     let mut folders = Folders::new();
+    let staging_gid = fstat(staging)?.st_gid;
     for (n, i) in fix.into_iter().enumerate() {
         if n % 256 == 0 && stop() {
             return Err(stopped());
@@ -924,6 +950,9 @@ fn audit_fd(
         } else {
             (f.st.st_mode & 0o777 & !umask) | 0o700
         };
+        if f.st.st_gid != staging_gid {
+            chgrp_fd(item.as_fd(), staging_gid, modes_kept)?;
+        }
         if f.st.st_mode & 0o7777 != want {
             chmod_fd(item.as_fd(), want, modes_kept)?;
         }
@@ -1097,6 +1126,46 @@ mod tests {
         assert_eq!(mode(&st.join("locked")), 0o700);
         assert!(st.join("locked/in").exists());
         assert_eq!(a.tree.lone_top, None);
+    }
+
+    #[test]
+    fn files_given_to_another_group_are_given_back() {
+        use std::os::unix::fs::MetadataExt;
+        let s = Scratch::new("group");
+        let st = s.staging();
+        std::fs::create_dir(st.join("d")).unwrap();
+        std::fs::write(st.join("d/f"), b"x").unwrap();
+        let mine = std::fs::metadata(&st).unwrap().gid();
+        // A group the user may use: any other one the process belongs to
+        // (root may use any).
+        // SAFETY: plain calls with valid buffers.
+        let other = unsafe {
+            let mut groups = [0 as libc::gid_t; 64];
+            let n = libc::getgroups(64, groups.as_mut_ptr());
+            let mut found = groups[..n.max(0) as usize]
+                .iter()
+                .copied()
+                .find(|&g| g != mine);
+            if found.is_none() && libc::geteuid() == 0 {
+                found = Some(mine.wrapping_add(1234));
+            }
+            found
+        };
+        let Some(other) = other else {
+            eprintln!("skipped: the user belongs to no second group");
+            return;
+        };
+        for p in [st.join("d/f"), st.join("d")] {
+            let c = CString::new(p.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a C string.
+            assert_eq!(
+                unsafe { libc::chown(c.as_ptr(), libc::uid_t::MAX, other) },
+                0
+            );
+        }
+        audit_path(&st, 0o022).unwrap();
+        assert_eq!(std::fs::metadata(st.join("d/f")).unwrap().gid(), mine);
+        assert_eq!(std::fs::metadata(st.join("d")).unwrap().gid(), mine);
     }
 
     #[test]

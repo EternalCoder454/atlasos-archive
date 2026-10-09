@@ -190,6 +190,7 @@ fn landlock(
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -395,6 +396,122 @@ mod tests {
         let r =
             unsafe { libc::setxattr(ok.as_ptr(), c"user.x".as_ptr(), b"1".as_ptr().cast(), 1, 0) };
         assert!(eperm(r.into()), "xattr");
+        // Landlock does not rule the mode, owner, times or extended attributes
+        // of files that exist: the filter must. `sibling` is the user's own
+        // file outside staging, as any file of the user's would be.
+        let sib = std::ffi::CString::new(dir.join("sibling").into_os_string().into_encoded_bytes())
+            .unwrap();
+        let ts = [libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        }; 2];
+        // SAFETY: C strings, valid pointers and plain integers.
+        unsafe {
+            let uid = libc::getuid();
+            let gid = libc::getgid();
+            assert!(
+                eperm(libc::chmod(sib.as_ptr(), 0o777).into()),
+                "chmod by path"
+            );
+            assert!(
+                eperm(libc::fchmodat(libc::AT_FDCWD, sib.as_ptr(), 0o777, 0).into()),
+                "fchmodat"
+            );
+            assert!(
+                eperm(libc::syscall(452, libc::AT_FDCWD, sib.as_ptr(), 0o777, 0)),
+                "fchmodat2"
+            );
+            assert!(eperm(libc::chown(sib.as_ptr(), uid, gid).into()), "chown");
+            assert!(eperm(libc::lchown(sib.as_ptr(), uid, gid).into()), "lchown");
+            assert!(
+                eperm(libc::fchownat(libc::AT_FDCWD, sib.as_ptr(), uid, gid, 0).into()),
+                "fchownat"
+            );
+            assert!(
+                eperm(libc::utimensat(libc::AT_FDCWD, sib.as_ptr(), ts.as_ptr(), 0).into()),
+                "utimensat by path"
+            );
+            assert!(
+                eperm(libc::utimes(sib.as_ptr(), std::ptr::null()).into()),
+                "utimes"
+            );
+            assert!(
+                eperm(libc::removexattr(sib.as_ptr(), c"user.x".as_ptr()).into()),
+                "removexattr"
+            );
+            assert!(
+                eperm(libc::lremovexattr(sib.as_ptr(), c"user.x".as_ptr()).into()),
+                "lremovexattr"
+            );
+            // What extraction does still works, through a descriptor it opened
+            // below staging: fchmod and futimens.
+            let fd = libc::open(ok.as_ptr(), libc::O_RDWR | libc::O_NOFOLLOW);
+            assert!(fd >= 0, "open a staged file");
+            assert_eq!(libc::fchmod(fd, 0o600), 0, "fchmod on a staged file");
+            assert_eq!(
+                libc::futimens(fd, ts.as_ptr()),
+                0,
+                "futimens on a staged file"
+            );
+            libc::close(fd);
+            // Calls that reach other processes, namespaces and the kernel's
+            // larger surfaces stay out of reach (each denied by number, so the
+            // check does not depend on libc's wrappers).
+            for (name, nr, args) in [
+                ("ptrace", libc::SYS_ptrace, [0u64, 0, 0, 0]),
+                (
+                    "unshare",
+                    libc::SYS_unshare,
+                    [libc::CLONE_NEWNS as u64, 0, 0, 0],
+                ),
+                ("setns", libc::SYS_setns, [0, 0, 0, 0]),
+                ("io_uring_setup", libc::SYS_io_uring_setup, [1, 0, 0, 0]),
+                ("bpf", libc::SYS_bpf, [0, 0, 0, 0]),
+                ("perf_event_open", libc::SYS_perf_event_open, [0, 0, 0, 0]),
+                ("keyctl", libc::SYS_keyctl, [0, 0, 0, 0]),
+                ("userfaultfd", libc::SYS_userfaultfd, [0, 0, 0, 0]),
+                ("mount", libc::SYS_mount, [0, 0, 0, 0]),
+                ("open_tree", libc::SYS_open_tree, [0, 0, 0, 0]),
+                ("fsopen", libc::SYS_fsopen, [0, 0, 0, 0]),
+                ("pidfd_open", libc::SYS_pidfd_open, [1, 0, 0, 0]),
+                ("process_vm_readv", libc::SYS_process_vm_readv, [1, 0, 0, 0]),
+                ("kcmp", libc::SYS_kcmp, [0, 0, 0, 0]),
+                (
+                    "name_to_handle_at",
+                    libc::SYS_name_to_handle_at,
+                    [0, 0, 0, 0],
+                ),
+                ("quotactl_fd", 443, [0, 0, 0, 0]),
+                ("lsm_set_self_attr", 460, [0, 0, 0, 0]),
+                ("open_tree_attr", 467, [0, 0, 0, 0]),
+                ("file_setattr", 469, [0, 0, 0, 0]),
+                ("fanotify_init", libc::SYS_fanotify_init, [0, 0, 0, 0]),
+                // fork by clone: no CLONE_THREAD
+                (
+                    "clone without CLONE_THREAD",
+                    libc::SYS_clone,
+                    [libc::SIGCHLD as u64, 0, 0, 0],
+                ),
+            ] {
+                assert!(
+                    eperm(libc::syscall(nr, args[0], args[1], args[2], args[3])),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::metadata(dir.join("sibling"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            std::fs::metadata(dir.join("secret"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            "the sibling's mode did not change"
+        );
     }
 
     #[test]
