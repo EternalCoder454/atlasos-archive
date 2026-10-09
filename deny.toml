@@ -1,0 +1,39 @@
+# cargo-deny: the supply-chain rules (CI runs `cargo deny --locked check`).
+# Advisories come from RustSec; a crate with a known vulnerability, an
+# unmaintained or yanked crate, an unexpected licence, a crate from outside
+# crates.io or the one pinned atlas-framework repository all fail the check.
+
+[graph]
+# What ships: the Linux build (Telamon OS is x86_64; aarch64 is kept honest).
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Each entry here needs a reason and an owner; none today.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licences only. Telamon Archive itself is MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A path dependency inside the workspace is not a wildcard.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/EternalCoder454/atlas-framework"]

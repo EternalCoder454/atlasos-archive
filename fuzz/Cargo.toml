@@ -1,0 +1,66 @@
+[package]
+name = "telamon-archive-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "cargo-fuzz targets for the code that reads what an archive and its reader say (run: cargo fuzz run <target>)"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not part of the app's workspace: libfuzzer-sys is built only for fuzzing.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+libc = "0.2"
+telamon-archive-core = { path = "../crates/telamon-archive-core" }
+telamon-archive-service = { path = "../crates/telamon-archive-service" }
+
+[profile.release]
+debug = true
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "entry_path"
+path = "fuzz_targets/entry_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto"
+path = "fuzz_targets/proto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "symlink"
+path = "fuzz_targets/symlink.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "service_text"
+path = "fuzz_targets/service_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_staging"
+path = "fuzz_targets/audit_staging.rs"
+test = false
+doc = false
+bench = false

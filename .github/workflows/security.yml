@@ -1,0 +1,112 @@
+name: Security
+
+# The supply chain (advisories, licences, sources) and a short fuzz run of the
+# parsers that read untrusted input. Weekly as well, because a new advisory
+# can hit a lock file that did not change.
+#   deny  : cargo-deny against deny.toml, with the RustSec database
+#   fuzz  : every target of fuzz/ for 20 seconds (libFuzzer, no sanitizer: the
+#           targets are safe Rust; their asserts are the checks)
+
+on:
+  push:
+    branches: [main, beta]
+    paths:
+      - crates/**
+      - apps/**
+      - fuzz/**
+      - deny.toml
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/security.yml
+  pull_request:
+    paths:
+      - crates/**
+      - apps/**
+      - fuzz/**
+      - deny.toml
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/security.yml
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Tools
+        run: dnf -y install cargo rust gcc gcc-c++ cmake make openssl-devel perl-FindBin perl-IPC-Cmd git-core tar zstd
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: bin
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/tools
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-f44
+      - name: Install cargo-deny
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: cargo install --locked --root /opt/tools --version "$CARGO_DENY_VERSION" cargo-deny
+      # --locked: the check is of the lock file as it is.
+      - name: Advisories, licences, bans, sources
+        run: /opt/tools/bin/cargo-deny --locked check
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Tools
+        run: dnf -y install cargo rust gcc gcc-c++ cmake make openssl-devel perl-FindBin perl-IPC-Cmd git-core tar zstd
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: bin
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/tools
+          key: cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}-f44
+      - name: Install cargo-fuzz
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: cargo install --locked --root /opt/tools --version "$CARGO_FUZZ_VERSION" cargo-fuzz
+      # libFuzzer's instrumentation flags are nightly ones; the stable
+      # compiler takes them with RUSTC_BOOTSTRAP, which only this job sets.
+      - name: Fuzz targets
+        working-directory: fuzz
+        env:
+          RUSTC_BOOTSTRAP: "1"
+        run: |
+          export PATH=/opt/tools/bin:$PATH
+          cargo fuzz build --sanitizer none
+          for target in $(cargo fuzz list); do
+            echo "::group::$target"
+            cargo fuzz run --sanitizer none "$target" -- -max_total_time=20 -timeout=10 -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+      # The sandbox tests need Landlock and a seccomp filter, which a hosted
+      # runner's container may not allow: they are the CI job's, not this one's.
+      - name: Core tests (paths, names, links, audit, protocol)
+        run: cargo test -p telamon-archive-core --locked

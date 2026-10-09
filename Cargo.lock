@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "telamon-archive"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cxx",
  "cxx-qt",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "telamon-archive-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "log",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "telamon-archive-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "telamon-archive-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "log",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "telamon-archive-service"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "log",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "telamon-archive-worker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "landlock",
  "libc",
