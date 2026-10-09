@@ -369,6 +369,29 @@ fn extract_all_is_a_dialog_job_that_starts_when_confirmed() {
 }
 
 #[test]
+fn extract_all_stops_when_the_archive_was_swapped_while_the_dialog_was_open() {
+    let e = Env::new("swap");
+    let a = e.tar_gz("data.tar.gz", &[("x.txt", "x")]);
+    let other = e.tar_gz("other.tar.gz", &[("evil.txt", "e")]);
+    let id = e.svc.extract_all(&[e.u(&a)], opts()).unwrap();
+    // Another file takes the name while the dialog waits.
+    std::fs::rename(&other, &a).unwrap();
+    let err = e.svc.confirm_extract_all(id, e.dest.clone()).unwrap_err();
+    assert!(format!("{err:?}").contains("replaced"), "{err:?}");
+    assert_eq!(e.svc.snapshot(id).unwrap().state, State::WaitingForUser);
+    assert!(e.ls().is_empty());
+    // A relative folder is not taken either, whatever the state of the archive:
+    // the refusal is about the folder.
+    std::fs::rename(&a, e.src.join("swapped.tar.gz")).unwrap();
+    std::fs::rename(e.src.join("swapped.tar.gz"), &a).unwrap();
+    let err = e
+        .svc
+        .confirm_extract_all(id, PathBuf::from("dest"))
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("full path"), "{err:?}");
+}
+
+#[test]
 fn extract_entries_puts_the_items_in_the_folder() {
     let e = Env::new("entries");
     let a = e.tar_gz(

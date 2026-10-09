@@ -34,6 +34,7 @@ const ARCH: u32 = 4;
 const ARG0_LOW: u32 = 16;
 const ARG0_HIGH: u32 = 20;
 const ARG1_LOW: u32 = 24;
+const ARG1_HIGH: u32 = 28;
 
 /// What a classic BPF program may hold.
 const BPF_MAXINSNS: usize = 4096;
@@ -70,6 +71,18 @@ const SYS_SETXATTRAT: i64 = 463;
 const SYS_IO_PGETEVENTS: i64 = 333;
 #[cfg(target_arch = "aarch64")]
 const SYS_IO_PGETEVENTS: i64 = 292;
+/// `removexattrat` and `fchmodat2`, newer than the libc crate's tables (the
+/// shared table, the same number on every architecture).
+const SYS_REMOVEXATTRAT: i64 = 466;
+const SYS_FCHMODAT2: i64 = 452;
+const SYS_QUOTACTL_FD: i64 = 443;
+const SYS_LSM_GET_SELF_ATTR: i64 = 459;
+const SYS_LSM_SET_SELF_ATTR: i64 = 460;
+const SYS_LSM_LIST_MODULES: i64 = 461;
+const SYS_OPEN_TREE_ATTR: i64 = 467;
+const SYS_FILE_GETATTR: i64 = 468;
+const SYS_FILE_SETATTR: i64 = 469;
+const SYS_LISTNS: i64 = 470;
 const SYS_STATMOUNT: i64 = 457;
 const SYS_LISTMOUNT: i64 = 458;
 
@@ -98,6 +111,21 @@ fn denied() -> Vec<i64> {
         libc::SYS_lsetxattr,
         libc::SYS_fsetxattr,
         SYS_SETXATTRAT,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
+        libc::SYS_fremovexattr,
+        SYS_REMOVEXATTRAT,
+        // Landlock rules who may open, create, rename and remove, but not who
+        // may change the mode, owner or times of a file that exists: a
+        // compromised parser could `chmod` or `chown` any file of the user's
+        // by its path. The worker changes modes only with `fchmod` on a
+        // descriptor it opened below staging, so every call that takes a path
+        // is denied (`utimensat` below is allowed only without one: that is
+        // `futimens`).
+        libc::SYS_fchownat,
+        libc::SYS_fchown,
+        libc::SYS_fchmodat,
+        SYS_FCHMODAT2,
         // Kernel surfaces no parser needs.
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
@@ -142,6 +170,19 @@ fn denied() -> Vec<i64> {
         SYS_IO_PGETEVENTS,
         SYS_STATMOUNT,
         SYS_LISTMOUNT,
+        // Newer siblings of calls denied above, and calls into the security
+        // modules (a chosen SELinux label for new files): nothing here needs
+        // them, and a kernel that has them should not hand them to a parser.
+        SYS_QUOTACTL_FD,
+        SYS_LSM_GET_SELF_ATTR,
+        SYS_LSM_SET_SELF_ATTR,
+        SYS_LSM_LIST_MODULES,
+        SYS_OPEN_TREE_ATTR,
+        SYS_FILE_GETATTR,
+        SYS_FILE_SETATTR,
+        SYS_LISTNS,
+        libc::SYS_fanotify_init,
+        libc::SYS_fanotify_mark,
         // Another process of the same user, by shared memory, message
         // queues or semaphores: nothing the parsers need.
         libc::SYS_shmget,
@@ -177,7 +218,17 @@ fn denied() -> Vec<i64> {
         libc::SYS_move_pages,
     ];
     #[cfg(target_arch = "x86_64")]
-    calls.extend([libc::SYS_fork, libc::SYS_vfork, libc::SYS_modify_ldt]);
+    calls.extend([
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_modify_ldt,
+        libc::SYS_chmod,
+        libc::SYS_chown,
+        libc::SYS_lchown,
+        libc::SYS_utime,
+        libc::SYS_utimes,
+        libc::SYS_futimesat,
+    ]);
     calls
 }
 
@@ -216,11 +267,17 @@ fn errno(e: i32) -> u32 {
 /// Allows call `nr` only when its first argument (both halves) is 0, else
 /// EPERM; any other call goes on to the next check. 8 instructions.
 fn allow_only_pid_zero(p: &mut Vec<libc::sock_filter>, nr: i64) {
+    allow_only_zero_arg(p, nr, ARG0_LOW, ARG0_HIGH);
+}
+
+/// The same for an argument at other offsets: `utimensat` with no path
+/// (`futimens`) is allowed, one with a path is not.
+fn allow_only_zero_arg(p: &mut Vec<libc::sock_filter>, nr: i64, low: u32, high: u32) {
     p.extend([
         jump(JMP_JEQ_K, nr as u32, 0, 6),
-        stmt(LD_W_ABS, ARG0_LOW),
+        stmt(LD_W_ABS, low),
         jump(JMP_JEQ_K, 0, 0, 3),
-        stmt(LD_W_ABS, ARG0_HIGH),
+        stmt(LD_W_ABS, high),
         jump(JMP_JEQ_K, 0, 0, 1),
         stmt(RET_K, libc::SECCOMP_RET_ALLOW),
         stmt(RET_K, errno(libc::EPERM)),
@@ -266,6 +323,7 @@ fn program() -> Vec<libc::sock_filter> {
     for nr in own_process_only() {
         allow_only_pid_zero(&mut p, nr);
     }
+    allow_only_zero_arg(&mut p, libc::SYS_utimensat, ARG1_LOW, ARG1_HIGH);
     deny_ioctls(&mut p);
     p.push(jump(JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1));
     p.push(stmt(RET_K, errno(libc::ENOSYS)));

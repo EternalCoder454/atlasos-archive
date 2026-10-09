@@ -8,7 +8,8 @@
 //! Nothing here touches archive bytes: that is the worker's, through
 //! `telamon_archive_core::client`.
 
-mod json;
+#[doc(hidden)]
+pub mod json;
 mod run;
 pub mod uri;
 pub mod validate;
@@ -200,6 +201,9 @@ pub enum Answer {
 pub enum Dialog {
     Extract {
         archives: Vec<PathBuf>,
+        /// Which file each path named when the dialog was asked for; the job
+        /// stops if one is another file when the answer comes.
+        ids: Vec<FileId>,
         folder: PathBuf,
     },
     Compress {
@@ -638,6 +642,7 @@ impl Service {
             .unwrap_or_default();
         let dialog = Dialog::Extract {
             archives: items.iter().map(|i| i.archive.clone()).collect(),
+            ids: items.iter().map(|i| i.id).collect(),
             folder,
         };
         let title = run::extract_title(&items);
@@ -654,19 +659,27 @@ impl Service {
     pub fn confirm_extract_all(&self, id: u32, folder: PathBuf) -> Result<(), ApiError> {
         validate::check_folder(&folder)?;
         let job = self.dialog_job(id, Kind::Extract)?;
-        let Some(Dialog::Extract { archives, .. }) = job.lock().dialog.clone() else {
+        let Some(Dialog::Extract { archives, ids, .. }) = job.lock().dialog.clone() else {
             return Err(ApiError::InvalidArgs(
                 "That job isn't waiting for a folder.".into(),
             ));
         };
         let mut items = Vec::new();
-        for a in &archives {
+        for (a, asked) in archives.iter().zip(&ids) {
             let meta = std::fs::metadata(a).map_err(|_| {
                 ApiError::InvalidArgs(format!("“{}” isn't there any more.", validate::shown(a)))
             })?;
+            // The dialog can stay open for minutes: a name now on another
+            // file is not the archive that was asked about.
+            if FileId::of(&meta) != *asked {
+                return Err(ApiError::InvalidArgs(format!(
+                    "“{}” has been replaced since the question was asked.",
+                    validate::shown(a)
+                )));
+            }
             items.push(run::ExtractItem {
                 archive: a.clone(),
-                id: FileId::of(&meta),
+                id: *asked,
                 dest_dir: folder.clone(),
             });
         }

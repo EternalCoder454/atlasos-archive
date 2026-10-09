@@ -34,6 +34,11 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.4.0" date="2026-10-08">
+      <description>
+        <p>Security: the archive reader can no longer change the permissions or owner of your files if it is ever compromised, only the program that started a job can answer its questions or cancel it, and no other program can quit Archive through the bus.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-10-08">
       <description>
         <p>Other apps can ask Archive to extract, compress and test through the Archive1 D-Bus API, with progress, Pause, Resume and Cancel. Compress… and Extract All… open their dialogs, and Archive can make ZIP, 7z and tar archives.</p>

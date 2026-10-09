@@ -114,13 +114,34 @@ uint Archive1Core::test(const QStringList &a, const QVariantMap &o, QString *n, 
     return adopted(m_service->test(a, o, n, m));
 }
 
+namespace
+{
+// What `Options::clean` keeps in the service: printable ASCII, at most 4096
+// characters, and for a window handle only the two forms the program reads.
+QString cleanHandle(const QString &s, bool window)
+{
+    if (s.isEmpty() || s.size() > 4096) {
+        return {};
+    }
+    for (const QChar c : s) {
+        if (c.unicode() < 0x20 || c.unicode() > 0x7e) {
+            return {};
+        }
+    }
+    if (window && !s.startsWith(QLatin1String("wayland:")) && !s.startsWith(QLatin1String("x11:"))) {
+        return {};
+    }
+    return s;
+}
+}
+
 bool Archive1Core::open(const QString &archive, const QVariantMap &o, QString *n, QString *m)
 {
     const QString path = m_service->open(archive, n, m);
     if (path.isEmpty()) {
         return false;
     }
-    Q_EMIT openRequested(path, o.value(QStringLiteral("activation_token")).toString(), o.value(QStringLiteral("parent_window")).toString());
+    Q_EMIT openRequested(path, cleanHandle(o.value(QStringLiteral("activation_token")).toString(), false), cleanHandle(o.value(QStringLiteral("parent_window")).toString(), true));
     return true;
 }
 
@@ -131,8 +152,8 @@ void Archive1Core::onAdded(uint id)
         return;
     }
     auto *o = new Objects;
-    o->telamon = new TelamonJobObject(item);
-    o->atlas = new AtlasJobObject(item);
+    o->telamon = new TelamonJobObject(item, this, id);
+    o->atlas = new AtlasJobObject(item, this, id);
     o->telamon->setParent(this);
     o->atlas->setParent(this);
     QDBusConnection bus = QDBusConnection::sessionBus();
@@ -218,6 +239,7 @@ void Archive1Core::onFinished(uint id, const QString &state, const QStringList &
 
 void Archive1Core::onRemoved(uint id)
 {
+    m_owners.remove(id);
     Objects *o = m_objects.take(id);
     if (!o) {
         return;

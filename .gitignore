@@ -1,3 +1,8 @@
 /target/
 /build/
 /out/
+
+# cargo-fuzz: build output, working corpora and crashing inputs
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/

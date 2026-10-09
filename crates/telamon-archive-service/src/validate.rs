@@ -83,6 +83,14 @@ pub fn folder(text: &str) -> Result<PathBuf, ApiError> {
 }
 
 pub fn check_folder(path: &Path) -> Result<(), ApiError> {
+    // A dialog's answer comes as plain text: a relative folder would be read
+    // against this program's working folder.
+    if !path.is_absolute() {
+        return Err(invalid(format!(
+            "The folder “{}” isn't a full path.",
+            shown(path)
+        )));
+    }
     let meta = std::fs::metadata(path).map_err(|e| {
         invalid(match e.kind() {
             std::io::ErrorKind::NotFound => format!("The folder “{}” isn't there.", shown(path)),
@@ -153,6 +161,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn a_relative_folder_is_not_a_folder() {
+        let d = dir("relative");
+        std::fs::create_dir(d.join("sub")).unwrap();
+        // "." exists (it is the working folder) and can be written, and is
+        // still refused: it is not a full path.
+        assert!(check_folder(Path::new(".")).is_err());
+        assert!(check_folder(&d.join("sub")).is_ok());
     }
 
     #[test]

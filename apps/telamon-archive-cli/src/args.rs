@@ -159,7 +159,7 @@ where
     };
     let cmd = command.as_str();
     if !matches!(cmd, "list" | "extract" | "test" | "info" | "create") {
-        return usage(format!("Unknown command {command}."));
+        return usage(format!("Unknown command {}.", shown(OsStr::new(&command))));
     }
     if cmd == "create" {
         return Ok(done(Command::Create, verbose, worker));
@@ -337,6 +337,15 @@ mod tests {
 
     fn err(args: &[&str]) -> String {
         p(args).unwrap_err().0
+    }
+
+    #[test]
+    fn an_unknown_command_is_never_echoed_with_control_characters() {
+        // Where the word is read as the command (the line after it is a name).
+        let msg = err(&["\x1b]0;owned\x07"]);
+        assert!(!msg.contains('\x1b') && !msg.contains('\x07'), "{msg:?}");
+        let msg = err(&["lisst\x1b[31m", "a.zip"]);
+        assert!(!msg.contains('\x1b'), "{msg:?}");
     }
 
     #[test]

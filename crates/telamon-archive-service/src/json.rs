@@ -90,7 +90,9 @@ impl Snapshot {
         o.push_str(",\"dialog\":");
         match &self.dialog {
             None => o.push_str("null"),
-            Some(Dialog::Extract { archives, folder }) => {
+            Some(Dialog::Extract {
+                archives, folder, ..
+            }) => {
                 o.push_str("{\"type\":\"extract\",\"archives\":");
                 list(
                     &mut o,

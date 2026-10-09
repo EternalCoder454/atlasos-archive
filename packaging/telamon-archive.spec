@@ -12,7 +12,7 @@
 %endif
 
 Name:           telamon-archive
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Telamon Archive, the archive manager of Telamon OS
 License:        MIT
@@ -29,6 +29,8 @@ BuildRequires:  rust
 BuildRequires:  rust-srpm-macros
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
+# readelf and nm, for the hardening check in %%check
+BuildRequires:  binutils
 BuildRequires:  cmake
 BuildRequires:  ninja-build
 BuildRequires:  corrosion
@@ -141,6 +143,19 @@ for check in "%{buildroot}%{_bindir}/telamon-archive:TELAMON_ARCHIVE_WORKER" \
         exit 1
     fi
 done
+# Hardened as the distribution builds programs: PIE, full RELRO, a
+# non-executable stack; the stack protector and fortified calls in the C++ one.
+bash packaging/check-hardening.sh --stack-protector %{buildroot}%{_bindir}/telamon-archive
+bash packaging/check-hardening.sh %{buildroot}%{_bindir}/telamon-archive-cli \
+    %{buildroot}%{_libexecdir}/telamon-archive/telamon-archive-worker
+# The sandbox is not optional in a shipped worker: the test-only "run without
+# one" path (the `unsandboxed` feature) is not in it.
+rc=0
+grep -qF "running WITHOUT a sandbox" %{buildroot}%{_libexecdir}/telamon-archive/telamon-archive-worker || rc=$?
+if [ "$rc" != 1 ]; then
+    echo "the worker was built with the unsandboxed feature (grep status $rc)" >&2
+    exit 1
+fi
 desktop-file-validate %{buildroot}%{_datadir}/applications/net.eterneon.telamon.archive.desktop
 # What it was called until 0.2.0, kept for one release (data/legacy): the old
 # names reach the same programs and the same MimeType list, and the old
@@ -180,6 +195,19 @@ appstream-util validate-relax --nonet \
 %{_datadir}/dbus-1/services/net.eterneon.atlas.archive.service
 
 %changelog
+* Thu Oct 08 2026 EternalHell <77252745+EternalCoder454@users.noreply.github.com> - 0.4.0-1
+- Secure phase (docs/SECURITY.md): the worker's system call filter also
+  denies changing the mode, owner, times or extended attributes of a file by
+  path (Landlock does not rule them) and the newest kernel calls the parsers
+  never need; the audit resets the group of staged files
+- Only the program that started a job can pause, resume, cancel or answer it
+  over D-Bus; at most 8 finished-job windows stay open; the application object
+  KDBusService exports (quit(), closeAllWindows()) is no longer on the bus
+- The Extract All dialog stops if the archive was replaced while it waited and
+  takes absolute folders only; window handles and activation tokens are
+  cleaned; the GUI writes no core file and is not dumpable
+- Hardening checked in %check (PIE, RELRO, BIND_NOW, stack protector); release
+  builds trap on integer overflow; cargo-deny and fuzz targets in CI
 * Thu Oct 08 2026 EternalHell <77252745+EternalCoder454@users.noreply.github.com> - 0.3.0-1
 - The Archive1 D-Bus API (net.eterneon.telamon.Archive1, and the old
   net.eterneon.atlas.Archive1): ExtractHere, ExtractTo, ExtractAll,

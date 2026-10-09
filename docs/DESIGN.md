@@ -114,6 +114,14 @@ test, preview, create, edit) runs in a fresh `telamon-archive-worker` process:
    `ioprio_set`, `migrate_pages`, `move_pages`, `pidfd_send_signal`,
    `process_mrelease`, `setpgid` and `setsid` (the group stays the one the
    client made), and
+   the calls that change the mode, owner, times or extended attributes of a
+   file *by path* (`chmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`,
+   `fchownat`, `fchown`, `utime`, `utimes`, `futimesat`, `removexattr` and
+   its kin; `utimensat` only without a path, which is `futimens`) because
+   Landlock does not rule them and the worker needs them only on the
+   descriptors it opened below staging, the newer siblings of calls denied
+   here (`open_tree_attr`, `file_getattr`/`file_setattr`, `listns`,
+   `quotactl_fd`), the security-module calls (`lsm_*`), `fanotify`, and
    the terminal and btrfs `ioctl` commands that reach outside the worker
    (`TIOCSTI`, `TIOCLINUX`, `TIOCCONS`, `TIOCSCTTY`, `TIOCSETD`, subvolume
    and snapshot creation); `prlimit64` and the `sched_set*` calls work only
@@ -676,7 +684,14 @@ Job objects, `/net/eterneon/telamon/archive/job/<n>`, interface
   a caller that can answer a question without our window (`true` when the
   job took the answer; the window can answer too, whoever is first). A
   question always brings our window up as well, so a caller that can't
-  answer loses nothing.
+  answer loses nothing. **Only the program that started a job** (its unique
+  bus name, remembered when the job is made) may `Pause`, `Resume`, `Cancel`
+  or answer it; anyone else gets `net.eterneon.telamon.Archive1.Error.AccessDenied`.
+  Without that, any process of the user could say "replace" or "unpack
+  anyway" to a question put to someone else. Properties and `Finished` stay
+  readable by everyone. The program does not know *who* a caller is beyond
+  its bus name (a Flatpak app with a bus grant is a caller like any other:
+  the portal is the supported way for those).
 - signal: `Finished(s state, as results)`, `results` being the URIs of what
   was made (for Explorer to select): an extraction's folders or items, the
   archive. Sent once, after the last property change. Programs that listen
@@ -875,11 +890,18 @@ rights.
 
 ## Fuzzing and malicious archives
 
-cargo-fuzz targets: `entry_path` (path checks), `names` (decode, display and
-disk forms), `proto` (the client's reply parser), `list` (libarchive and zip
-listing of arbitrary bytes, every format) and `extract` (arbitrary bytes
-extracted into a temporary folder, asserting nothing appears outside it, no
-symlink escapes, no device node, no setuid bit). The test suite holds crafted
+cargo-fuzz targets (`fuzz/`, built with `cargo fuzz run --sanitizer none <target>`
+and `RUSTC_BOOTSTRAP=1` on the stable toolchain; CI runs each for 20 s,
+`.github/workflows/security.yml`): `entry_path` (path checks, all encodings),
+`names` (decode, display and disk forms), `proto` (the client's reply
+parser, and the frame reader), `symlink` (link targets), `service_text`
+(URIs the bus callers send, and the JSON strings) and `audit_staging`
+(staging built from random operations, as a compromised reader could leave it,
+then audited: afterwards only plain files, folders and relative links that
+stay inside it, no setuid bit, no name with controls, hard links with all their
+names inside, and the file outside untouched). `list` and `extract`
+(libarchive on arbitrary bytes) are for the worker's own harness and are not
+here: libarchive is C, so they need the sandbox. The test suite holds crafted
 archives for each attack: `../` and absolute paths, zip-slip through
 backslashes, symlink-then-file, hardlink escapes, a symlink chain, a
 42.zip-style bomb, an overlapping-entries zip bomb, a 300k-entry archive,

@@ -488,6 +488,22 @@ void JobsService::handle(int kind, uint id, const QByteArray &arg)
         const bool clean = state == QLatin1String("done") && it->jobError().isEmpty() && it->jobWarning().isEmpty() && it->jobLeft() == 0 && it->kind() != QLatin1String("test");
         if (clean || state == QLatin1String("cancelled")) {
             QTimer::singleShot(clean ? 600 : 0, it, [it] { it->closeJob(); });
+        } else if (it->windowWanted() && !it->dismissed()) {
+            m_kept.removeAll(id);
+            m_kept.append(id);
+            // Only windows still open count; the oldest of more than the
+            // limit is closed.
+            m_kept.erase(std::remove_if(m_kept.begin(), m_kept.end(),
+                                        [this](uint k) {
+                                            const JobItem *j = m_items.value(k);
+                                            return !j || j->dismissed() || !j->windowWanted();
+                                        }),
+                         m_kept.end());
+            while (m_kept.size() > kMaxKeptWindows) {
+                if (JobItem *old = m_items.value(m_kept.takeFirst())) {
+                    old->closeJob();
+                }
+            }
         }
         break;
     }

@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/EternalCoder454/atlasos-archive"
@@ -34,3 +34,7 @@ landlock = "0.4.7"
 lto = "thin"
 codegen-units = 4
 strip = true
+# Sizes, counts and offsets come from files, archives and servers: arithmetic
+# on them traps on overflow instead of wrapping. (panic stays "unwind": a trap
+# in a worker thread is contained and reported, an abort would end the program.)
+overflow-checks = true
