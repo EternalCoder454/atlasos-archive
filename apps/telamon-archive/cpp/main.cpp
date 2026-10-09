@@ -36,6 +36,8 @@
 
 #include <memory>
 
+#include <sys/resource.h>
+
 // Defined in src/lib.rs.
 extern "C" void *telamon_backend_new();
 
@@ -97,7 +99,12 @@ public Q_SLOTS:
         applyToken(platformData);
         QList<QUrl> urls;
         for (const QString &uri : uris) {
-            urls << QUrl::fromUserInput(uri);
+            // A URL as sent, or an absolute path: `fromUserInput` would turn
+            // a bare name into a file of this program's working folder.
+            const QUrl url = uri.startsWith(QLatin1Char('/')) ? QUrl::fromLocalFile(uri) : QUrl(uri, QUrl::StrictMode);
+            if (url.isLocalFile()) {
+                urls << url;
+            }
         }
         Q_EMIT m_service->openRequested(urls);
     }
@@ -181,6 +188,14 @@ static QStringList withoutService(const QStringList &arguments)
 
 int main(int argc, char *argv[])
 {
+    // This process holds the passwords people type while a job runs: a crash
+    // must not write them to a core file. (Not made undumpable as the CLI and
+    // the worker are: a process that is not dumpable has /proc/<pid>/root
+    // owned by root, which the desktop portals read to tell who is calling.
+    // The price is that a native crash of the window is not reported by the
+    // framework's crash collector; Rust panics still are.)
+    const rlimit noCore{0, 0};
+    setrlimit(RLIMIT_CORE, &noCore);
     telamon_app_init();
     // Drawn on the CPU like the other Telamon apps unless QT_QUICK_BACKEND says
     // otherwise (the P phase measures a 50k-row list both ways).
@@ -217,6 +232,12 @@ int main(int argc, char *argv[])
     // One instance per session. A second launch's arguments come here through
     // activateRequested; without a session bus each launch runs on its own.
     KDBusService service(KDBusService::Unique | KDBusService::NoExitOnFailure);
+    // KDBusService also exports the whole application object at
+    // /MainApplication, with its slots and properties: any process on the bus
+    // could call quit() (ending a job half way) or closeAllWindows(). Nothing
+    // needs that path: org.freedesktop.Application is served at the
+    // application's own path.
+    QDBusConnection::sessionBus().unregisterObject(QStringLiteral("/MainApplication"));
 
     // The jobs (Rust), their windows, and the Archive1 API on the bus.
     JobsService jobs;

@@ -218,6 +218,11 @@ private:
     void update();
 
     QHash<uint, JobItem *> m_items;
+    // Jobs that ended with something to read, oldest first: their windows stay
+    // open until closed, so a caller in a loop must not be able to open
+    // windows without end (the oldest closes past kMaxKeptWindows).
+    QList<uint> m_kept;
+    static constexpr int kMaxKeptWindows = 8;
     JobWindowsModel m_model;
     static QAtomicPointer<JobsService> s_instance;
 };

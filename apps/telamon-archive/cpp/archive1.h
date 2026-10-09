@@ -46,6 +46,10 @@ public:
     // The path of a job's object in one of the two names (0 telamon, 1 atlas).
     static QString pathFor(uint id, int flavor);
     JobsService *service() const { return m_service; }
+    // Who started a job (the sender's unique bus name): the only one that may
+    // pause, resume, cancel or answer it.
+    void setOwner(uint id, const QString &sender) { m_owners.insert(id, sender); }
+    bool isOwner(uint id, const QString &sender) const { return !sender.isEmpty() && m_owners.value(id) == sender; }
 
 Q_SIGNALS:
     void openRequested(const QString &path, const QString &token, const QString &parentWindow);
@@ -64,6 +68,7 @@ private:
 
     JobsService *m_service;
     QHash<uint, Objects *> m_objects;
+    QHash<uint, QString> m_owners;
     QTimer m_flush;
 };
 
@@ -103,8 +108,10 @@ QVariantMap all(const JobItem *j);
         Q_PROPERTY(QString QuestionText READ QuestionText)                                                                \
         Q_PROPERTY(QStringList Results READ Results)                                                                      \
     public:                                                                                                               \
-        explicit Name(JobItem *job)                                                                                       \
+        Name(JobItem *job, Archive1Core *core, uint id)                                                                   \
             : m_job(job)                                                                                                  \
+            , m_core(core)                                                                                                \
+            , m_id(id)                                                                                                    \
         {                                                                                                                 \
         }                                                                                                                 \
         QString Title() const { return JobProps::title(m_job); }                                                          \
@@ -119,22 +126,55 @@ QVariantMap all(const JobItem *j);
         QString QuestionText() const { return JobProps::questionText(m_job); }                                            \
         QStringList Results() const { return JobProps::results(m_job); }                                                  \
     public Q_SLOTS:                                                                                                       \
-        void Pause() { m_job->pause(); }                                                                                  \
-        void Resume() { m_job->resume(); }                                                                                \
-        void Cancel() { m_job->cancel(); }                                                                                \
+        void Pause()                                                                                                      \
+        {                                                                                                                 \
+            if (mine()) {                                                                                                 \
+                m_job->pause();                                                                                           \
+            }                                                                                                             \
+        }                                                                                                                 \
+        void Resume()                                                                                                     \
+        {                                                                                                                 \
+            if (mine()) {                                                                                                 \
+                m_job->resume();                                                                                          \
+            }                                                                                                             \
+        }                                                                                                                 \
+        void Cancel()                                                                                                     \
+        {                                                                                                                 \
+            if (mine()) {                                                                                                 \
+                m_job->cancel();                                                                                          \
+            }                                                                                                             \
+        }                                                                                                                 \
         bool AnswerConflict(const QString &action, bool all)                                                              \
         {                                                                                                                 \
+            if (!mine()) {                                                                                                \
+                return false;                                                                                             \
+            }                                                                                                             \
             if (action != QLatin1String("replace") && action != QLatin1String("skip") && action != QLatin1String("keep-both")) { \
                 sendErrorReply(QStringLiteral(ErrorPrefix "InvalidArgs"), QStringLiteral("The answer must be replace, skip or keep-both.")); \
                 return false;                                                                                             \
             }                                                                                                             \
             return m_job->answerConflict(action, all);                                                                    \
         }                                                                                                                 \
-        bool AnswerLimit(bool goOn) { return m_job->answerLimitBus(goOn); }                                               \
+        bool AnswerLimit(bool goOn)                                                                                       \
+        {                                                                                                                 \
+            return mine() && m_job->answerLimitBus(goOn);                                                                 \
+        }                                                                                                                 \
     Q_SIGNALS:                                                                                                            \
         void Finished(const QString &state, const QStringList &results);                                                  \
     private:                                                                                                              \
+        /* Only the process that started a job controls it or answers its questions: another process of the user   */ \
+        /* must not be able to say "replace" or "unpack anyway" to a question put to someone else. */ \
+        bool mine()                                                                                                       \
+        {                                                                                                                 \
+            if (m_core->isOwner(m_id, message().service())) {                                                             \
+                return true;                                                                                              \
+            }                                                                                                             \
+            sendErrorReply(QStringLiteral(ErrorPrefix "AccessDenied"), QStringLiteral("Only the program that started this job can do that."));   \
+            return false;                                                                                                 \
+        }                                                                                                                 \
         QPointer<JobItem> m_job;                                                                                          \
+        Archive1Core *m_core;                                                                                             \
+        uint m_id;                                                                                                        \
     };
 
 ARCHIVE_JOB_CLASS(TelamonJobObject, "net.eterneon.telamon.Archive1.Job", "net.eterneon.telamon.Archive1.Error.")
@@ -202,6 +242,7 @@ ARCHIVE_JOB_CLASS(AtlasJobObject, "net.eterneon.atlas.Archive1.Job", "net.eterne
                 fail(message, QStringLiteral(ErrorPrefix) + n, m);                                                        \
                 return QDBusObjectPath();                                                                                 \
             }                                                                                                             \
+            m_core->setOwner(id, message.service());                                                                      \
             return QDBusObjectPath(Archive1Core::pathFor(id, Flavor));                                                    \
         }                                                                                                                 \
         static void fail(const QDBusMessage &message, const QString &name, const QString &text)                           \

@@ -39,6 +39,7 @@ struct Env {
     bus: Child,
     conn: Connection,
     app: PathBuf,
+    addr: String,
 }
 
 macro_rules! env_or_skip {
@@ -130,7 +131,16 @@ impl Env {
             bus,
             conn,
             app,
+            addr,
         })
+    }
+
+    /// Another process of the user on the same bus.
+    fn other(&self) -> Connection {
+        Builder::address(self.addr.as_str())
+            .unwrap()
+            .build()
+            .expect("a second connection")
     }
 
     fn u(&self, p: impl AsRef<Path>) -> String {
@@ -656,6 +666,112 @@ fn a_name_clash_waits_for_the_callers_answer() {
     assert!(m.body().deserialize::<bool>().unwrap());
     assert_eq!(e.done(job.as_str()), "done");
     assert_eq!(e.results(job.as_str()), [e.u(e.src.join("note (2).txt"))]);
+    assert_eq!(
+        std::fs::read_to_string(e.src.join("note.txt")).unwrap(),
+        "old"
+    );
+}
+
+#[test]
+fn the_application_object_is_not_on_the_bus() {
+    let e = env_or_skip!("mainapp");
+    // Start the app (a call that is answered).
+    let a = e.tar_gz("a.tar.gz", &[("a.txt", "a")]);
+    let job = e.job("Test", &(vec![e.u(&a)], no_opts()));
+    e.done(job.as_str());
+    // KDBusService's /MainApplication has quit() and closeAllWindows() for
+    // everyone on the bus; it is not served.
+    for (iface, method) in [
+        ("org.qtproject.Qt.QCoreApplication", "quit"),
+        ("org.qtproject.Qt.QApplication", "closeAllWindows"),
+    ] {
+        let r = e
+            .other()
+            .call_method(Some(NAME), "/MainApplication", Some(iface), method, &());
+        // refused because there is no such object, not because anything else went wrong
+        match r {
+            Err(zbus::Error::MethodError(name, _, _)) => assert!(
+                name.contains("Unknown"),
+                "{iface}.{method} failed with {name}"
+            ),
+            other => panic!("{iface}.{method} should not be there: {other:?}"),
+        }
+    }
+    assert!(e.app_running(), "the app is still there");
+    // The program holds the passwords people type: it writes no core file.
+    let pid: u32 = e
+        .conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixProcessID",
+            &(NAME,),
+        )
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+    let core = limits
+        .lines()
+        .find(|l| l.starts_with("Max core file size"))
+        .unwrap();
+    assert!(core.split_whitespace().rev().nth(2) == Some("0"), "{core}");
+}
+
+#[test]
+fn only_the_program_that_started_a_job_controls_or_answers_it() {
+    let e = env_or_skip!("owner");
+    let a = e.tar_gz("note.tar.gz", &[("note.txt", "new")]);
+    std::fs::write(e.src.join("note.txt"), "old").unwrap();
+    let job = e.job("ExtractHere", &(vec![e.u(&a)], no_opts()));
+    e.wait_state(job.as_str(), "the question", |s| s == "waiting-for-user");
+    // Another process of the same user answers first: refused, and nothing
+    // is replaced.
+    let other = e.other();
+    let denied = |r: zbus::Result<zbus::Message>| match r {
+        Err(zbus::Error::MethodError(name, _, _)) => name.to_string(),
+        other => panic!("should have been refused: {other:?}"),
+    };
+    assert_eq!(
+        denied(other.call_method(
+            Some(NAME),
+            job.as_str(),
+            Some(JOB),
+            "AnswerConflict",
+            &("replace", true)
+        )),
+        "net.eterneon.telamon.Archive1.Error.AccessDenied"
+    );
+    assert_eq!(
+        denied(other.call_method(Some(NAME), job.as_str(), Some(JOB), "AnswerLimit", &(true,))),
+        "net.eterneon.telamon.Archive1.Error.AccessDenied"
+    );
+    for m in ["Pause", "Resume", "Cancel"] {
+        assert_eq!(
+            denied(other.call_method(Some(NAME), job.as_str(), Some(JOB), m, &())),
+            "net.eterneon.telamon.Archive1.Error.AccessDenied"
+        );
+    }
+    assert_eq!(e.state(job.as_str()), "waiting-for-user");
+    assert_eq!(
+        std::fs::read_to_string(e.src.join("note.txt")).unwrap(),
+        "old"
+    );
+    // The starter still can.
+    let m = e
+        .conn
+        .call_method(
+            Some(NAME),
+            job.as_str(),
+            Some(JOB),
+            "AnswerConflict",
+            &("skip", false),
+        )
+        .unwrap();
+    assert!(m.body().deserialize::<bool>().unwrap());
+    e.done(job.as_str());
     assert_eq!(
         std::fs::read_to_string(e.src.join("note.txt")).unwrap(),
         "old"
